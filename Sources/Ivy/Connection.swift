@@ -1,0 +1,214 @@
+import Foundation
+import NIOCore
+import NIOPosix
+import NIOFoundationCompat
+import Tally
+
+public final class PeerConnection: @unchecked Sendable {
+    static let inboundBufferLimit = 256
+
+    public internal(set) var id: PeerID
+    public internal(set) var endpoint: PeerEndpoint
+    /// IP address observed on the accepted socket for inbound connections,
+    /// independent of any self-advertised endpoint. Diversity/netgroup
+    /// accounting reads THIS (never the advertised host) so a peer cannot forge
+    /// its network group via the identify frame. Nil for outbound dials.
+    public internal(set) var observedHost: String? = nil
+    let channel: Channel
+    private let maxFrameSize: UInt32
+    private var closed = false
+    private let inbound: AsyncStream<Message>
+    private let inboundContinuation: AsyncStream<Message>.Continuation
+
+    init(id: PeerID, endpoint: PeerEndpoint, channel: Channel, maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize) {
+        self.id = id
+        self.endpoint = endpoint
+        self.channel = channel
+        self.maxFrameSize = maxFrameSize
+        let (stream, continuation) = AsyncStream<Message>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.inboundBufferLimit)
+        )
+        self.inbound = stream
+        self.inboundContinuation = continuation
+    }
+
+    public static func dial(
+        endpoint: PeerEndpoint,
+        group: EventLoopGroup,
+        maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize
+    ) async throws -> PeerConnection {
+        let id = PeerID(publicKey: endpoint.publicKey)
+
+        let bootstrap = ClientBootstrap(group: group)
+            .connectTimeout(.seconds(5))
+            .channelInitializer { channel in
+                let handler = MessageFrameDecoder(maxFrameSize: maxFrameSize)
+                return channel.pipeline.addHandler(handler)
+            }
+
+        let channel = try await bootstrap.connect(
+            host: endpoint.host,
+            port: Int(endpoint.port)
+        ).get()
+
+        let peerConn = PeerConnection(id: id, endpoint: endpoint, channel: channel, maxFrameSize: maxFrameSize)
+        let peerHandler = PeerChannelHandler(connection: peerConn)
+        try await channel.pipeline.addHandler(peerHandler).get()
+
+        return peerConn
+    }
+
+    public func send(_ message: Message) async throws {
+        let payload = message.serialize(maxFrameSize: maxFrameSize)
+        var buf = channel.allocator.buffer(capacity: 4 + payload.count)
+        buf.writeInteger(UInt32(payload.count), endianness: .big)
+        buf.writeBytes(payload)
+        try await channel.writeAndFlush(buf).get()
+    }
+
+    public func fireAndForget(_ payload: Data) {
+        var buf = channel.allocator.buffer(capacity: 4 + payload.count)
+        buf.writeInteger(UInt32(payload.count), endianness: .big)
+        buf.writeBytes(payload)
+        channel.writeAndFlush(buf, promise: nil)
+    }
+
+    public func fireAndForgetMessage(_ message: Message) {
+        let payload = message.serialize(maxFrameSize: maxFrameSize)
+        fireAndForget(payload)
+    }
+
+    public var messages: AsyncStream<Message> { inbound }
+
+    var isLive: Bool {
+        channel.isActive || !closed
+    }
+
+    func feedMessage(_ message: Message) {
+        inboundContinuation.yield(message)
+    }
+
+    func connectionClosed() {
+        closed = true
+        inboundContinuation.finish()
+    }
+
+    public func cancel() {
+        closed = true
+        channel.close(promise: nil)
+        inboundContinuation.finish()
+    }
+}
+
+final class MessageFrameDecoder: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias InboundOut = Message
+
+    private let maxFrameSize: UInt32
+    private var buffer: ByteBuffer = ByteBuffer()
+
+    init(maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize) {
+        self.maxFrameSize = maxFrameSize
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
+        buffer.writeBuffer(&incoming)
+
+        while buffer.readableBytes >= 4 {
+            guard let length = buffer.getInteger(at: buffer.readerIndex, endianness: .big, as: UInt32.self) else { break }
+            if length == 0 {
+                buffer.moveReaderIndex(forwardBy: 4)
+                continue
+            }
+            guard length <= maxFrameSize else {
+                context.close(promise: nil)
+                return
+            }
+            guard buffer.readableBytes >= 4 + Int(length) else { break }
+            buffer.moveReaderIndex(forwardBy: 4)
+            guard let data = buffer.readData(length: Int(length)) else { break }
+            if let message = Message.deserialize(data, maxDataPayload: maxFrameSize) {
+                context.fireChannelRead(wrapInboundOut(message))
+            }
+        }
+
+        buffer.discardReadBytes()
+    }
+}
+
+final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = Message
+
+    let connection: PeerConnection
+
+    init(connection: PeerConnection) {
+        self.connection = connection
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let message = unwrapInboundIn(data)
+        connection.feedMessage(message)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        connection.connectionClosed()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
+    }
+}
+
+final class UnsafeMutableTransferBox<T>: @unchecked Sendable {
+    var value: T
+    init(_ value: T) { self.value = value }
+}
+
+final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = Message
+
+    let ivy: Ivy
+    private let maxFrameSize: UInt32
+    private var registered = false
+    private var connection: PeerConnection?
+
+    init(ivy: Ivy, maxFrameSize: UInt32) {
+        self.ivy = ivy
+        self.maxFrameSize = maxFrameSize
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        if !registered {
+            registered = true
+            let channel = context.channel
+            let unknownID = PeerID(publicKey: "inbound-\(UUID().uuidString)")
+            let endpoint = PeerEndpoint(publicKey: unknownID.publicKey, host: "unknown", port: 0)
+            let conn = PeerConnection(
+                id: unknownID,
+                endpoint: endpoint,
+                channel: channel,
+                maxFrameSize: maxFrameSize
+            )
+            // Pin the netgroup to the unforgeable L3 source address seen on the
+            // socket, captured before identify so there is no "unknown" window.
+            conn.observedHost = channel.remoteAddress?.ipAddress
+            connection = conn
+            Task { await ivy.registerInboundConnection(conn) }
+        }
+        context.fireChannelActive()
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let message = unwrapInboundIn(data)
+        connection?.feedMessage(message)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        connection?.connectionClosed()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
+    }
+}
