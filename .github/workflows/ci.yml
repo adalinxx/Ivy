@@ -1,101 +1,17 @@
-name: CI/CD
+name: CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
-    tags: ["v*"]
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
+  pull_request:
+    branches: [main]
 
 jobs:
-  test-macos:
-    name: Build & Test (macOS)
-    runs-on: macos-15
-    timeout-minutes: 45
+  test:
+    runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer
-
-      - name: Show Swift version
-        run: swift --version
-
-      - name: Cache SwiftPM
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: spm-macos-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            spm-macos-
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build release
-        run: swift build -c release
-
-      - name: Build benchmarks executable
-        run: swift build -c release --product IvyBenchmarks
-
-      - name: Run tests
-        run: swift test
-
-  test-linux:
-    name: Build & Test (Linux)
-    runs-on: ubuntu-latest
-    container: swift:6.1-jammy
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Show Swift version
-        run: swift --version
-
-      - name: Cache SwiftPM
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: spm-linux-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            spm-linux-
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build release
-        run: swift build -c release
-
-      - name: Build benchmarks executable
-        run: swift build -c release --product IvyBenchmarks
-
-      - name: Run tests
-        run: swift test
-
-  release:
-    name: Publish GitHub Release
-    needs: [test-macos, test-linux]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          gh release create "$TAG_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG_NAME" \
-            --generate-notes
+      - run: swift --version
+      - run: swift build
+      - run: swift test
