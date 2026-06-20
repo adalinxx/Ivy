@@ -157,7 +157,14 @@ public actor Ivy {
         }
         #endif
 
-        if let addr = await stunClient.discoverPublicAddress() {
+        // An operator-declared external address is authoritative: it overrides
+        // STUN, which on cloud hosts (e.g. fly) returns nothing useful and lets
+        // the node fall back to advertising its private (172.x) address.
+        if let ext = config.externalAddress {
+            let addr = ObservedAddress(host: ext.host, port: ext.port)
+            publicAddress = addr
+            delegate?.ivy(self, didDiscoverPublicAddress: addr)
+        } else if let addr = await stunClient.discoverPublicAddress() {
             publicAddress = addr
             delegate?.ivy(self, didDiscoverPublicAddress: addr)
         }
@@ -415,17 +422,23 @@ public actor Ivy {
         let observedHost = conn.endpoint.host
         let observedPort = conn.endpoint.port
         var listenAddrs: [(String, UInt16)] = []
-        if let pub = publicAddress {
-            listenAddrs.append((pub.host, pub.port))
-        }
-        if let localHost = conn.channel.localAddress?.ipAddress,
-           localHost != "0.0.0.0",
-           localHost != "::",
-           !listenAddrs.contains(where: { $0.0 == localHost && $0.1 == config.listenPort }) {
-            listenAddrs.append((localHost, config.listenPort))
-        }
-        if listenAddrs.isEmpty {
-            listenAddrs.append(("0.0.0.0", config.listenPort))
+        if let ext = config.externalAddress {
+            // Advertise ONLY the declared public endpoint — never leak the
+            // private/local (172.x) address, which would poison peer routing.
+            listenAddrs.append((ext.host, ext.port))
+        } else {
+            if let pub = publicAddress {
+                listenAddrs.append((pub.host, pub.port))
+            }
+            if let localHost = conn.channel.localAddress?.ipAddress,
+               localHost != "0.0.0.0",
+               localHost != "::",
+               !listenAddrs.contains(where: { $0.0 == localHost && $0.1 == config.listenPort }) {
+                listenAddrs.append((localHost, config.listenPort))
+            }
+            if listenAddrs.isEmpty {
+                listenAddrs.append(("0.0.0.0", config.listenPort))
+            }
         }
 
         var signature = Data()

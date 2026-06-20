@@ -65,6 +65,13 @@ public struct IvyConfig: Sendable {
     /// candidate feeds from low-reputation peers.
     public let pexMinResponderScore: Double
 
+    /// Operator-declared public P2P endpoint advertised in identify, overriding
+    /// STUN/observed addresses. Required for cloud/NAT nodes whose locally
+    /// observed address (e.g. a fly `172.x` private IP) is not externally
+    /// dialable — without it, peers learn an unreachable address and the node
+    /// can never be joined from outside its private network.
+    public let externalAddress: (host: String, port: UInt16)?
+
     public init(
         publicKey: String,
         listenPort: UInt16 = 4001,
@@ -94,7 +101,8 @@ public struct IvyConfig: Sendable {
         findNodeBurst: Double = 40,
         findNodeRefillPerSec: Double = 10,
         pexMaxAcceptedPerRound: Int? = nil,
-        pexMinResponderScore: Double = 0
+        pexMinResponderScore: Double = 0,
+        externalAddress: (host: String, port: UInt16)? = nil
     ) {
         self.publicKey = publicKey
         self.listenPort = listenPort
@@ -125,5 +133,6 @@ public struct IvyConfig: Sendable {
         self.findNodeRefillPerSec = findNodeRefillPerSec
         self.pexMaxAcceptedPerRound = pexMaxAcceptedPerRound ?? pexMaxPeers
         self.pexMinResponderScore = pexMinResponderScore
+        self.externalAddress = externalAddress
     }
 }
