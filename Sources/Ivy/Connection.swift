@@ -14,16 +14,37 @@ public final class PeerConnection: @unchecked Sendable {
     /// accounting reads THIS (never the advertised host) so a peer cannot forge
     /// its network group via the identify frame. Nil for outbound dials.
     public internal(set) var observedHost: String? = nil
-    let channel: Channel
+    /// nil for a RELAYED connection (frames go through `relayForward` instead of
+    /// a direct socket); non-nil for a normal direct TCP connection.
+    let channel: Channel?
+    /// When set, this connection is relayed: outbound frames are wrapped in a
+    /// `relayData` envelope and sent through a relay peer, so identify/want/sync
+    /// flow over it exactly like a direct connection. nil for direct connections.
+    let relayForward: (@Sendable (Data) -> Void)?
+    /// For a relayed connection, the public key the peer CLAIMS (used to route
+    /// inbound relayData and to clean up the relay index on teardown). The claim
+    /// is unverified until a signed identify re-keys the connection to its real
+    /// identity — exactly like a direct inbound `inbound-<uuid>` connection.
+    let relayedClaimedKey: String?
+    /// For a relayed connection, the carrier connection it is routed through. When
+    /// the carrier tears down, the carrier's `handleInbound` teardown reaps every
+    /// relayed connection pointing at it (they are channel-less and otherwise
+    /// `isLive` forever, so they'd leak a slot). nil for direct connections.
+    let relayCarrierConn: PeerConnection?
     private let maxFrameSize: UInt32
     private var closed = false
     private let inbound: AsyncStream<Message>
     private let inboundContinuation: AsyncStream<Message>.Continuation
 
-    init(id: PeerID, endpoint: PeerEndpoint, channel: Channel, maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize) {
+    init(id: PeerID, endpoint: PeerEndpoint, channel: Channel?, maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize,
+         relayForward: (@Sendable (Data) -> Void)? = nil, relayedClaimedKey: String? = nil,
+         relayCarrierConn: PeerConnection? = nil) {
         self.id = id
         self.endpoint = endpoint
         self.channel = channel
+        self.relayForward = relayForward
+        self.relayedClaimedKey = relayedClaimedKey
+        self.relayCarrierConn = relayCarrierConn
         self.maxFrameSize = maxFrameSize
         let (stream, continuation) = AsyncStream<Message>.makeStream(
             bufferingPolicy: .bufferingNewest(Self.inboundBufferLimit)
@@ -60,6 +81,8 @@ public final class PeerConnection: @unchecked Sendable {
 
     public func send(_ message: Message) async throws {
         let payload = message.serialize(maxFrameSize: maxFrameSize)
+        if let relayForward { relayForward(payload); return }
+        guard let channel else { return }
         var buf = channel.allocator.buffer(capacity: 4 + payload.count)
         buf.writeInteger(UInt32(payload.count), endianness: .big)
         buf.writeBytes(payload)
@@ -67,6 +90,8 @@ public final class PeerConnection: @unchecked Sendable {
     }
 
     public func fireAndForget(_ payload: Data) {
+        if let relayForward { relayForward(payload); return }
+        guard let channel else { return }
         var buf = channel.allocator.buffer(capacity: 4 + payload.count)
         buf.writeInteger(UInt32(payload.count), endianness: .big)
         buf.writeBytes(payload)
@@ -81,7 +106,8 @@ public final class PeerConnection: @unchecked Sendable {
     public var messages: AsyncStream<Message> { inbound }
 
     var isLive: Bool {
-        channel.isActive || !closed
+        if let channel { return channel.isActive || !closed }
+        return !closed  // relayed connection: live until explicitly closed
     }
 
     func feedMessage(_ message: Message) {
@@ -95,7 +121,7 @@ public final class PeerConnection: @unchecked Sendable {
 
     public func cancel() {
         closed = true
-        channel.close(promise: nil)
+        channel?.close(promise: nil)
         inboundContinuation.finish()
     }
 }

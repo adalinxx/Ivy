@@ -15,6 +15,7 @@ public protocol IvyDataSource: AnyObject, Sendable {
 public enum IvyError: Error, Sendable {
     case notRunning
     case identityVerificationFailed
+    case noRelayAvailable
 }
 
 struct PendingNeighborResponse: Sendable {
@@ -49,6 +50,18 @@ public actor Ivy {
     var ownSpawnCertChain: [SpawnCertificate] = []
 
     var connections: [PeerID: PeerConnection] = [:]
+    // NAT traversal Phase 1 — circuit relay.
+    let relayService = RelayService()
+    /// In-flight `connectViaRelay` requests, keyed by the relay peer we asked.
+    var pendingRelayRequests: [PeerID: CheckedContinuation<Bool, Never>] = [:]
+    /// Relayed connections indexed by the peer's CLAIMED key, for routing inbound
+    /// relayData. The connection itself lives in `connections` under a temporary
+    /// `inbound-<uuid>` id until a signed identify re-keys it (so an unverified
+    /// relayed peer is never attributed to the claimed identity).
+    var relayedConnByClaimedKey: [String: PeerConnection] = [:]
+    /// Cap on concurrent relayed (channel-less) connections — bounds the phantom
+    /// slot DoS where a relay/peer opens relayed entries that never identify.
+    static let maxRelayedConnections = 64
     var inboundConnectionIDs: Set<PeerID> = []
     var inboundConnectionOrder: [PeerID] = []
     var pendingRequests: [String: [CheckedContinuation<Data?, Never>]] = [:]
@@ -172,6 +185,11 @@ public actor Ivy {
         for bootstrap in config.bootstrapPeers {
             Task { try? await connect(to: bootstrap) }
         }
+        // Stay connected to known relays so they are available as relay candidates
+        // for connectViaRelay when a direct dial to some other peer fails.
+        for relay in config.knownRelays where !config.bootstrapPeers.contains(where: { $0.publicKey == relay.publicKey }) {
+            Task { try? await connect(to: relay) }
+        }
 
         let monitor = PeerHealthMonitor(
             config: config.healthConfig,
@@ -236,6 +254,13 @@ public actor Ivy {
             conn = try await PeerConnection.dial(endpoint: endpoint, group: group, maxFrameSize: config.maxFrameSize)
         } catch {
             finishOutgoingDial(to: peer, connected: false)
+            // P0: direct dial failed (likely NAT). Fall back to a circuit relay if
+            // any relay-capable peer is connected. `endpoint.host == "relay"` is the
+            // synthetic host of an already-relayed endpoint — never relay those.
+            if endpoint.host != "relay",
+               connections.values.contains(where: { $0.channel != nil }) {
+                do { try await connectViaRelay(to: endpoint); return } catch { throw error }
+            }
             throw error
         }
 
@@ -430,7 +455,7 @@ public actor Ivy {
             if let pub = publicAddress {
                 listenAddrs.append((pub.host, pub.port))
             }
-            if let localHost = conn.channel.localAddress?.ipAddress,
+            if let localHost = conn.channel?.localAddress?.ipAddress,
                localHost != "0.0.0.0",
                localHost != "::",
                !listenAddrs.contains(where: { $0.0 == localHost && $0.1 == config.listenPort }) {
@@ -632,7 +657,19 @@ public actor Ivy {
         }
 
         let wasIntentionalDisconnect = intentionallyDisconnectedPeers.remove(peer) != nil
+        // Relayed connections have no dialable endpoint (host "relay"); don't try
+        // to reconnect to them directly — they re-form via the relay on demand.
+        // Drop the claimed-key index entry (kept across the identify re-key, so
+        // clean it by the connection's own claimed key, not the current peer id).
+        let wasRelayed = conn.relayForward != nil
+        if let claimed = conn.relayedClaimedKey { relayedConnByClaimedKey.removeValue(forKey: claimed) }
+        // N1: this carrier is gone — reap relayed connections routed through it.
+        // They are channel-less (isLive forever) and would otherwise leak a slot.
+        for orphan in connections.values where orphan.relayCarrierConn === conn {
+            orphan.cancel()
+        }
         if wasCurrentConnection,
+           !wasRelayed,
            !peer.publicKey.hasPrefix("inbound-"),
            running,
            !wasIntentionalDisconnect {
@@ -681,6 +718,121 @@ public actor Ivy {
         }
     }
 
+    // MARK: - NAT traversal: circuit relay (Phase 1)
+
+    /// Establish a RELAYED connection to `endpoint` through one of our connected
+    /// relay-capable peers. The result lives in `connections[target]` with a nil
+    /// channel, so identify/want/sync flow over it exactly like a direct link.
+    public func connectViaRelay(to endpoint: PeerEndpoint) async throws {
+        let targetKey = endpoint.publicKey
+        let target = PeerID(publicKey: targetKey)
+        guard connections[target] == nil else { return }
+
+        let candidates = connections.compactMap { (pid, conn) -> PeerID? in
+            (conn.channel != nil && pid.publicKey != targetKey) ? pid : nil
+        }
+        for relayPeer in candidates {
+            let success: Bool = await withCheckedContinuation { cont in
+                pendingRelayRequests[relayPeer] = cont
+                fireToPeer(relayPeer, .relayConnect(srcKey: config.publicKey, dstKey: targetKey))
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(10))
+                    await self?.timeoutRelayRequest(relayPeer)
+                }
+            }
+            if success {
+                openRelayedConnection(claimedKey: targetKey, endpoint: endpoint, via: relayPeer)
+                return
+            }
+        }
+        throw IvyError.noRelayAvailable
+    }
+
+    func timeoutRelayRequest(_ relayPeer: PeerID) {
+        if let cont = pendingRelayRequests.removeValue(forKey: relayPeer) { cont.resume(returning: false) }
+    }
+
+    /// Open a relayed PeerConnection for a peer CLAIMING `claimedKey`, carried by
+    /// `relayPeer`. Treated as an UNVERIFIED inbound connection: keyed under a
+    /// temporary `inbound-<uuid>` id and routed through the same admission +
+    /// identify-timeout path as a direct inbound socket, so it is NOT attributed
+    /// to `claimedKey`, cannot displace a real peer under that key, and is reaped
+    /// if it never presents a signed identify. `handleIdentify` re-keys it to its
+    /// real id (firing `didIdentifyPeer`) only after the signature verifies. Idempotent.
+    func openRelayedConnection(claimedKey: String, endpoint: PeerEndpoint, via relayPeer: PeerID) {
+        guard relayedConnByClaimedKey[claimedKey] == nil, let relayConn = connections[relayPeer] else { return }
+        // H2 bound: cap concurrent relayed slots so a relay/peer can't open an
+        // unbounded number of channel-less entries.
+        guard connections.values.filter({ $0.relayForward != nil }).count < Self.maxRelayedConnections else {
+            config.logger.warning("Relayed connection cap reached — refusing relayed peer \(claimedKey.prefix(16))…")
+            return
+        }
+        let tempID = PeerID(publicKey: "inbound-relay-\(UUID().uuidString)")
+        guard admitInboundConnection(tempID) else { return }
+        let conn = PeerConnection(
+            id: tempID, endpoint: endpoint, channel: nil, maxFrameSize: config.maxFrameSize,
+            relayForward: { payload in
+                relayConn.fireAndForgetMessage(.relayData(peerKey: claimedKey, data: payload))
+            },
+            relayedClaimedKey: claimedKey,
+            relayCarrierConn: relayConn)
+        connections[tempID] = conn
+        relayedConnByClaimedKey[claimedKey] = conn
+        trackInboundConnection(tempID)
+        if healthMonitor != nil { Task { await self.trackPeerHealth(tempID) } }
+        delegate?.ivy(self, didConnect: tempID)
+        Task { await handleInbound(conn) }
+        sendIdentify(to: conn)
+        let toTimeout = tempID
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            await self?.timeoutUnidentifiedPeer(toTimeout)
+        }
+    }
+
+    func handleRelayConnect(srcKey: String, dstKey: String, from peer: PeerID) async {
+        if dstKey == config.publicKey {
+            // I am the TARGET; `peer` is the relay. Open my (unverified) side toward src.
+            openRelayedConnection(claimedKey: srcKey, endpoint: PeerEndpoint(publicKey: srcKey, host: "relay", port: 0), via: peer)
+        } else if config.relayEnabled {
+            // I am the RELAY. H3: the initiator is the AUTHENTICATED sender, NOT the
+            // body's `srcKey` (which a peer could forge to bypass the per-peer cap or
+            // impersonate a victim). Account + forward under `peer.publicKey`.
+            let realSrc = peer.publicKey
+            let dst = PeerID(publicKey: dstKey)
+            guard tally.shouldAllow(peer: peer), connections[dst] != nil else {
+                fireToPeer(peer, .relayStatus(code: 1)); return
+            }
+            if await relayService.createCircuit(initiator: realSrc, target: dstKey) {
+                fireToPeer(peer, .relayStatus(code: 0))
+                fireToPeer(dst, .relayConnect(srcKey: realSrc, dstKey: dstKey))
+            } else {
+                fireToPeer(peer, .relayStatus(code: 2))
+            }
+        }
+    }
+
+    func handleRelayData(peerKey: String, data: Data, from peer: PeerID) async {
+        let senderKey = peer.publicKey
+        if await relayService.hasCircuit(between: senderKey, and: peerKey) {
+            // I am the relay: forward to the other endpoint, tagging the sender.
+            // M5: forward via fireToPeer so the carrier's per-peer Tally budget
+            // applies to relayed bytes (not just the circuit's byte budget).
+            if await relayService.relay(from: senderKey, to: peerKey, bytes: data.count) {
+                fireToPeer(PeerID(publicKey: peerKey), .relayData(peerKey: senderKey, data: data))
+            }
+        } else {
+            // I am an endpoint: `data` is a framed message from `peerKey` via relay `peer`.
+            // Route into the (unverified) relayed connection for that claimed key.
+            if relayedConnByClaimedKey[peerKey] == nil {
+                openRelayedConnection(claimedKey: peerKey, endpoint: PeerEndpoint(publicKey: peerKey, host: "relay", port: 0), via: peer)
+            }
+            if let inner = Message.deserialize(data, maxDataPayload: config.maxFrameSize) {
+                relayedConnByClaimedKey[peerKey]?.feedMessage(inner)
+            }
+        }
+    }
+
     func handleMessage(_ message: Message, from peer: PeerID) async {
         if let monitor = healthMonitor {
             await monitor.recordActivity(from: peer)
@@ -694,6 +846,14 @@ public actor Ivy {
             if let monitor = healthMonitor {
                 await monitor.recordPong(from: peer, nonce: nonce)
             }
+
+        // NAT traversal Phase 1 — circuit relay.
+        case .relayConnect(let srcKey, let dstKey):
+            await handleRelayConnect(srcKey: srcKey, dstKey: dstKey, from: peer)
+        case .relayStatus(let code):
+            if let cont = pendingRelayRequests.removeValue(forKey: peer) { cont.resume(returning: code == 0) }
+        case .relayData(let peerKey, let data):
+            await handleRelayData(peerKey: peerKey, data: data, from: peer)
 
         case .block(let cid, let data):
             let cpl = Router.commonPrefixLength(router.localHash, Router.hash(cid))
@@ -1151,6 +1311,12 @@ public actor Ivy {
     // MARK: - Cleanup
 
     func cleanupPendingForPeer(_ peer: PeerID) {
+        // H4: release relay state at the teardown choke point so a churning peer
+        // can't leak circuits/continuations. (relayedVia is cleared in the
+        // handleInbound teardown, which needs it for the reconnect decision.)
+        if let cont = pendingRelayRequests.removeValue(forKey: peer) { cont.resume(returning: false) }
+        Task { await relayService.removeAllCircuits(forPeer: peer.publicKey) }
+
         let forwardCIDs = pendingForwards.compactMap { cid, peers in
             peers[peer] == nil ? nil : cid
         }
