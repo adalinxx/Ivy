@@ -17,6 +17,15 @@ public enum Message: Sendable {
     case spawnCertPresentation(chain: [SpawnCertificate])
     case dhtForward(cid: String, ttl: UInt8)
 
+    // NAT traversal Phase 1 — circuit relay (carries identify/want/sync
+    // transparently between peers that have no direct link).
+    /// Establish a relayed circuit src↔dst through this relay.
+    case relayConnect(srcKey: String, dstKey: String)
+    /// Relay control reply: 0 = ok, 1 = refused/unreachable target, 2 = at capacity.
+    case relayStatus(code: UInt8)
+    /// One framed peer message carried over a circuit (peerKey = the OTHER endpoint).
+    case relayData(peerKey: String, data: Data)
+
     case want(rootCIDs: [String])
     case wantVolume(rootCID: String, cids: [String])
 
@@ -50,10 +59,12 @@ public enum Message: Sendable {
         case neighbors = 6
         case announceBlock = 7
         case identify = 8
-        // tags 9-12 removed (dialBack/dialBackResult AutoNAT, getZoneInventory/zoneInventory)
-        // tags 13, 14 removed (haveVolumes, haveVolumesResult — replaced by want/blocks)
+        // NAT traversal Phase 1 — circuit relay (tags 9, 10, 14, 15 remain free).
+        case relayConnect = 11
+        case relayStatus = 12
+        case relayData = 13
         case dhtForward = 16
-        // tags 21-31 removed (chain-specific messages)
+        // tags 17-31 free (removed chain-specific messages)
         case want = 26
         // tags 35-36 removed (miningChallenge, miningChallengeSolution)
         case pexRequest = 37
@@ -176,6 +187,17 @@ public enum Message: Sendable {
             buf.append(Tag.dhtForward.rawValue)
             guard buf.appendLengthPrefixedString(cid) else { return false }
             buf.appendUInt8(ttl)
+        case .relayConnect(let srcKey, let dstKey):
+            buf.append(Tag.relayConnect.rawValue)
+            guard buf.appendLengthPrefixedString(srcKey),
+                  buf.appendLengthPrefixedString(dstKey) else { return false }
+        case .relayStatus(let code):
+            buf.append(Tag.relayStatus.rawValue)
+            buf.appendUInt8(code)
+        case .relayData(let peerKey, let data):
+            buf.append(Tag.relayData.rawValue)
+            guard buf.appendLengthPrefixedString(peerKey),
+                  buf.appendLengthPrefixedData(data, maxDataPayload: maxDataPayload) else { return false }
         case .want(let rootCIDs):
             buf.append(Tag.want.rawValue)
             guard buf.appendCount(rootCIDs.count, max: MessageLimits.maxTxCIDCount) else { return false }
@@ -341,6 +363,17 @@ public enum Message: Sendable {
             guard let cid = reader.readString(),
                   let ttl = reader.readUInt8() else { return nil }
             return .dhtForward(cid: cid, ttl: ttl)
+        case .relayConnect:
+            guard let srcKey = reader.readString(),
+                  let dstKey = reader.readString() else { return nil }
+            return .relayConnect(srcKey: srcKey, dstKey: dstKey)
+        case .relayStatus:
+            guard let code = reader.readUInt8() else { return nil }
+            return .relayStatus(code: code)
+        case .relayData:
+            guard let peerKey = reader.readString(),
+                  let payload = reader.readData() else { return nil }
+            return .relayData(peerKey: peerKey, data: payload)
         case .want:
             guard let count = reader.readUInt16(), count <= MessageLimits.maxTxCIDCount else { return nil }
             var cids = [String]()

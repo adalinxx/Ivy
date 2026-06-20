@@ -72,6 +72,13 @@ public struct IvyConfig: Sendable {
     /// can never be joined from outside its private network.
     public let externalAddress: (host: String, port: UInt16)?
 
+    /// Serve as a circuit relay: forward `relayData` between peers we are each
+    /// directly connected to, so NAT'd nodes can reach each other through us.
+    /// Public/backbone nodes set this true.
+    public let relayEnabled: Bool
+    /// Relay peers this node will route through when a direct dial fails.
+    public let knownRelays: [PeerEndpoint]
+
     public init(
         publicKey: String,
         listenPort: UInt16 = 4001,
@@ -102,7 +109,9 @@ public struct IvyConfig: Sendable {
         findNodeRefillPerSec: Double = 10,
         pexMaxAcceptedPerRound: Int? = nil,
         pexMinResponderScore: Double = 0,
-        externalAddress: (host: String, port: UInt16)? = nil
+        externalAddress: (host: String, port: UInt16)? = nil,
+        relayEnabled: Bool = false,
+        knownRelays: [PeerEndpoint] = []
     ) {
         self.publicKey = publicKey
         self.listenPort = listenPort
@@ -134,5 +143,7 @@ public struct IvyConfig: Sendable {
         self.pexMaxAcceptedPerRound = pexMaxAcceptedPerRound ?? pexMaxPeers
         self.pexMinResponderScore = pexMinResponderScore
         self.externalAddress = externalAddress
+        self.relayEnabled = relayEnabled
+        self.knownRelays = knownRelays
     }
 }
