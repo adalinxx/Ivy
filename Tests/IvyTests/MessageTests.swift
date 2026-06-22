@@ -152,6 +152,31 @@ struct MessageTests {
         }
     }
 
+    @Test("RelayConnect roundtrip")
+    func testRelayConnectRoundtrip() {
+        let msg = Message.relayConnect(srcKey: "src", dstKey: "dst", nonce: 123)
+        let decoded = Message.deserialize(msg.serialize())
+        if case .relayConnect(let src, let dst, let nonce) = decoded {
+            #expect(src == "src")
+            #expect(dst == "dst")
+            #expect(nonce == 123)
+        } else {
+            Issue.record("Expected relayConnect")
+        }
+    }
+
+    @Test("RelayStatus roundtrip")
+    func testRelayStatusRoundtrip() {
+        let msg = Message.relayStatus(code: 2, nonce: 456)
+        let decoded = Message.deserialize(msg.serialize())
+        if case .relayStatus(let code, let nonce) = decoded {
+            #expect(code == 2)
+            #expect(nonce == 456)
+        } else {
+            Issue.record("Expected relayStatus")
+        }
+    }
+
     @Test("PexRequest roundtrip")
     func testPexRequestRoundtrip() {
         let msg = Message.pexRequest(nonce: 12345)
