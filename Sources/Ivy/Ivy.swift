@@ -765,7 +765,12 @@ public actor Ivy {
         let requestKey = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
         if let cont = pendingRelayRequests.removeValue(forKey: requestKey) {
             cont.resume(returning: code == 0)
+            return
         }
+        guard nonce == 0 else { return }
+        let legacyKeys = pendingRelayRequests.keys.filter { $0.relayPeer == relayPeer }
+        guard legacyKeys.count == 1, let legacyKey = legacyKeys.first else { return }
+        pendingRelayRequests.removeValue(forKey: legacyKey)?.resume(returning: code == 0)
     }
 
     /// Open a relayed PeerConnection for a peer CLAIMING `claimedKey`, carried by
@@ -1372,7 +1377,8 @@ public actor Ivy {
         pendingVolumeRequests: [String: PendingVolumeRequest],
         pendingPEX: [UInt64: CheckedContinuation<[PeerEndpoint], Never>],
         pendingNeighborResponses: [UInt64: PendingNeighborResponse],
-        pendingFindPins: [String: PendingFindPins]
+        pendingFindPins: [String: PendingFindPins],
+        pendingRelayRequests: [PendingRelayRequestKey: CheckedContinuation<Bool, Never>]
     ) {
         for (_, continuations) in pendingRequests {
             for cont in continuations { cont.resume(returning: nil) }
@@ -1389,6 +1395,9 @@ public actor Ivy {
         for (_, pending) in pendingFindPins {
             for cont in pending.continuations { cont.resume(returning: []) }
         }
+        for (_, cont) in pendingRelayRequests {
+            cont.resume(returning: false)
+        }
     }
 
     /// Safety net: resolve all pending continuations when the actor is torn down.
@@ -1402,7 +1411,8 @@ public actor Ivy {
             pendingVolumeRequests: pendingVolumeRequests,
             pendingPEX: pendingPEX,
             pendingNeighborResponses: pendingNeighborResponses,
-            pendingFindPins: pendingFindPins
+            pendingFindPins: pendingFindPins,
+            pendingRelayRequests: pendingRelayRequests
         )
     }
 
@@ -1412,7 +1422,8 @@ public actor Ivy {
             pendingVolumeRequests: pendingVolumeRequests,
             pendingPEX: pendingPEX,
             pendingNeighborResponses: pendingNeighborResponses,
-            pendingFindPins: pendingFindPins
+            pendingFindPins: pendingFindPins,
+            pendingRelayRequests: pendingRelayRequests
         )
         pendingRequests.removeAll()
         pendingVolumeRequests.removeAll()
@@ -1421,6 +1432,7 @@ public actor Ivy {
         pendingNeighborLookupNonces.removeAll()
         completedNeighborResponses.removeAll()
         pendingFindPins.removeAll()
+        pendingRelayRequests.removeAll()
         clearPendingForwards()
     }
 
