@@ -59,6 +59,36 @@ struct RelayIntegrationTests {
         }
     }
 
+    @Test("legacy relayStatus resolves a single pending relay request")
+    func legacyRelayStatusResolvesSinglePendingRequest() async throws {
+        let (pubA, skA) = keypair()
+        let node = Ivy(config: cfg(pub: pubA, priv: skA, port: 0, relay: false))
+        let relay = PeerID(publicKey: "legacy-relay")
+        let task = Task { await node.parkRelayRequestForTesting(relayPeer: relay, nonce: 42) }
+
+        try await Task.sleep(for: .milliseconds(20))
+        await node.resolveRelayRequest(from: relay, code: 0, nonce: 0)
+
+        let result = try await withTimeout(.milliseconds(500)) { await task.value }
+        #expect(result)
+        #expect(await node.pendingRelayRequests.isEmpty)
+    }
+
+    @Test("cleanupAllPending resolves pending relay requests")
+    func cleanupAllPendingResolvesRelayRequests() async throws {
+        let (pubA, skA) = keypair()
+        let node = Ivy(config: cfg(pub: pubA, priv: skA, port: 0, relay: false))
+        let relay = PeerID(publicKey: "cleanup-relay")
+        let task = Task { await node.parkRelayRequestForTesting(relayPeer: relay, nonce: 7) }
+
+        try await Task.sleep(for: .milliseconds(20))
+        await node.cleanupAllPending()
+
+        let result = try await withTimeout(.milliseconds(500)) { await task.value }
+        #expect(!result)
+        #expect(await node.pendingRelayRequests.isEmpty)
+    }
+
     @Test("two NAT'd nodes exchange a message through a relay")
     func natToNatViaRelay() async throws {
         let (pubR, skR) = keypair(); let (pubA, skA) = keypair(); let (pubB, skB) = keypair()
@@ -226,5 +256,14 @@ struct RelayIntegrationTests {
         let freed = await waitUntil { await R.relayService.activeCircuitCount() == 0 }
         #expect(freed)
         await B.stop(); await R.stop()
+    }
+}
+
+private extension Ivy {
+    func parkRelayRequestForTesting(relayPeer: PeerID, nonce: UInt64) async -> Bool {
+        await withCheckedContinuation { cont in
+            let key = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
+            pendingRelayRequests[key] = cont
+        }
     }
 }
