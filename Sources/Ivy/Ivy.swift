@@ -765,13 +765,7 @@ public actor Ivy {
         let requestKey = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
         if let cont = pendingRelayRequests.removeValue(forKey: requestKey) {
             cont.resume(returning: code == 0)
-            return
         }
-        guard nonce == 0,
-              let oldestKey = pendingRelayRequests.keys
-                  .filter({ $0.relayPeer == relayPeer })
-                  .min(by: { $0.nonce < $1.nonce }) else { return }
-        pendingRelayRequests.removeValue(forKey: oldestKey)?.resume(returning: code == 0)
     }
 
     /// Open a relayed PeerConnection for a peer CLAIMING `claimedKey`, carried by
