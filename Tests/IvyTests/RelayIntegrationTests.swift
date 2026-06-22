@@ -10,6 +10,10 @@ import Crypto
 /// real identity keys (identify requires a valid signature).
 @Suite("NAT circuit relay (integration)")
 struct RelayIntegrationTests {
+    private enum TestTimeout: Error {
+        case timedOut
+    }
+
     private func keypair() -> (pub: String, priv: Data) {
         let sk = Curve25519.Signing.PrivateKey()
         let pub = sk.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
@@ -37,6 +41,52 @@ struct RelayIntegrationTests {
             waited += 50
         }
         return await cond()
+    }
+
+    private func withTimeout<T: Sendable>(
+        _ duration: Duration,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: duration)
+                throw TestTimeout.timedOut
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    @Test("legacy relayStatus resolves a single pending relay request")
+    func legacyRelayStatusResolvesSinglePendingRequest() async throws {
+        let (pubA, skA) = keypair()
+        let node = Ivy(config: cfg(pub: pubA, priv: skA, port: 0, relay: false))
+        let relay = PeerID(publicKey: "legacy-relay")
+        let task = Task { await node.parkRelayRequestForTesting(relayPeer: relay, nonce: 42) }
+
+        try await Task.sleep(for: .milliseconds(20))
+        await node.resolveRelayRequest(from: relay, code: 0, nonce: 0)
+
+        let result = try await withTimeout(.milliseconds(500)) { await task.value }
+        #expect(result)
+        #expect(await node.pendingRelayRequests.isEmpty)
+    }
+
+    @Test("cleanupAllPending resolves pending relay requests")
+    func cleanupAllPendingResolvesRelayRequests() async throws {
+        let (pubA, skA) = keypair()
+        let node = Ivy(config: cfg(pub: pubA, priv: skA, port: 0, relay: false))
+        let relay = PeerID(publicKey: "cleanup-relay")
+        let task = Task { await node.parkRelayRequestForTesting(relayPeer: relay, nonce: 7) }
+
+        try await Task.sleep(for: .milliseconds(20))
+        await node.cleanupAllPending()
+
+        let result = try await withTimeout(.milliseconds(500)) { await task.value }
+        #expect(!result)
+        #expect(await node.pendingRelayRequests.isEmpty)
     }
 
     @Test("two NAT'd nodes exchange a message through a relay")
@@ -91,6 +141,52 @@ struct RelayIntegrationTests {
         #expect(delivered)
 
         await A.stop(); await B.stop(); await R.stop()
+    }
+
+    @Test("same relay can satisfy concurrent connectViaRelay requests")
+    func concurrentConnectsViaSameRelayDoNotLeakContinuations() async throws {
+        let (pubR, skR) = keypair(); let (pubA, skA) = keypair()
+        let (pubB, skB) = keypair(); let (pubC, skC) = keypair()
+        let (portR, portA, portB, portC): (UInt16, UInt16, UInt16, UInt16) = (19731, 19732, 19733, 19734)
+        let R = Ivy(config: cfg(pub: pubR, priv: skR, port: portR, relay: true))
+        let A = Ivy(config: cfg(pub: pubA, priv: skA, port: portA, relay: false))
+        let B = Ivy(config: cfg(pub: pubB, priv: skB, port: portB, relay: false))
+        let C = Ivy(config: cfg(pub: pubC, priv: skC, port: portC, relay: false))
+        try await R.start(); try await A.start(); try await B.start(); try await C.start()
+
+        let relayID = PeerID(publicKey: pubR), aID = PeerID(publicKey: pubA)
+        let bID = PeerID(publicKey: pubB), cID = PeerID(publicKey: pubC)
+        let rEndpoint = PeerEndpoint(publicKey: pubR, host: "127.0.0.1", port: portR)
+        try await A.connect(to: rEndpoint)
+        try await B.connect(to: rEndpoint)
+        try await C.connect(to: rEndpoint)
+
+        let connectedToRelay = await waitUntil {
+            let aToR = await A.connections[relayID] != nil
+            let rToA = await R.connections[aID] != nil
+            let rToB = await R.connections[bID] != nil
+            let rToC = await R.connections[cID] != nil
+            return aToR && rToA && rToB && rToC
+        }
+        #expect(connectedToRelay)
+
+        try await withTimeout(.seconds(3)) {
+            async let toB: Void = A.connectViaRelay(to: PeerEndpoint(publicKey: pubB, host: "relay", port: 0))
+            async let toC: Void = A.connectViaRelay(to: PeerEndpoint(publicKey: pubC, host: "relay", port: 0))
+            try await toB
+            try await toC
+        }
+
+        let relayedBoth = await waitUntil {
+            let aToB = await A.connections[bID] != nil
+            let aToC = await A.connections[cID] != nil
+            let bToA = await B.connections[aID] != nil
+            let cToA = await C.connections[aID] != nil
+            return aToB && aToC && bToA && cToA
+        }
+        #expect(relayedBoth)
+
+        await A.stop(); await B.stop(); await C.stop(); await R.stop()
     }
 
     @Test("connect() falls back to a relay when the direct dial fails (P0 wiring)")
@@ -160,5 +256,14 @@ struct RelayIntegrationTests {
         let freed = await waitUntil { await R.relayService.activeCircuitCount() == 0 }
         #expect(freed)
         await B.stop(); await R.stop()
+    }
+}
+
+private extension Ivy {
+    func parkRelayRequestForTesting(relayPeer: PeerID, nonce: UInt64) async -> Bool {
+        await withCheckedContinuation { cont in
+            let key = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
+            pendingRelayRequests[key] = cont
+        }
     }
 }

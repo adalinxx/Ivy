@@ -20,9 +20,9 @@ public enum Message: Sendable {
     // NAT traversal Phase 1 — circuit relay (carries identify/want/sync
     // transparently between peers that have no direct link).
     /// Establish a relayed circuit src↔dst through this relay.
-    case relayConnect(srcKey: String, dstKey: String)
+    case relayConnect(srcKey: String, dstKey: String, nonce: UInt64 = 0)
     /// Relay control reply: 0 = ok, 1 = refused/unreachable target, 2 = at capacity.
-    case relayStatus(code: UInt8)
+    case relayStatus(code: UInt8, nonce: UInt64 = 0)
     /// One framed peer message carried over a circuit (peerKey = the OTHER endpoint).
     case relayData(peerKey: String, data: Data)
 
@@ -187,13 +187,15 @@ public enum Message: Sendable {
             buf.append(Tag.dhtForward.rawValue)
             guard buf.appendLengthPrefixedString(cid) else { return false }
             buf.appendUInt8(ttl)
-        case .relayConnect(let srcKey, let dstKey):
+        case .relayConnect(let srcKey, let dstKey, let nonce):
             buf.append(Tag.relayConnect.rawValue)
             guard buf.appendLengthPrefixedString(srcKey),
                   buf.appendLengthPrefixedString(dstKey) else { return false }
-        case .relayStatus(let code):
+            buf.appendUInt64(nonce)
+        case .relayStatus(let code, let nonce):
             buf.append(Tag.relayStatus.rawValue)
             buf.appendUInt8(code)
+            buf.appendUInt64(nonce)
         case .relayData(let peerKey, let data):
             buf.append(Tag.relayData.rawValue)
             guard buf.appendLengthPrefixedString(peerKey),
@@ -366,10 +368,12 @@ public enum Message: Sendable {
         case .relayConnect:
             guard let srcKey = reader.readString(),
                   let dstKey = reader.readString() else { return nil }
-            return .relayConnect(srcKey: srcKey, dstKey: dstKey)
+            let nonce = reader.readUInt64() ?? 0
+            return .relayConnect(srcKey: srcKey, dstKey: dstKey, nonce: nonce)
         case .relayStatus:
             guard let code = reader.readUInt8() else { return nil }
-            return .relayStatus(code: code)
+            let nonce = reader.readUInt64() ?? 0
+            return .relayStatus(code: code, nonce: nonce)
         case .relayData:
             guard let peerKey = reader.readString(),
                   let payload = reader.readData() else { return nil }
