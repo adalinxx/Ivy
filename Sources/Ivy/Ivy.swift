@@ -29,6 +29,11 @@ struct PendingFindPins {
     let generation: UInt64
 }
 
+struct PendingRelayRequestKey: Hashable {
+    let relayPeer: PeerID
+    let nonce: UInt64
+}
+
 public actor Ivy {
     public let config: IvyConfig
     public let tally: Tally
@@ -52,8 +57,9 @@ public actor Ivy {
     var connections: [PeerID: PeerConnection] = [:]
     // NAT traversal Phase 1 — circuit relay.
     let relayService = RelayService()
-    /// In-flight `connectViaRelay` requests, keyed by the relay peer we asked.
-    var pendingRelayRequests: [PeerID: CheckedContinuation<Bool, Never>] = [:]
+    /// In-flight `connectViaRelay` requests, keyed by relay peer + request nonce.
+    var pendingRelayRequests: [PendingRelayRequestKey: CheckedContinuation<Bool, Never>] = [:]
+    var nextRelayRequestNonce: UInt64 = 0
     /// Relayed connections indexed by the peer's CLAIMED key, for routing inbound
     /// relayData. The connection itself lives in `connections` under a temporary
     /// `inbound-<uuid>` id until a signed identify re-keys it (so an unverified
@@ -732,12 +738,15 @@ public actor Ivy {
             (conn.channel != nil && pid.publicKey != targetKey) ? pid : nil
         }
         for relayPeer in candidates {
+            nextRelayRequestNonce &+= 1
+            let nonce = nextRelayRequestNonce
+            let requestKey = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
             let success: Bool = await withCheckedContinuation { cont in
-                pendingRelayRequests[relayPeer] = cont
-                fireToPeer(relayPeer, .relayConnect(srcKey: config.publicKey, dstKey: targetKey))
+                pendingRelayRequests[requestKey] = cont
+                fireToPeer(relayPeer, .relayConnect(srcKey: config.publicKey, dstKey: targetKey, nonce: nonce))
                 Task { [weak self] in
                     try? await Task.sleep(for: .seconds(10))
-                    await self?.timeoutRelayRequest(relayPeer)
+                    await self?.timeoutRelayRequest(requestKey)
                 }
             }
             if success {
@@ -748,8 +757,20 @@ public actor Ivy {
         throw IvyError.noRelayAvailable
     }
 
-    func timeoutRelayRequest(_ relayPeer: PeerID) {
-        if let cont = pendingRelayRequests.removeValue(forKey: relayPeer) { cont.resume(returning: false) }
+    func timeoutRelayRequest(_ requestKey: PendingRelayRequestKey) {
+        if let cont = pendingRelayRequests.removeValue(forKey: requestKey) { cont.resume(returning: false) }
+    }
+
+    func resolveRelayRequest(from relayPeer: PeerID, code: UInt8, nonce: UInt64) {
+        let requestKey = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
+        if let cont = pendingRelayRequests.removeValue(forKey: requestKey) {
+            cont.resume(returning: code == 0)
+            return
+        }
+        guard nonce == 0 else { return }
+        let legacyKeys = pendingRelayRequests.keys.filter { $0.relayPeer == relayPeer }
+        guard legacyKeys.count == 1, let legacyKey = legacyKeys.first else { return }
+        pendingRelayRequests.removeValue(forKey: legacyKey)?.resume(returning: code == 0)
     }
 
     /// Open a relayed PeerConnection for a peer CLAIMING `claimedKey`, carried by
@@ -790,7 +811,7 @@ public actor Ivy {
         }
     }
 
-    func handleRelayConnect(srcKey: String, dstKey: String, from peer: PeerID) async {
+    func handleRelayConnect(srcKey: String, dstKey: String, nonce: UInt64, from peer: PeerID) async {
         if dstKey == config.publicKey {
             // I am the TARGET; `peer` is the relay. Open my (unverified) side toward src.
             openRelayedConnection(claimedKey: srcKey, endpoint: PeerEndpoint(publicKey: srcKey, host: "relay", port: 0), via: peer)
@@ -801,13 +822,13 @@ public actor Ivy {
             let realSrc = peer.publicKey
             let dst = PeerID(publicKey: dstKey)
             guard tally.shouldAllow(peer: peer), connections[dst] != nil else {
-                fireToPeer(peer, .relayStatus(code: 1)); return
+                fireToPeer(peer, .relayStatus(code: 1, nonce: nonce)); return
             }
             if await relayService.createCircuit(initiator: realSrc, target: dstKey) {
-                fireToPeer(peer, .relayStatus(code: 0))
-                fireToPeer(dst, .relayConnect(srcKey: realSrc, dstKey: dstKey))
+                fireToPeer(peer, .relayStatus(code: 0, nonce: nonce))
+                fireToPeer(dst, .relayConnect(srcKey: realSrc, dstKey: dstKey, nonce: nonce))
             } else {
-                fireToPeer(peer, .relayStatus(code: 2))
+                fireToPeer(peer, .relayStatus(code: 2, nonce: nonce))
             }
         }
     }
@@ -848,10 +869,10 @@ public actor Ivy {
             }
 
         // NAT traversal Phase 1 — circuit relay.
-        case .relayConnect(let srcKey, let dstKey):
-            await handleRelayConnect(srcKey: srcKey, dstKey: dstKey, from: peer)
-        case .relayStatus(let code):
-            if let cont = pendingRelayRequests.removeValue(forKey: peer) { cont.resume(returning: code == 0) }
+        case .relayConnect(let srcKey, let dstKey, let nonce):
+            await handleRelayConnect(srcKey: srcKey, dstKey: dstKey, nonce: nonce, from: peer)
+        case .relayStatus(let code, let nonce):
+            resolveRelayRequest(from: peer, code: code, nonce: nonce)
         case .relayData(let peerKey, let data):
             await handleRelayData(peerKey: peerKey, data: data, from: peer)
 
@@ -1314,7 +1335,10 @@ public actor Ivy {
         // H4: release relay state at the teardown choke point so a churning peer
         // can't leak circuits/continuations. (relayedVia is cleared in the
         // handleInbound teardown, which needs it for the reconnect decision.)
-        if let cont = pendingRelayRequests.removeValue(forKey: peer) { cont.resume(returning: false) }
+        let relayRequestKeys = pendingRelayRequests.keys.filter { $0.relayPeer == peer }
+        for requestKey in relayRequestKeys {
+            pendingRelayRequests.removeValue(forKey: requestKey)?.resume(returning: false)
+        }
         Task { await relayService.removeAllCircuits(forPeer: peer.publicKey) }
 
         let forwardCIDs = pendingForwards.compactMap { cid, peers in
@@ -1353,7 +1377,8 @@ public actor Ivy {
         pendingVolumeRequests: [String: PendingVolumeRequest],
         pendingPEX: [UInt64: CheckedContinuation<[PeerEndpoint], Never>],
         pendingNeighborResponses: [UInt64: PendingNeighborResponse],
-        pendingFindPins: [String: PendingFindPins]
+        pendingFindPins: [String: PendingFindPins],
+        pendingRelayRequests: [PendingRelayRequestKey: CheckedContinuation<Bool, Never>]
     ) {
         for (_, continuations) in pendingRequests {
             for cont in continuations { cont.resume(returning: nil) }
@@ -1370,6 +1395,9 @@ public actor Ivy {
         for (_, pending) in pendingFindPins {
             for cont in pending.continuations { cont.resume(returning: []) }
         }
+        for (_, cont) in pendingRelayRequests {
+            cont.resume(returning: false)
+        }
     }
 
     /// Safety net: resolve all pending continuations when the actor is torn down.
@@ -1383,7 +1411,8 @@ public actor Ivy {
             pendingVolumeRequests: pendingVolumeRequests,
             pendingPEX: pendingPEX,
             pendingNeighborResponses: pendingNeighborResponses,
-            pendingFindPins: pendingFindPins
+            pendingFindPins: pendingFindPins,
+            pendingRelayRequests: pendingRelayRequests
         )
     }
 
@@ -1393,7 +1422,8 @@ public actor Ivy {
             pendingVolumeRequests: pendingVolumeRequests,
             pendingPEX: pendingPEX,
             pendingNeighborResponses: pendingNeighborResponses,
-            pendingFindPins: pendingFindPins
+            pendingFindPins: pendingFindPins,
+            pendingRelayRequests: pendingRelayRequests
         )
         pendingRequests.removeAll()
         pendingVolumeRequests.removeAll()
@@ -1402,6 +1432,7 @@ public actor Ivy {
         pendingNeighborLookupNonces.removeAll()
         completedNeighborResponses.removeAll()
         pendingFindPins.removeAll()
+        pendingRelayRequests.removeAll()
         clearPendingForwards()
     }
 
