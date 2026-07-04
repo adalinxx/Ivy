@@ -33,6 +33,19 @@ public final class PeerConnection: @unchecked Sendable {
     let relayCarrierConn: PeerConnection?
     private let maxFrameSize: UInt32
     private var closed = false
+    /// Last time an inbound frame arrived. For a channel-less RELAYED connection this is the
+    /// only liveness signal: a healthy relay circuit delivers the peer's keepalive pongs, so no
+    /// inbound for `relayedStaleTimeout` means the circuit is dead even though the carrier is up —
+    /// otherwise `isLive` reads `!closed` forever. Updated on `feedMessage`. The health monitor
+    /// (staleTimeout 180s) is the primary reaper; this is a conservative backstop for the case
+    /// it doesn't fire, deliberately set WELL above the worst-case pong cadence so it never
+    /// false-drops a healthy conn.
+    private var lastInboundActivity: ContinuousClock.Instant = .now
+    /// A relayed conn with no inbound for this long is presumed dead. A quiet circuit's pong
+    /// cadence is ~120s (PeerHealthMonitor pings only when idle > keepaliveInterval=60s and its
+    /// loop sleeps 60s), and pongs traverse two hops, so the real worst case is ~240s. Set well
+    /// above that to avoid false teardown; the 180s health monitor handles the common case.
+    static let relayedStaleTimeout: Duration = .seconds(300)
     private let inbound: AsyncStream<Message>
     private let inboundContinuation: AsyncStream<Message>.Continuation
 
@@ -107,10 +120,14 @@ public final class PeerConnection: @unchecked Sendable {
 
     var isLive: Bool {
         if let channel { return channel.isActive || !closed }
-        return !closed  // relayed connection: live until explicitly closed
+        // Relayed (channel-less): live only while un-closed AND recently active. A dead relay
+        // circuit stops delivering the peer's keepalives, so inbound goes quiet — reap it so
+        // the slot frees and re-dial can recreate the circuit, instead of `!closed` forever.
+        return !closed && lastInboundActivity.duration(to: .now) < Self.relayedStaleTimeout
     }
 
     func feedMessage(_ message: Message) {
+        lastInboundActivity = .now
         inboundContinuation.yield(message)
     }
 
