@@ -24,14 +24,19 @@ struct RelayServiceTests {
         #expect(await relay.activeCircuitCount() == 4)
     }
 
-    @Test("byte budget closes a circuit")
-    func byteBudget() async {
+    @Test("per-window rate cap closes a flooding circuit; steady legit traffic stays open")
+    func byteRateCap() async {
         let relay = RelayService()
         #expect(await relay.createCircuit(initiator: "A", target: "B"))
-        // within budget
-        #expect(await relay.relay(from: "A", to: "B", bytes: 1024))
-        // exceeding the 128 KB per-circuit budget closes it
-        #expect(await relay.relay(from: "A", to: "B", bytes: 128 * 1024) == false)
+        // 1 MB of steady traffic — far over the OLD 128 KB hard total (which would have
+        // black-holed a real gossip/sync stream), but under the per-window rate cap, so the
+        // circuit stays open. This is exactly the regression the fix targets.
+        for _ in 0..<8 {
+            #expect(await relay.relay(from: "A", to: "B", bytes: 128 * 1024))
+        }
+        #expect(await relay.hasCircuit(between: "A", and: "B"))
+        // A frame that pushes THIS window over the 8 MB/min rate cap tears it down (flooding).
+        #expect(await relay.relay(from: "A", to: "B", bytes: 8 * 1024 * 1024) == false)
         #expect(await relay.hasCircuit(between: "A", and: "B") == false)
     }
 

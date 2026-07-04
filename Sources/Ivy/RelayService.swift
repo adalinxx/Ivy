@@ -13,14 +13,28 @@ actor RelayService {
     struct Circuit: Sendable {
         let peerA: String
         let peerB: String
-        let created: ContinuousClock.Instant
-        var bytesRelayed: Int = 0
+        let created: ContinuousClock.Instant          // hard-lifetime backstop
+        var lastActivity: ContinuousClock.Instant      // sliding idle timeout — renewed on relayed traffic
+        var windowStart: ContinuousClock.Instant       // start of the current byte-rate window
+        var bytesInWindow: Int = 0
 
-        static let maxDuration: Duration = .seconds(120)
-        static let maxBytes = 128 * 1024  // tunable default, not a protocol constant
+        // An IDLE circuit (no relayed traffic within this) is torn down; an ACTIVELY-used
+        // circuit is renewed on every frame and lives on. This replaces the old hard 120s
+        // lifetime, which black-holed long-lived legitimate gossip/sync circuits mid-stream
+        // (a relay-only follower's chain gossip is continuous and far exceeds 120s).
+        static let idleTimeout: Duration = .seconds(120)
+        // Absolute backstop: no circuit outlives this regardless of activity, bounding the
+        // worst case a single circuit can cost the relay.
+        static let maxLifetime: Duration = .seconds(3600)
+        // Byte-RATE cap (not a total): at most `maxBytesPerWindow` per `rateWindow`, reset each
+        // window. Bounds sustained throughput abuse while permitting arbitrarily long legitimate
+        // transfers (chain sync, ongoing gossip) at a sane rate. Tunable defaults, not protocol constants.
+        static let rateWindow: Duration = .seconds(60)
+        static let maxBytesPerWindow = 8 * 1024 * 1024  // 8 MB/min
 
         var isExpired: Bool {
-            created.duration(to: .now) > Self.maxDuration || bytesRelayed >= Self.maxBytes
+            lastActivity.duration(to: .now) > Self.idleTimeout
+                || created.duration(to: .now) > Self.maxLifetime
         }
     }
 
@@ -44,7 +58,8 @@ actor RelayService {
         }.count
         guard peerCircuits < maxCircuitsPerPeer else { return false }
 
-        circuits[key] = Circuit(peerA: initiator, peerB: target, created: .now)
+        let now: ContinuousClock.Instant = .now
+        circuits[key] = Circuit(peerA: initiator, peerB: target, created: now, lastActivity: now, windowStart: now)
         return true
     }
 
@@ -57,13 +72,21 @@ actor RelayService {
             circuits.removeValue(forKey: key)
             return false
         }
-        circuit.bytesRelayed += bytes
-        // Reject (and close) the frame that pushes the circuit over its budget,
-        // rather than forwarding it and only refusing the next one.
-        if circuit.isExpired {
+        let now: ContinuousClock.Instant = .now
+        // Roll the byte-rate window if it has elapsed.
+        if circuit.windowStart.duration(to: now) > Circuit.rateWindow {
+            circuit.windowStart = now
+            circuit.bytesInWindow = 0
+        }
+        circuit.bytesInWindow += bytes
+        // Over the per-window rate cap: drop this frame and tear the circuit down
+        // (sustained flooding), rather than forwarding it and only refusing the next one.
+        if circuit.bytesInWindow > Circuit.maxBytesPerWindow {
             circuits.removeValue(forKey: key)
             return false
         }
+        // Renew the idle timeout — an actively-relaying circuit stays alive past 120s.
+        circuit.lastActivity = now
         circuits[key] = circuit
         return true
     }
