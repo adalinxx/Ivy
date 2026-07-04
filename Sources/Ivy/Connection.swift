@@ -33,6 +33,15 @@ public final class PeerConnection: @unchecked Sendable {
     let relayCarrierConn: PeerConnection?
     private let maxFrameSize: UInt32
     private var closed = false
+    /// Last time an inbound frame arrived. For a channel-less RELAYED connection this is
+    /// the only liveness signal: a healthy relay circuit delivers the peer's ~60s keepalive
+    /// pongs, so no inbound for `relayedStaleTimeout` means the circuit is dead even though
+    /// the carrier is up — otherwise `isLive` reads `!closed` forever and the dead conn
+    /// lingers until the 180s health reaper, blocking re-dial. Updated on `feedMessage`.
+    private var lastInboundActivity: ContinuousClock.Instant = .now
+    /// A relayed conn with no inbound for this long is presumed dead (≈2.5 missed keepalives);
+    /// slightly under the health monitor's stale timeout so re-dial can start a beat sooner.
+    static let relayedStaleTimeout: Duration = .seconds(150)
     private let inbound: AsyncStream<Message>
     private let inboundContinuation: AsyncStream<Message>.Continuation
 
@@ -107,10 +116,14 @@ public final class PeerConnection: @unchecked Sendable {
 
     var isLive: Bool {
         if let channel { return channel.isActive || !closed }
-        return !closed  // relayed connection: live until explicitly closed
+        // Relayed (channel-less): live only while un-closed AND recently active. A dead relay
+        // circuit stops delivering the peer's keepalives, so inbound goes quiet — reap it so
+        // the slot frees and re-dial can recreate the circuit, instead of `!closed` forever.
+        return !closed && lastInboundActivity.duration(to: .now) < Self.relayedStaleTimeout
     }
 
     func feedMessage(_ message: Message) {
+        lastInboundActivity = .now
         inboundContinuation.yield(message)
     }
 
