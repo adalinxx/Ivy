@@ -45,6 +45,23 @@ struct RelayServiceTests {
         #expect(await relay.hasCircuit(between: "A", and: "B"))
     }
 
+    @Test("node-wide aggregate rate cap bounds total relayed egress across circuits")
+    func aggregateRateCap() async {
+        let relay = RelayService()
+        // 9 circuits, each a distinct peer pair (every peer appears once → under the 4/peer cap).
+        var pairs: [(String, String)] = []
+        for i in 0..<9 { pairs.append(("i\(i)a", "i\(i)b")) }
+        for p in pairs { #expect(await relay.createCircuit(initiator: p.0, target: p.1)) }
+        // Each of the first 8 relays exactly its 8 MB per-circuit budget; the SUM is 64 MB = the
+        // node-wide aggregate cap, so all 8 succeed.
+        for i in 0..<8 { #expect(await relay.relay(from: pairs[i].0, to: pairs[i].1, bytes: 8 * 1024 * 1024)) }
+        // The 9th circuit is FRESH (well under its own per-circuit budget), but the node-wide
+        // aggregate is now exhausted — so its frame is dropped by the AGGREGATE cap, proving the
+        // sum across circuits is bounded and can't be amplified by opening more circuits.
+        #expect(await relay.relay(from: pairs[8].0, to: pairs[8].1, bytes: 8 * 1024 * 1024) == false)
+        #expect(await relay.hasCircuit(between: pairs[8].0, and: pairs[8].1))  // throttled, not torn down
+    }
+
     @Test("relay on a missing circuit is refused")
     func missingCircuit() async {
         let relay = RelayService()

@@ -42,6 +42,15 @@ actor RelayService {
     private let maxCircuitsPerPeer = 4
     private let maxTotalCircuits = 128
 
+    // Node-wide AGGREGATE relayed-byte ceiling across ALL circuits (same window as the per-circuit
+    // rate). The per-circuit rate alone bounds one circuit, but 128 circuits × 8 MB/min would let a
+    // Sybil set turn the relay into a ~1 GB/min bandwidth amplifier. This caps total relayed egress
+    // so the relay can never forward more than `maxAggregateBytesPerWindow` per window regardless of
+    // circuit count. A single peer (≤4 circuits) can't reach it alone; it bounds a colluding set.
+    static let maxAggregateBytesPerWindow = 64 * 1024 * 1024  // 64 MB / rateWindow; tunable default
+    private var aggregateBytesInWindow = 0
+    private var aggregateWindowStart: ContinuousClock.Instant = .now
+
     private func circuitKey(_ a: String, _ b: String) -> String {
         a < b ? "\(a):\(b)" : "\(b):\(a)"
     }
@@ -79,14 +88,26 @@ actor RelayService {
             circuit.bytesInWindow = 0
         }
         circuit.bytesInWindow += bytes
-        // Over the per-window rate cap: DROP this frame but KEEP the circuit — a rate limit
-        // throttles, it does not destroy a legitimate stream mid-burst. Tearing down here
-        // would (a) re-introduce the black-holing this change fixes (a sync backlog bursts
-        // past the cap) and (b) trip the pre-existing relay/endpoint role-confusion in
-        // handleRelayData (a torn circuit makes the next relayData look like endpoint traffic).
-        // Persist the counter (the window keeps accounting) and do NOT renew the idle timeout,
-        // so a circuit that only ever floods still idles out.
+        // Over the per-circuit rate cap: DROP this frame but KEEP the circuit — a rate limit
+        // throttles, it does not destroy a legitimate stream mid-burst. Tearing down here would
+        // (a) re-introduce the black-holing this change fixes (a sync backlog bursts past the cap)
+        // and (b) trip the pre-existing relay/endpoint role-confusion in handleRelayData (a torn
+        // circuit makes the next relayData look like endpoint traffic). Persist the counter so the
+        // frame stays throttled until the window rolls. (Throughput and total lifetime are bounded
+        // by the rate + maxLifetime backstop regardless.)
         if circuit.bytesInWindow > Circuit.maxBytesPerWindow {
+            circuits[key] = circuit
+            return false
+        }
+        // Node-wide AGGREGATE rate window — bound TOTAL relayed egress across all circuits so the
+        // sum of per-circuit rates can't amplify. Rolled independently of the per-circuit window.
+        if aggregateWindowStart.duration(to: now) > Circuit.rateWindow {
+            aggregateWindowStart = now
+            aggregateBytesInWindow = 0
+        }
+        aggregateBytesInWindow += bytes
+        if aggregateBytesInWindow > Self.maxAggregateBytesPerWindow {
+            // Over the node-wide aggregate cap: drop the frame, keep the circuit (throttle).
             circuits[key] = circuit
             return false
         }
