@@ -13,20 +13,43 @@ actor RelayService {
     struct Circuit: Sendable {
         let peerA: String
         let peerB: String
-        let created: ContinuousClock.Instant
-        var bytesRelayed: Int = 0
+        let created: ContinuousClock.Instant          // hard-lifetime backstop
+        var lastActivity: ContinuousClock.Instant      // sliding idle timeout — renewed on relayed traffic
+        var windowStart: ContinuousClock.Instant       // start of the current byte-rate window
+        var bytesInWindow: Int = 0
 
-        static let maxDuration: Duration = .seconds(120)
-        static let maxBytes = 128 * 1024  // tunable default, not a protocol constant
+        // An IDLE circuit (no relayed traffic within this) is torn down; an ACTIVELY-used
+        // circuit is renewed on every frame and lives on. This replaces the old hard 120s
+        // lifetime, which black-holed long-lived legitimate gossip/sync circuits mid-stream
+        // (a relay-only follower's chain gossip is continuous and far exceeds 120s).
+        static let idleTimeout: Duration = .seconds(120)
+        // Absolute backstop: no circuit outlives this regardless of activity, bounding the
+        // worst case a single circuit can cost the relay.
+        static let maxLifetime: Duration = .seconds(3600)
+        // Byte-RATE cap (not a total): at most `maxBytesPerWindow` per `rateWindow`, reset each
+        // window. Bounds sustained throughput abuse while permitting arbitrarily long legitimate
+        // transfers (chain sync, ongoing gossip) at a sane rate. Tunable defaults, not protocol constants.
+        static let rateWindow: Duration = .seconds(60)
+        static let maxBytesPerWindow = 8 * 1024 * 1024  // 8 MB/min
 
         var isExpired: Bool {
-            created.duration(to: .now) > Self.maxDuration || bytesRelayed >= Self.maxBytes
+            lastActivity.duration(to: .now) > Self.idleTimeout
+                || created.duration(to: .now) > Self.maxLifetime
         }
     }
 
     private var circuits: [String: Circuit] = [:]
     private let maxCircuitsPerPeer = 4
     private let maxTotalCircuits = 128
+
+    // Node-wide AGGREGATE relayed-byte ceiling across ALL circuits (same window as the per-circuit
+    // rate). The per-circuit rate alone bounds one circuit, but 128 circuits × 8 MB/min would let a
+    // Sybil set turn the relay into a ~1 GB/min bandwidth amplifier. This caps total relayed egress
+    // so the relay can never forward more than `maxAggregateBytesPerWindow` per window regardless of
+    // circuit count. A single peer (≤4 circuits) can't reach it alone; it bounds a colluding set.
+    static let maxAggregateBytesPerWindow = 64 * 1024 * 1024  // 64 MB / rateWindow; tunable default
+    private var aggregateBytesInWindow = 0
+    private var aggregateWindowStart: ContinuousClock.Instant = .now
 
     private func circuitKey(_ a: String, _ b: String) -> String {
         a < b ? "\(a):\(b)" : "\(b):\(a)"
@@ -44,7 +67,8 @@ actor RelayService {
         }.count
         guard peerCircuits < maxCircuitsPerPeer else { return false }
 
-        circuits[key] = Circuit(peerA: initiator, peerB: target, created: .now)
+        let now: ContinuousClock.Instant = .now
+        circuits[key] = Circuit(peerA: initiator, peerB: target, created: now, lastActivity: now, windowStart: now)
         return true
     }
 
@@ -57,13 +81,38 @@ actor RelayService {
             circuits.removeValue(forKey: key)
             return false
         }
-        circuit.bytesRelayed += bytes
-        // Reject (and close) the frame that pushes the circuit over its budget,
-        // rather than forwarding it and only refusing the next one.
-        if circuit.isExpired {
-            circuits.removeValue(forKey: key)
+        let now: ContinuousClock.Instant = .now
+        // Roll the byte-rate window if it has elapsed.
+        if circuit.windowStart.duration(to: now) > Circuit.rateWindow {
+            circuit.windowStart = now
+            circuit.bytesInWindow = 0
+        }
+        circuit.bytesInWindow += bytes
+        // Over the per-circuit rate cap: DROP this frame but KEEP the circuit — a rate limit
+        // throttles, it does not destroy a legitimate stream mid-burst. Tearing down here would
+        // (a) re-introduce the black-holing this change fixes (a sync backlog bursts past the cap)
+        // and (b) trip the pre-existing relay/endpoint role-confusion in handleRelayData (a torn
+        // circuit makes the next relayData look like endpoint traffic). Persist the counter so the
+        // frame stays throttled until the window rolls. (Throughput and total lifetime are bounded
+        // by the rate + maxLifetime backstop regardless.)
+        if circuit.bytesInWindow > Circuit.maxBytesPerWindow {
+            circuits[key] = circuit
             return false
         }
+        // Node-wide AGGREGATE rate window — bound TOTAL relayed egress across all circuits so the
+        // sum of per-circuit rates can't amplify. Rolled independently of the per-circuit window.
+        if aggregateWindowStart.duration(to: now) > Circuit.rateWindow {
+            aggregateWindowStart = now
+            aggregateBytesInWindow = 0
+        }
+        aggregateBytesInWindow += bytes
+        if aggregateBytesInWindow > Self.maxAggregateBytesPerWindow {
+            // Over the node-wide aggregate cap: drop the frame, keep the circuit (throttle).
+            circuits[key] = circuit
+            return false
+        }
+        // Renew the idle timeout on a SUCCESSFUL relay — an actively-relaying circuit lives past 120s.
+        circuit.lastActivity = now
         circuits[key] = circuit
         return true
     }
