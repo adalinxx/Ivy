@@ -79,13 +79,18 @@ actor RelayService {
             circuit.bytesInWindow = 0
         }
         circuit.bytesInWindow += bytes
-        // Over the per-window rate cap: drop this frame and tear the circuit down
-        // (sustained flooding), rather than forwarding it and only refusing the next one.
+        // Over the per-window rate cap: DROP this frame but KEEP the circuit — a rate limit
+        // throttles, it does not destroy a legitimate stream mid-burst. Tearing down here
+        // would (a) re-introduce the black-holing this change fixes (a sync backlog bursts
+        // past the cap) and (b) trip the pre-existing relay/endpoint role-confusion in
+        // handleRelayData (a torn circuit makes the next relayData look like endpoint traffic).
+        // Persist the counter (the window keeps accounting) and do NOT renew the idle timeout,
+        // so a circuit that only ever floods still idles out.
         if circuit.bytesInWindow > Circuit.maxBytesPerWindow {
-            circuits.removeValue(forKey: key)
+            circuits[key] = circuit
             return false
         }
-        // Renew the idle timeout — an actively-relaying circuit stays alive past 120s.
+        // Renew the idle timeout on a SUCCESSFUL relay — an actively-relaying circuit lives past 120s.
         circuit.lastActivity = now
         circuits[key] = circuit
         return true

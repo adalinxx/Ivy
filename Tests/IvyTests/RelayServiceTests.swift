@@ -24,7 +24,7 @@ struct RelayServiceTests {
         #expect(await relay.activeCircuitCount() == 4)
     }
 
-    @Test("per-window rate cap closes a flooding circuit; steady legit traffic stays open")
+    @Test("per-window rate cap throttles a flood without tearing the circuit down; steady legit traffic stays open")
     func byteRateCap() async {
         let relay = RelayService()
         #expect(await relay.createCircuit(initiator: "A", target: "B"))
@@ -35,9 +35,14 @@ struct RelayServiceTests {
             #expect(await relay.relay(from: "A", to: "B", bytes: 128 * 1024))
         }
         #expect(await relay.hasCircuit(between: "A", and: "B"))
-        // A frame that pushes THIS window over the 8 MB/min rate cap tears it down (flooding).
+        // A frame that pushes THIS window over the 8 MB/min rate cap is DROPPED (relay → false),
+        // but the circuit is KEPT — a rate limiter throttles, it does not destroy a legit stream
+        // mid-burst (destroying it would re-introduce black-holing + trip relay/endpoint role
+        // confusion). Subsequent over-rate frames also drop until the window rolls.
         #expect(await relay.relay(from: "A", to: "B", bytes: 8 * 1024 * 1024) == false)
-        #expect(await relay.hasCircuit(between: "A", and: "B") == false)
+        #expect(await relay.hasCircuit(between: "A", and: "B"))  // still open — throttled, not torn down
+        #expect(await relay.relay(from: "A", to: "B", bytes: 1024) == false)  // still throttled this window
+        #expect(await relay.hasCircuit(between: "A", and: "B"))
     }
 
     @Test("relay on a missing circuit is refused")
