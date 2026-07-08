@@ -36,16 +36,23 @@ public final class PeerConnection: @unchecked Sendable {
     /// Last time an inbound frame arrived. For a channel-less RELAYED connection this is the
     /// only liveness signal: a healthy relay circuit delivers the peer's keepalive pongs, so no
     /// inbound for `relayedStaleTimeout` means the circuit is dead even though the carrier is up —
-    /// otherwise `isLive` reads `!closed` forever. Updated on `feedMessage`. The health monitor
-    /// (staleTimeout 180s) is the primary reaper; this is a conservative backstop for the case
-    /// it doesn't fire, deliberately set WELL above the worst-case pong cadence so it never
-    /// false-drops a healthy conn.
+    /// otherwise `isLive` reads `!closed` forever. Updated on `feedMessage`.
     private var lastInboundActivity: ContinuousClock.Instant = .now
-    /// A relayed conn with no inbound for this long is presumed dead. A quiet circuit's pong
-    /// cadence is ~120s (PeerHealthMonitor pings only when idle > keepaliveInterval=60s and its
-    /// loop sleeps 60s), and pongs traverse two hops, so the real worst case is ~240s. Set well
-    /// above that to avoid false teardown; the 180s health monitor handles the common case.
-    static let relayedStaleTimeout: Duration = .seconds(300)
+    /// Cadence of the dedicated relayed-circuit probe: Ivy pings each relayed connection over
+    /// its circuit on this interval, so a HEALTHY circuit sees inbound (the pong) at least
+    /// every ~probe interval + RTT. This replaces the old reliance on the health monitor's
+    /// idle-gated keepalive (worst case ~240s across two hops) as the inbound floor.
+    static let relayedProbeInterval: Duration = .seconds(30)
+    /// A relayed connection with no inbound for this long FAILS OVER to another carrier
+    /// (`scheduleRelayFailover`). With the probe loop guaranteeing a ~30s inbound floor on a
+    /// healthy circuit, 90s means ~3 consecutive unanswered probes — robust to transient loss
+    /// yet 3.3x faster than the old passive 300s bound (which had to sit above the health
+    /// monitor's worst-case pong cadence because nothing probed the circuit directly).
+    static let relayedFailoverTimeout: Duration = .seconds(90)
+    /// `isLive` backstop: a relayed conn with no inbound for this long is presumed dead even
+    /// if the failover path never ran (e.g. the probe task was lost). Four unanswered probes;
+    /// strictly above `relayedFailoverTimeout` so failover always fires first.
+    static let relayedStaleTimeout: Duration = .seconds(120)
     private let inbound: AsyncStream<Message>
     private let inboundContinuation: AsyncStream<Message>.Continuation
 
@@ -125,6 +132,20 @@ public final class PeerConnection: @unchecked Sendable {
         // the slot frees and re-dial can recreate the circuit, instead of `!closed` forever.
         return !closed && lastInboundActivity.duration(to: .now) < Self.relayedStaleTimeout
     }
+
+    /// Time since the last inbound frame. The probe loop reads this to decide
+    /// whether a relayed circuit has gone silent (see `relayedFailoverTimeout`).
+    var inboundIdle: Duration {
+        lastInboundActivity.duration(to: .now)
+    }
+
+#if DEBUG
+    /// Backdate inbound activity so tests can exercise the silent-circuit
+    /// detection without waiting wall-clock time.
+    func backdateInboundActivityForTesting(by duration: Duration) {
+        lastInboundActivity = ContinuousClock.now - duration
+    }
+#endif
 
     func feedMessage(_ message: Message) {
         lastInboundActivity = .now
