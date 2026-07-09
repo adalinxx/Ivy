@@ -319,17 +319,29 @@ public actor Ivy {
         connections[peer] != nil
     }
 
-    /// Count of OTHER peers holding a connection (direct OR relayed —
-    /// relayed conns are counted intentionally so the cap can't be bypassed via
-    /// relayed links) whose advertised `endpoint.host` falls in netgroup `group`.
-    /// Backs `reserveOutgoingDial`'s per-netgroup diversity cap; `excluding` omits
-    /// the peer being upgraded so a direct dial that supersedes that peer's own
-    /// relayed conn is not counted against its own upgrade (nil ⇒ nothing
-    /// excluded, i.e. a brand-new peer). NOTE: do NOT narrow this to direct-only —
-    /// that would let relayed links occupy netgroup slots for free.
+    /// Count of OTHER peers holding a connection whose UNFORGEABLE observed L3
+    /// netgroup (`carrierNetgroup`, keyed on the address seen on the socket, NOT
+    /// the self-advertised `endpoint.host` that `handleIdentify` overwrites)
+    /// equals `group`. Backs `reserveOutgoingDial`'s per-netgroup diversity cap;
+    /// `excluding` omits the peer being upgraded (nil ⇒ nothing excluded, i.e. a
+    /// brand-new peer).
+    ///
+    /// Keying on the observed address closes an eclipse assist: a connected peer
+    /// cannot deflate its true-netgroup count by advertising a listenAddr in a
+    /// different netgroup to unlock extra direct dials into its real netgroup.
+    ///
+    /// A RELAYED conn (channel == nil) has NO observed L3 address — it was never
+    /// dialed/accepted on a socket — so `carrierNetgroup` returns the sentinel and
+    /// it matches no real target netgroup: relayed conns do NOT occupy a
+    /// DIRECT-dial netgroup slot. This is intended: `reserveOutgoingDial` gates
+    /// direct outbound dials, and a relayed circuit (established via
+    /// `connectViaRelay`, bounded separately by `maxRelayedConnections` and the
+    /// RelayService caps) is not a direct-dial slot. The old behavior counted a
+    /// relayed conn by its FORGEABLE advertised host, which gave no real
+    /// protection anyway.
     func connectionCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
         connections.filter { pid, conn in
-            pid != peer && NetGroup.group(conn.endpoint.host) == group
+            pid != peer && carrierNetgroup(conn) == group
         }.count
     }
 
