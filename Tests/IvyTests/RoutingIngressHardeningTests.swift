@@ -236,6 +236,40 @@ struct RoutingIngressHardeningTests {
         peerSide.close()
     }
 
+    @Test("A public node rejects discovered endpoints in non-routable address space")
+    func publicNodeRejectsNonRoutableDiscoveredEndpoints() async {
+        // A node with a declared ROUTABLE externalAddress is public-facing.
+        let publicNode = Ivy(config: IvyConfig(
+            publicKey: "routing-public-node",
+            listenPort: 0,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            externalAddress: (host: "203.0.113.5", port: 4001)
+        ))
+        let source = PeerID(publicKey: "routing-public-source")
+        func ep(_ host: String) -> PeerEndpoint {
+            PeerEndpoint(publicKey: "disc-\(host)", host: host, port: 4001)
+        }
+
+        // Non-routable / internal / non-IP: all rejected (no SSRF steering).
+        for host in ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1",
+                     "169.254.1.1", "::1", "fe80::1", "fc00::1", "not-an-ip", "example.com"] {
+            #expect(!(await publicNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
+                    "public node must reject non-routable/internal host \(host)")
+        }
+        // Genuinely routable addresses still pass.
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("198.51.100.7"), source: "test", from: source))
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2001:db8::1"), source: "test", from: source))
+
+        // A node WITHOUT a public externalAddress (local/test mode) still accepts
+        // loopback/private peers — the filter must not break local operation.
+        let localNode = Ivy(config: routingConfig(publicKey: "routing-local-node"))
+        #expect(await localNode.isAcceptableDiscoveredEndpoint(ep("127.0.0.1"), source: "test", from: source))
+        #expect(await localNode.isAcceptableDiscoveredEndpoint(ep("10.0.0.1"), source: "test", from: source))
+    }
+
     @Test("findNode handler is gated by Tally before enumerating routing table")
     func findNodeIsGatedBeforeReplyingWithNeighbors() async throws {
         let tallyConfig = TallyConfig(rateLimitBytesPerSecond: 1)
