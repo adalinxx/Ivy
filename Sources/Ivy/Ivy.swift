@@ -286,6 +286,15 @@ public actor Ivy {
     // MARK: - Connection Management
 
     public func connect(to endpoint: PeerEndpoint) async throws {
+        try await connect(to: endpoint, allowRelayFallback: true)
+    }
+
+    /// `allowRelayFallback == false` forces a DIRECT dial with no circuit-relay
+    /// fallback. Carrier-seed redial uses this: a seed reachable only via relay is
+    /// not a usable carrier (a relayed connection has `channel == nil`), so its
+    /// direct-dial failure must count toward eviction rather than silently opening
+    /// a channel-less relayed connection that falsely reads as a restored carrier.
+    func connect(to endpoint: PeerEndpoint, allowRelayFallback: Bool) async throws {
         let peer = PeerID(publicKey: endpoint.publicKey)
         guard reserveOutgoingDial(to: endpoint) else { return }
 
@@ -297,7 +306,7 @@ public actor Ivy {
             // P0: direct dial failed (likely NAT). Fall back to a circuit relay if
             // any relay-capable peer is connected. `endpoint.host == "relay"` is the
             // synthetic host of an already-relayed endpoint — never relay those.
-            if endpoint.host != "relay",
+            if allowRelayFallback, endpoint.host != "relay",
                connections.values.contains(where: { $0.channel != nil }) {
                 do { try await connectViaRelay(to: endpoint); return } catch { throw error }
             }
@@ -966,7 +975,11 @@ public actor Ivy {
     /// while still reclaiming a genuinely dead carrier.
     func redialRelayCarrierSeed(key: String, endpoint: PeerEndpoint) async {
         do {
-            try await connect(to: endpoint)
+            // DIRECT-ONLY: a seed only reachable via relay cannot serve as a
+            // carrier, so a failed direct dial must count toward eviction (below)
+            // rather than open a channel-less relayed connection that would falsely
+            // read as a restored carrier and suppress future direct redials.
+            try await connect(to: endpoint, allowRelayFallback: false)
             relayCarrierSeedFailures.removeValue(forKey: key)
         } catch {
             let failures = (relayCarrierSeedFailures[key] ?? 0) + 1
