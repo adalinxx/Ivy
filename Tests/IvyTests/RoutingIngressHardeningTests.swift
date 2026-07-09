@@ -290,6 +290,27 @@ struct RoutingIngressHardeningTests {
         #expect(await localNode.isAcceptableDiscoveredEndpoint(ep("10.0.0.1"), source: "test", from: source))
     }
 
+    @Test("A STUN-reflexive-public node (no externalAddress) rejects non-routable discovered endpoints")
+    func stunPublicNodeRejectsNonRoutableDiscoveredEndpoints() async {
+        // No declared externalAddress, but the node became publicly reachable via
+        // STUN: start() stores a reflexive publicAddress and sendIdentify advertises
+        // it. Such a node is effectively public, so the SSRF non-routable filter
+        // must apply — even though config.externalAddress is nil.
+        let stunNode = Ivy(config: routingConfig(publicKey: "routing-stun-public-node"))
+        await stunNode.setPublicAddressForTesting(ObservedAddress(host: "8.8.8.8", port: 4001))
+        let source = PeerID(publicKey: "routing-stun-public-source")
+        func ep(_ host: String) -> PeerEndpoint {
+            PeerEndpoint(publicKey: "stun-disc-\(host)", host: host, port: 4001)
+        }
+
+        for host in ["10.0.0.1", "169.254.169.254", "127.0.0.1", "192.168.1.1"] {
+            #expect(!(await stunNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
+                    "STUN-public node must reject non-routable host \(host)")
+        }
+        // Genuinely routable endpoints still pass.
+        #expect(await stunNode.isAcceptableDiscoveredEndpoint(ep("1.1.1.1"), source: "test", from: source))
+    }
+
     @Test("findNode handler is gated by Tally before enumerating routing table")
     func findNodeIsGatedBeforeReplyingWithNeighbors() async throws {
         let tallyConfig = TallyConfig(rateLimitBytesPerSecond: 1)
