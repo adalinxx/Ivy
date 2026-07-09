@@ -956,7 +956,7 @@ public actor Ivy {
     func ensureRelayCarrierConnections() {
         let hasRelayedConns = connections.values.contains { $0.relayForward != nil }
         guard hasRelayedConns || !relayCarrierSeeds.isEmpty else { return }
-        let carriers = connections.values.filter { $0.channel != nil }
+        let carriers = relayCapableDirectCarriers()
         let groups = Set(carriers.map { carrierNetgroup($0) })
         if carriers.count >= Self.targetRelayCarrierCount, groups.count >= 2 { return }
         for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)] == nil {
@@ -964,6 +964,23 @@ public actor Ivy {
         }
         for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)] == nil {
             Task { try? await self.connect(to: relay) }
+        }
+    }
+
+    /// Direct connections to peers KNOWN to accept relayConnect — the only
+    /// connections that can actually carry a relayed circuit. Relay capability is
+    /// a peer we've PROVEN serves relays (`relayCarrierSeeds`, populated by
+    /// `noteRelayCarrierSuccess` after a successful circuit) or a configured
+    /// `knownRelays` endpoint. An ordinary non-relay direct peer ignores
+    /// relayConnect, so counting it as a carrier would let a relay-dependent node
+    /// with a couple of plain peers stop replenishing its real carrier pool.
+    /// Requires a live channel (`channel != nil`): a relayed connection cannot
+    /// itself be a carrier.
+    func relayCapableDirectCarriers() -> [PeerConnection] {
+        let relayCapableKeys = Set(relayCarrierSeeds.keys)
+            .union(config.knownRelays.map { $0.publicKey })
+        return connections.compactMap { (pid, conn) in
+            (conn.channel != nil && relayCapableKeys.contains(pid.publicKey)) ? conn : nil
         }
     }
 
