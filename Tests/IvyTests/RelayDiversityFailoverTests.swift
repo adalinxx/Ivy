@@ -441,6 +441,132 @@ struct RelayCarrierSeedTests {
         #expect(redialed, "a disconnected relay seed must be re-dialed when the only direct peers are non-relay")
     }
 
+    // MARK: - knownRelays carrier top-up must be direct-only and not suppressed by a relayed conn
+
+    private func keypair() -> (pub: String, priv: Data) {
+        let sk = Curve25519.Signing.PrivateKey()
+        let pub = sk.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        return (pub, sk.rawRepresentation)
+    }
+
+    /// (a) The configured-knownRelays top-up in ensureRelayCarrierConnections must
+    /// dial DIRECT-ONLY. A knownRelay reachable only via another relay is not a
+    /// usable carrier, so a failed direct dial must count as a failed top-up — never
+    /// open a channel-less relayed connection (which would falsely read as a restored
+    /// carrier and, because connections[relay] != nil, block all future top-up).
+    ///
+    /// RED before the fix: the top-up's connect(to:) (allowRelayFallback defaulting
+    /// true), with a direct carrier present, fires connectViaRelay on direct-dial
+    /// failure, advancing nextRelayRequestNonce and opening a relayed connection.
+    /// GREEN after: direct-only, no relay request, no connection to the relay.
+    @Test("knownRelays carrier top-up is direct-only (no relay fallback)")
+    func knownRelaysTopUpIsDirectOnly() async {
+        let (pub, priv) = keypair()
+        // Nothing listens on loopback:1 — a direct dial to the relay is refused fast.
+        let relayEndpoint = PeerEndpoint(publicKey: "known-relay-directonly", host: "127.0.0.1", port: 1)
+        let node = Ivy(config: IvyConfig(
+            publicKey: pub,
+            listenPort: 0,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            enablePEX: false,
+            signingKey: priv,
+            relayEnabled: false,
+            knownRelays: [relayEndpoint]
+        ))
+
+        // A direct carrier (channel != nil) so the OLD relay-fallback would have had
+        // a candidate to route a circuit through.
+        let carrier = directCarrier("carrier-key-a", observed: "10.0.0.1")
+        await node.registerConnectionForTesting(carrier, as: carrier.id)
+
+        // A relayed connection to an unrelated peer so ensureRelayCarrierConnections
+        // passes its "has relayed conns" guard and reaches the knownRelays top-up.
+        let dummyRelayed = PeerConnection(
+            id: PeerID(publicKey: "dummy-relayed-a"),
+            endpoint: PeerEndpoint(publicKey: "dummy-relayed-a", host: "relay", port: 0),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        await node.registerConnectionForTesting(dummyRelayed, as: dummyRelayed.id)
+
+        let relayID = PeerID(publicKey: relayEndpoint.publicKey)
+        let nonceBefore = await node.nextRelayRequestNonce
+        await node.ensureRelayCarrierConnections()
+        // Allow the spawned top-up Task to run to completion.
+        _ = await waitUntil(2000) { await node.nextRelayRequestNonce != nonceBefore }
+
+        // No relay request was ever initiated by the top-up path (direct-only).
+        #expect(await node.nextRelayRequestNonce == nonceBefore)
+        // The failed direct dial opened no (relayed) connection to the relay.
+        #expect(await node.connections[relayID] == nil)
+    }
+
+    /// (b) A pre-existing RELAYED connection (channel == nil) to a configured
+    /// knownRelay must NOT suppress a DIRECT top-up dial — only a live DIRECT channel
+    /// counts as a satisfied carrier. Otherwise the false relayed carrier permanently
+    /// blocks the relay from becoming a real (direct, circuit-capable) carrier.
+    ///
+    /// RED before the fix: the skip check is `connections[relay] == nil`, so the
+    /// relayed connection suppresses the direct dial and the relay stays relayed
+    /// (channel == nil). GREEN after: the skip requires a live direct channel, so the
+    /// direct top-up proceeds and (the relay being reachable) establishes a DIRECT
+    /// channel, replacing the relayed connection.
+    @Test("a relayed connection to a knownRelay does not suppress a direct top-up dial")
+    func relayedConnDoesNotSuppressDirectTopUp() async throws {
+        let (pubR, skR) = keypair()
+        let portR: UInt16 = 19781
+        let R = Ivy(config: IvyConfig(
+            publicKey: pubR,
+            listenPort: portR,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            signingKey: skR,
+            relayEnabled: true
+        ))
+        try await R.start()
+
+        let (pubA, skA) = keypair()
+        let relayEndpoint = PeerEndpoint(publicKey: pubR, host: "127.0.0.1", port: portR)
+        // A is deliberately NOT started: start() would itself auto-connect to every
+        // knownRelay directly, contaminating the setup. We drive only the top-up path.
+        // An outbound dial does not require A's listener to be running.
+        let A = Ivy(config: IvyConfig(
+            publicKey: pubA,
+            listenPort: 0,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            signingKey: skA,
+            relayEnabled: false,
+            knownRelays: [relayEndpoint]
+        ))
+
+        // The ONLY connection to the knownRelay is RELAYED (channel == nil). It also
+        // satisfies the ensureRelayCarrierConnections "has relayed conns" guard.
+        let relayID = PeerID(publicKey: pubR)
+        let relayedConn = PeerConnection(
+            id: relayID,
+            endpoint: PeerEndpoint(publicKey: pubR, host: "relay", port: 0),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        await A.registerConnectionForTesting(relayedConn, as: relayID)
+        #expect(await A.connections[relayID]?.channel == nil)
+
+        await A.ensureRelayCarrierConnections()
+
+        // The direct top-up was NOT suppressed: A now holds a live DIRECT channel to
+        // the relay (the relayed connection was replaced).
+        let becameDirect = await waitUntil(5000) { await A.connections[relayID]?.channel != nil }
+        #expect(becameDirect, "a relayed connection must not suppress the direct knownRelay top-up dial")
+
+        await A.stop(); await R.stop()
+    }
+
     @Test("seed set is bounded and prefers netgroup diversity on displacement")
     func seedsBoundedAndDiverse() async {
         let node = makeNode()
