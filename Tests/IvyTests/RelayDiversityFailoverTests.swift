@@ -567,6 +567,75 @@ struct RelayCarrierSeedTests {
         await A.stop(); await R.stop()
     }
 
+    /// The carrier-SEED redial path (distinct from the knownRelays top-up above)
+    /// must ALSO treat a relayed-only connection as NOT a satisfied carrier. A node
+    /// whose ONLY connection to a recorded carrier seed is RELAYED (channel == nil)
+    /// must STILL attempt the direct redial: a relayed conn is not counted by
+    /// relayCapableDirectCarriers(), yet the old `connections[seed] == nil` skip
+    /// suppressed the direct redial forever, freezing the false relayed carrier.
+    ///
+    /// RED before the fix: the relayed connection satisfies `connections[seed] != nil`,
+    /// so the seed redial is skipped and the connection stays relayed (channel == nil).
+    /// GREEN after: the skip requires a live direct channel, so the redial proceeds
+    /// and (the seed being reachable) upgrades the relayed connection to DIRECT.
+    @Test("a relayed connection to a carrier seed does not suppress the direct seed redial")
+    func relayedConnDoesNotSuppressSeedRedial() async throws {
+        let (pubR, skR) = keypair()
+        let portR: UInt16 = 19801
+        let R = Ivy(config: IvyConfig(
+            publicKey: pubR,
+            listenPort: portR,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            signingKey: skR,
+            relayEnabled: true
+        ))
+        try await R.start()
+
+        let (pubA, skA) = keypair()
+        // A is deliberately NOT started: start() auto-connects to bootstrap/knownRelays
+        // and would contaminate the setup. We drive only the seed-redial path.
+        let A = Ivy(config: IvyConfig(
+            publicKey: pubA,
+            listenPort: 0,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            signingKey: skA,
+            relayEnabled: false
+        ))
+
+        // Record R as a known-good carrier SEED reachable at its real direct address.
+        let seedID = PeerID(publicKey: pubR)
+        await A.recordRelayCarrierSeed(
+            key: pubR,
+            endpoint: PeerEndpoint(publicKey: pubR, host: "127.0.0.1", port: portR),
+            group: NetGroup.group("10.0.0.1"))
+
+        // The ONLY connection to the seed is RELAYED (channel == nil). It also
+        // satisfies the ensureRelayCarrierConnections "has relayed conns" guard.
+        let relayedConn = PeerConnection(
+            id: seedID,
+            endpoint: PeerEndpoint(publicKey: pubR, host: "relay", port: 0),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        await A.registerConnectionForTesting(relayedConn, as: seedID)
+        #expect(await A.connections[seedID]?.channel == nil)
+
+        await A.ensureRelayCarrierConnections()
+
+        // The direct seed redial was NOT suppressed: A upgrades to a live DIRECT
+        // channel to the seed (the relayed connection was superseded).
+        let becameDirect = await waitUntil(5000) { await A.connections[seedID]?.channel != nil }
+        #expect(becameDirect, "a relayed connection must not suppress the direct carrier-seed redial")
+
+        await A.stop(); await R.stop()
+    }
+
     @Test("seed set is bounded and prefers netgroup diversity on displacement")
     func seedsBoundedAndDiverse() async {
         let node = makeNode()

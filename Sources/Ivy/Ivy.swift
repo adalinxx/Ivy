@@ -355,8 +355,8 @@ public actor Ivy {
         // A live DIRECT channel (channel != nil) blocks a redundant dial; but a
         // RELAYED-only connection (channel == nil) must NOT — a direct dial legitimately
         // UPGRADES it to a real socket (e.g. the knownRelays carrier top-up establishing
-        // a circuit-capable direct carrier). A relayed connection uses the sentinel
-        // netgroup, so permitting the upgrade does not distort per-subnet diversity.
+        // a circuit-capable direct carrier). The upgrade supersedes the peer's own
+        // relayed conn, which is excluded from the per-netgroup tally below.
         guard connections[peer]?.channel == nil, !connectingPeers.contains(peer) else { return false }
 
         // Enforce netgroup diversity on every outbound dial, not just during
@@ -364,8 +364,15 @@ public actor Ivy {
         // slots in the 60-second window between refresh cycles [Heilman 2015].
         // Limit: 2 connections per netgroup (IPv4 /16, IPv6 /32).
         let targetSubnet = NetGroup.group(endpoint.host)
-        let sameSubnetCount = connections.values.filter {
-            NetGroup.group($0.endpoint.host) == targetSubnet
+        // Count only OTHER peers' connections in the netgroup. A direct dial that
+        // UPGRADES `peer`'s own existing (relayed, channel == nil) connection
+        // supersedes that connection rather than adding alongside it, so counting
+        // it here would let a re-keyed relayed conn — whose endpoint.host is the
+        // peer's advertised (real target) host — occupy a netgroup slot against
+        // its own upgrade. Excluding `peer` keeps the guard identical for a dial
+        // to a NEW peer (no existing connection → nothing excluded).
+        let sameSubnetCount = connections.filter { pid, conn in
+            pid != peer && NetGroup.group(conn.endpoint.host) == targetSubnet
         }.count + connectingEndpoints.values.filter {
             NetGroup.group($0.host) == targetSubnet
         }.count
@@ -989,7 +996,13 @@ public actor Ivy {
         let carriers = relayCapableDirectCarriers()
         let groups = Set(carriers.map { carrierNetgroup($0) })
         if carriers.count >= Self.targetRelayCarrierCount, groups.count >= 2 { return }
-        for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)] == nil {
+        // DIRECT-ONLY: skip a seed redial only when a LIVE DIRECT channel to the
+        // seed already exists. A relayed-only seed connection (channel == nil) is
+        // not a usable carrier — it is not counted by relayCapableDirectCarriers()
+        // — so it must NOT suppress the direct redial, which upgrades it to a real
+        // socket via the M1 supersede path (redialRelayCarrierSeed dials
+        // allowRelayFallback:false, so a failure records toward eviction).
+        for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)]?.channel == nil {
             Task { await self.redialRelayCarrierSeed(key: key, endpoint: seed.endpoint) }
         }
         // DIRECT-ONLY top-up: a relay reachable only via another relay is not a
