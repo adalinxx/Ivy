@@ -195,6 +195,19 @@ extension Ivy {
             return false
         }
 
+        // A publicly-reachable node rejects discovered endpoints that point at
+        // non-routable address space (RFC1918, loopback, link-local, IPv6
+        // unique-local, unspecified) or a non-IP string — a peer must not be able
+        // to steer it into dialing an internal host (SSRF). Gated to public nodes
+        // (a declared, routable externalAddress): a node configured for local/test
+        // operation legitimately talks to loopback/private peers, so the filter
+        // must not apply to it.
+        if let ext = config.externalAddress, !isNonRoutableDiscoveredHost(ext.host),
+           isNonRoutableDiscoveredHost(host) {
+            config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
+            return false
+        }
+
         // Measure the canonical raw key form (ed01 Multikey prefix stripped)
         // so a key ground to the threshold passes regardless of which
         // spelling the endpoint record carries.
@@ -207,5 +220,33 @@ extension Ivy {
         }
 
         return true
+    }
+
+    /// True if `host` is NOT a globally-routable IP literal: a non-IP string, or
+    /// an address in loopback / RFC1918-private / link-local / IPv6 unique-local
+    /// / unspecified space. Reuses `NetGroup.group` for parsing (v4:/v6:/raw:
+    /// tagging) so a single canonical parser decides both bucketing and routability.
+    func isNonRoutableDiscoveredHost(_ host: String) -> Bool {
+        let group = NetGroup.group(host)
+        if group.hasPrefix("v4:") {
+            let parts = group.dropFirst(3).split(separator: ".")
+            guard parts.count == 2, let a = Int(parts[0]), let b = Int(parts[1]) else { return true }
+            switch a {
+            case 0, 10, 127: return true                   // unspecified/this-net, private, loopback
+            case 169: return b == 254                       // link-local 169.254/16
+            case 172: return (16...31).contains(b)          // private 172.16/12
+            case 192: return b == 168                       // private 192.168/16
+            default: return false
+            }
+        }
+        if group.hasPrefix("v6:") {
+            let parts = group.dropFirst(3).split(separator: ".")
+            guard let first = parts.first, let h = UInt16(first, radix: 16) else { return true }
+            if h == 0 { return true }                       // ::/16 (::, ::1, docs) — non-global
+            if (0xfe80...0xfebf).contains(h) { return true } // link-local fe80::/10
+            if (0xfc00...0xfdff).contains(h) { return true } // unique-local fc00::/7
+            return false
+        }
+        return true   // raw: — not an IP literal
     }
 }
