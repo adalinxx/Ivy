@@ -319,12 +319,15 @@ public actor Ivy {
         connections[peer] != nil
     }
 
-    /// Count of OTHER peers holding a connection whose advertised
-    /// `endpoint.host` falls in netgroup `group`. Backs `reserveOutgoingDial`'s
-    /// per-netgroup diversity cap; `excluding` omits the peer being upgraded so
-    /// a direct dial that supersedes that peer's own relayed conn is not counted
-    /// against its own upgrade (nil ⇒ nothing excluded, i.e. a brand-new peer).
-    func directPeerCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
+    /// Count of OTHER peers holding a connection (direct OR relayed —
+    /// relayed conns are counted intentionally so the cap can't be bypassed via
+    /// relayed links) whose advertised `endpoint.host` falls in netgroup `group`.
+    /// Backs `reserveOutgoingDial`'s per-netgroup diversity cap; `excluding` omits
+    /// the peer being upgraded so a direct dial that supersedes that peer's own
+    /// relayed conn is not counted against its own upgrade (nil ⇒ nothing
+    /// excluded, i.e. a brand-new peer). NOTE: do NOT narrow this to direct-only —
+    /// that would let relayed links occupy netgroup slots for free.
+    func connectionCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
         connections.filter { pid, conn in
             pid != peer && NetGroup.group(conn.endpoint.host) == group
         }.count
@@ -420,7 +423,7 @@ public actor Ivy {
         // peer's advertised (real target) host — occupy a netgroup slot against
         // its own upgrade. Excluding `peer` keeps the guard identical for a dial
         // to a NEW peer (no existing connection → nothing excluded).
-        let sameSubnetCount = directPeerCount(inNetgroup: targetSubnet, excluding: peer)
+        let sameSubnetCount = connectionCount(inNetgroup: targetSubnet, excluding: peer)
             + connectingEndpoints.values.filter {
                 NetGroup.group($0.host) == targetSubnet
             }.count
