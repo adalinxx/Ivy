@@ -72,8 +72,23 @@ public actor Ivy {
     /// public key), bounded and diversity-preferring — the re-dial pool for
     /// `ensureRelayCarrierConnections`. `config.knownRelays` seeds the same
     /// pool at start; a discovered carrier is just as good as a configured one.
-    var relayCarrierSeeds: [String: PeerEndpoint] = [:]
+    /// A carrier we can re-dial to keep the relay pool populated. Stores the
+    /// dialable advertised `endpoint` AND the unforgeable observed `group`
+    /// (netgroup captured from the L3 socket at record time) — the group drives
+    /// the diversity-preserving eviction and is never re-derived from the
+    /// self-advertised endpoint host, which the peer controls.
+    struct RelayCarrierSeed: Sendable {
+        let endpoint: PeerEndpoint
+        let group: String
+    }
+    var relayCarrierSeeds: [String: RelayCarrierSeed] = [:]
     static let maxRelayCarrierSeeds = 3
+    /// Consecutive re-dial failures per carrier seed. A seed that repeatedly
+    /// fails to (re)connect is a black hole — dropped from the pool once it hits
+    /// `maxRelayCarrierSeedDialFailures` so we stop re-dialing it forever. Reset
+    /// on any successful (re)connection.
+    var relayCarrierSeedFailures: [String: Int] = [:]
+    static let maxRelayCarrierSeedDialFailures = 3
     /// How many relay-capable direct connections a relay-DEPENDENT node keeps
     /// alive (bounded 2-3: one failover alternative + netgroup diversity,
     /// without per-target multi-relay fan-out for the common direct case).
@@ -263,6 +278,7 @@ public actor Ivy {
         }
         reconnectTasks.removeAll()
         reconnectAttempts.removeAll()
+        relayCarrierSeedFailures.removeAll()
         intentionallyDisconnectedPeers.removeAll()
         clearPendingForwards()
     }
@@ -834,12 +850,26 @@ public actor Ivy {
         throw IvyError.noRelayAvailable
     }
 
-    /// Netgroup of a carrier connection, from an address the peer cannot forge:
-    /// the observed socket address for inbound connections, else the address WE
-    /// dialed for outbound ones. Never a self-advertised (identify) value.
+    /// Sentinel netgroup for a carrier with no unforgeable observed address.
+    /// ALL such carriers collapse onto this one group so a peer cannot fabricate
+    /// many distinct "fresh" netgroups (which win diverse-first ordering) via its
+    /// self-advertised endpoint. Distinct from every `NetGroup.group` output
+    /// (which is always `v4:`/`v6:`/`raw:`-prefixed), so it never collides.
+    static let unknownCarrierNetgroup = "unknown:no-observed-addr"
+
+    /// Netgroup of a carrier connection, from an address the peer CANNOT forge:
+    /// the L3 remote observed on the socket (captured on both the inbound accept
+    /// and the outbound dial, before identify runs). NEVER falls back to the
+    /// self-advertised `conn.endpoint.host` — during identify that field is
+    /// overwritten with the peer's own listenAddrs, so using it would let an
+    /// attacker forge arbitrarily many netgroups and capture every relayed
+    /// circuit (the relay-layer eclipse this diversity is meant to prevent).
+    /// A carrier without an observed address (should not happen for a live TCP
+    /// carrier) is collapsed onto a single sentinel group so it cannot forge
+    /// freshness.
     func carrierNetgroup(_ conn: PeerConnection) -> String {
-        if let host = conn.observedHost, !host.isEmpty { return NetGroup.group(host) }
-        return NetGroup.group(conn.endpoint.host)
+        guard let host = conn.observedHost, !host.isEmpty else { return Self.unknownCarrierNetgroup }
+        return NetGroup.group(host)
     }
 
     /// Order relay-carrier candidates netgroup-diverse-first: round-robin across
@@ -884,25 +914,29 @@ public actor Ivy {
               !relayPeer.publicKey.hasPrefix("inbound-"),
               conn.endpoint.port != 0,
               conn.endpoint.host != "relay", conn.endpoint.host != "unknown" else { return }
-        recordRelayCarrierSeed(key: relayPeer.publicKey, endpoint: conn.endpoint)
+        // Diversity keys on the UNFORGEABLE observed netgroup, not the advertised
+        // endpoint host (which identify overwrites with the peer's listenAddrs).
+        recordRelayCarrierSeed(key: relayPeer.publicKey, endpoint: conn.endpoint, group: carrierNetgroup(conn))
+        relayCarrierSeedFailures.removeValue(forKey: relayPeer.publicKey)
     }
 
     /// Insert into the bounded carrier-seed set. When full, a newcomer only
     /// displaces an existing seed if it ADDS a netgroup the set lacks (evicting
     /// one member of a duplicated group), keeping the set diversity-maximal.
-    func recordRelayCarrierSeed(key: String, endpoint: PeerEndpoint) {
+    /// `group` is the observed (unforgeable) netgroup of the carrier.
+    func recordRelayCarrierSeed(key: String, endpoint: PeerEndpoint, group: String) {
         if relayCarrierSeeds[key] != nil || relayCarrierSeeds.count < Self.maxRelayCarrierSeeds {
-            relayCarrierSeeds[key] = endpoint
+            relayCarrierSeeds[key] = RelayCarrierSeed(endpoint: endpoint, group: group)
             return
         }
-        let newGroup = NetGroup.group(endpoint.host)
-        let groups = relayCarrierSeeds.mapValues { NetGroup.group($0.host) }
+        let newGroup = group
+        let groups = relayCarrierSeeds.mapValues { $0.group }
         guard !groups.values.contains(newGroup) else { return }
         var byGroup: [String: [String]] = [:]
-        for (seedKey, group) in groups { byGroup[group, default: []].append(seedKey) }
+        for (seedKey, seedGroup) in groups { byGroup[seedGroup, default: []].append(seedKey) }
         guard let evict = byGroup.values.first(where: { $0.count > 1 })?.sorted().first else { return }
         relayCarrierSeeds.removeValue(forKey: evict)
-        relayCarrierSeeds[key] = endpoint
+        relayCarrierSeeds[key] = RelayCarrierSeed(endpoint: endpoint, group: group)
     }
 
     /// Keep-N-carriers: a node that depends on relayed reachability keeps a
@@ -916,11 +950,32 @@ public actor Ivy {
         let carriers = connections.values.filter { $0.channel != nil }
         let groups = Set(carriers.map { carrierNetgroup($0) })
         if carriers.count >= Self.targetRelayCarrierCount, groups.count >= 2 { return }
-        for (key, seedEndpoint) in relayCarrierSeeds where connections[PeerID(publicKey: key)] == nil {
-            Task { try? await self.connect(to: seedEndpoint) }
+        for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)] == nil {
+            Task { await self.redialRelayCarrierSeed(key: key, endpoint: seed.endpoint) }
         }
         for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)] == nil {
             Task { try? await self.connect(to: relay) }
+        }
+    }
+
+    /// Re-dial a carrier seed, tracking consecutive failures so a black-holed
+    /// seed is eventually evicted instead of re-dialed forever (L1). A success
+    /// clears the failure count; hitting `maxRelayCarrierSeedDialFailures`
+    /// consecutive failures drops the seed from the pool (size stays bounded at
+    /// `maxRelayCarrierSeeds`). Threshold 3 tolerates transient loss / NAT flaps
+    /// while still reclaiming a genuinely dead carrier.
+    func redialRelayCarrierSeed(key: String, endpoint: PeerEndpoint) async {
+        do {
+            try await connect(to: endpoint)
+            relayCarrierSeedFailures.removeValue(forKey: key)
+        } catch {
+            let failures = (relayCarrierSeedFailures[key] ?? 0) + 1
+            if failures >= Self.maxRelayCarrierSeedDialFailures {
+                relayCarrierSeeds.removeValue(forKey: key)
+                relayCarrierSeedFailures.removeValue(forKey: key)
+            } else {
+                relayCarrierSeedFailures[key] = failures
+            }
         }
     }
 
@@ -950,6 +1005,11 @@ public actor Ivy {
     /// gone/superseded, or declared silent and torn down — the teardown path
     /// then schedules the carrier failover).
     func probeRelayedConnection(_ conn: PeerConnection) -> Bool {
+        // I1 (acknowledged): each probe tick sends a frame over the circuit, so a
+        // relayed circuit is kept alive right up to the relay's 3600s hard cap —
+        // idle-reclaim of an abandoned relayed circuit is effectively disabled.
+        // This is accepted: relay resource bounds still hold via the per-relay
+        // circuit-count, rate, and absolute-lifetime caps in RelayService.
         // No `running` check needed: stop() clears `connections`, which ends
         // every probe loop on its next tick via this identity check.
         guard connections[conn.id] === conn else { return false }
