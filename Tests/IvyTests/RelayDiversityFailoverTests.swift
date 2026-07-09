@@ -1,6 +1,8 @@
 import Testing
 import Foundation
 import Crypto
+import NIOCore
+import NIOEmbedded
 @testable import Ivy
 @testable import Tally
 
@@ -341,6 +343,102 @@ struct RelayCarrierSeedTests {
 
     private func ep(_ key: String, _ host: String) -> PeerEndpoint {
         PeerEndpoint(publicKey: key, host: host, port: 4001)
+    }
+
+    private func waitUntil(_ timeoutMs: Int = 5000, _ cond: @Sendable () async -> Bool) async -> Bool {
+        var waited = 0
+        while waited < timeoutMs {
+            if await cond() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+            waited += 50
+        }
+        return await cond()
+    }
+
+    /// A DIRECT connection (live channel, no relayForward) whose netgroup derives
+    /// from `observed`. Backed by an `EmbeddedChannel` so `channel != nil` holds
+    /// without a real socket.
+    private func directCarrier(_ key: String, observed: String) -> PeerConnection {
+        let conn = PeerConnection(
+            id: PeerID(publicKey: key),
+            endpoint: PeerEndpoint(publicKey: key, host: observed, port: 4001),
+            channel: EmbeddedChannel()
+        )
+        conn.observedHost = observed
+        return conn
+    }
+
+    // MARK: - Finding 3: carrier-seed redial must be direct-only
+
+    /// Redialing a carrier seed must NOT fall back to `connectViaRelay`: a seed
+    /// reachable only via relay is not a usable carrier (a relayed connection has
+    /// `channel == nil`). The old path called the general `connect(to:)`, which
+    /// on direct-dial failure opened a RELAYED connection to the seed, cleared its
+    /// failure count, and — because `connections[seed] != nil` — suppressed all
+    /// future direct redials, leaving the carrier pool falsely "restored".
+    ///
+    /// RED before the fix: with a direct carrier present, the relay-fallback fires
+    /// and initiates a relay request (`nextRelayRequestNonce` advances).
+    /// GREEN after: the dial fails direct-only, records a failure toward eviction,
+    /// and never touches the relay path.
+    @Test("carrier-seed redial is direct-only and a relay-only seed is not a restored carrier")
+    func carrierSeedRedialIsDirectOnly() async {
+        let node = makeNode()
+        // A direct carrier so the OLD relay-fallback would have had a candidate.
+        let carrier = directCarrier("carrier-key", observed: "10.0.0.1")
+        await node.registerConnectionForTesting(carrier, as: carrier.id)
+
+        let seedKey = "relay-only-seed"
+        let seedID = PeerID(publicKey: seedKey)
+        // Nothing listens on loopback:1 — the direct dial is refused immediately.
+        let seedEndpoint = PeerEndpoint(publicKey: seedKey, host: "127.0.0.1", port: 1)
+
+        let nonceBefore = await node.nextRelayRequestNonce
+        await node.redialRelayCarrierSeed(key: seedKey, endpoint: seedEndpoint)
+
+        // No relay request was ever initiated (direct-only: no connectViaRelay).
+        #expect(await node.nextRelayRequestNonce == nonceBefore)
+        // The failed dial counts toward eviction — not suppressed, not cleared.
+        #expect(await node.relayCarrierSeedFailures[seedKey] == 1)
+        // No relayed connection to the seed was created; it is not a live carrier.
+        #expect(await node.connections[seedID] == nil)
+    }
+
+    // MARK: - Finding 2: only relay-capable direct peers count as carriers
+
+    /// A relay-dependent node with a couple of ordinary (non-relay) direct peers
+    /// must STILL replenish its relay-carrier pool — those peers ignore
+    /// relayConnect and cannot carry a circuit. The carrier-sufficiency accounting
+    /// must count only relay-capable direct connections; otherwise the node returns
+    /// early and never re-dials its known-good relay seeds.
+    ///
+    /// RED before the fix: the two non-relay direct peers (distinct netgroups)
+    /// satisfy the carrier floor, so `ensureRelayCarrierConnections` early-returns
+    /// and no seed redial happens. GREEN after: they do not count, so the
+    /// disconnected relay seed is re-dialed (its dial fails → failure recorded).
+    @Test("two non-relay direct peers do not satisfy the relay-carrier floor")
+    func nonRelayDirectPeersDoNotCountAsCarriers() async {
+        let node = makeNode()
+        // Two ordinary direct peers in DISTINCT netgroups — not relay-capable.
+        let p1 = directCarrier("plain-peer-1", observed: "10.0.0.1")
+        let p2 = directCarrier("plain-peer-2", observed: "20.0.0.1")
+        await node.registerConnectionForTesting(p1, as: p1.id)
+        await node.registerConnectionForTesting(p2, as: p2.id)
+
+        // A known-good relay seed that is NOT currently connected (loopback:1
+        // refuses, so the redial fails fast and records a failure).
+        let seedKey = "carrier-seed"
+        await node.recordRelayCarrierSeed(
+            key: seedKey,
+            endpoint: PeerEndpoint(publicKey: seedKey, host: "127.0.0.1", port: 1),
+            group: NetGroup.group("30.0.0.1")
+        )
+
+        await node.ensureRelayCarrierConnections()
+
+        // The seed must be re-dialed despite the two plain peers being present.
+        let redialed = await waitUntil(3000) { await node.relayCarrierSeedFailures[seedKey] == 1 }
+        #expect(redialed, "a disconnected relay seed must be re-dialed when the only direct peers are non-relay")
     }
 
     @Test("seed set is bounded and prefers netgroup diversity on displacement")
