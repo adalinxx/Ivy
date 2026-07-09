@@ -131,6 +131,15 @@ public final class PeerConnection: @unchecked Sendable {
 
     public var messages: AsyncStream<Message> { inbound }
 
+    /// Canonical transport-kind query: true iff this is a normal DIRECT TCP
+    /// connection (backed by a live socket `channel`). The single authority for
+    /// "direct vs relayed" — read this instead of testing `channel != nil`.
+    var isDirect: Bool { channel != nil }
+    /// Canonical transport-kind query: true iff this is a RELAYED connection
+    /// (channel-less; frames flow through `relayForward`). Exact complement of
+    /// `isDirect` — read this instead of testing `channel == nil`.
+    var isRelayed: Bool { channel == nil }
+
     var isLive: Bool {
         if let channel { return channel.isActive || !closed }
         // Relayed (channel-less): live only while un-closed AND recently active. A dead relay

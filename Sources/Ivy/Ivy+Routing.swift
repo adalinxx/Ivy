@@ -25,7 +25,7 @@ extension Ivy {
             let toQuery = candidates
                 .filter {
                     !queried.contains($0.id.publicKey) &&
-                    (connections[$0.id] != nil || localPeers[$0.id] != nil)
+                    (hasAnyConnection($0.id) || localPeers[$0.id] != nil)
                 }
                 .prefix(lookupParallelism)
 
@@ -171,7 +171,7 @@ extension Ivy {
         }
 
         let discovered = PeerID(publicKey: endpoint.publicKey)
-        guard connections[discovered] == nil else { return nil }
+        guard !hasAnyConnection(discovered) else { return nil }
         router.addPeer(discovered, endpoint: endpoint, tally: tally)
         return discovered
     }

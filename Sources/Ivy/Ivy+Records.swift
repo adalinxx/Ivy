@@ -113,7 +113,7 @@ extension Ivy {
         let cidHash = Router.hash(rootCID)
         let closest = router.closestPeers(to: cidHash, count: config.kBucketSize)
         for entry in closest {
-            let reachable = connections[entry.id] != nil || localPeers[entry.id] != nil
+            let reachable = hasAnyConnection(entry.id) || localPeers[entry.id] != nil
             guard reachable else { continue }
             fireToPeer(entry.id, msg)
         }

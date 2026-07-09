@@ -287,6 +287,49 @@ public actor Ivy {
         clearPendingForwards()
     }
 
+    // MARK: - Connection-state queries
+
+    // The single vocabulary for asking about a peer's connection. Every call
+    // site expresses its intent through one of these instead of re-deriving
+    // relayed-vs-direct-vs-connected from `connections[x]` and `.channel`.
+
+    /// The connection to `peer` IFF it is a live DIRECT channel, else nil.
+    /// INVARIANT: a non-nil result is always `isDirect` (a real socket).
+    func directCarrier(to peer: PeerID) -> PeerConnection? {
+        guard let conn = connections[peer], conn.isDirect else { return nil }
+        return conn
+    }
+
+    /// True IFF we hold a live DIRECT channel to `peer` (relayed-only ⇒ false).
+    func isDirectlyConnected(_ peer: PeerID) -> Bool {
+        directCarrier(to: peer) != nil
+    }
+
+    /// The connection to `peer` IFF it is RELAYED (channel-less), else nil.
+    /// INVARIANT: a non-nil result is always `isRelayed`.
+    func relayedConn(to peer: PeerID) -> PeerConnection? {
+        guard let conn = connections[peer], conn.isRelayed else { return nil }
+        return conn
+    }
+
+    /// True IFF we hold ANY connection to `peer` — direct OR relayed. Use this
+    /// (not `directCarrier`) where a relayed link is equally usable, e.g.
+    /// reachability for forwarding, or a "no connection at all" reconnect guard.
+    func hasAnyConnection(_ peer: PeerID) -> Bool {
+        connections[peer] != nil
+    }
+
+    /// Count of OTHER peers holding a connection whose advertised
+    /// `endpoint.host` falls in netgroup `group`. Backs `reserveOutgoingDial`'s
+    /// per-netgroup diversity cap; `excluding` omits the peer being upgraded so
+    /// a direct dial that supersedes that peer's own relayed conn is not counted
+    /// against its own upgrade (nil ⇒ nothing excluded, i.e. a brand-new peer).
+    func directPeerCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
+        connections.filter { pid, conn in
+            pid != peer && NetGroup.group(conn.endpoint.host) == group
+        }.count
+    }
+
     // MARK: - Connection Management
 
     public func connect(to endpoint: PeerEndpoint) async throws {
@@ -311,7 +354,7 @@ public actor Ivy {
             // any relay-capable peer is connected. `endpoint.host == "relay"` is the
             // synthetic host of an already-relayed endpoint — never relay those.
             if allowRelayFallback, endpoint.host != "relay",
-               connections.values.contains(where: { $0.channel != nil }) {
+               connections.values.contains(where: { $0.isDirect }) {
                 do { try await connectViaRelay(to: endpoint); return } catch { throw error }
             }
             throw error
@@ -333,7 +376,7 @@ public actor Ivy {
         // set, and cancel it. (`stale.cancel()` alone is insufficient for exactly
         // the early-return reason above.) A healthy DIRECT conn (channel != nil)
         // is already deduped by `reserveOutgoingDial` and never reaches here.
-        if let stale = connections[peer], stale.channel == nil {
+        if let stale = relayedConn(to: peer) {
             if let claimed = stale.relayedClaimedKey {
                 relayedConnByClaimedKey.removeValue(forKey: claimed)
             }
@@ -357,7 +400,7 @@ public actor Ivy {
         // UPGRADES it to a real socket (e.g. the knownRelays carrier top-up establishing
         // a circuit-capable direct carrier). The upgrade supersedes the peer's own
         // relayed conn, which is excluded from the per-netgroup tally below.
-        guard connections[peer]?.channel == nil, !connectingPeers.contains(peer) else { return false }
+        guard !isDirectlyConnected(peer), !connectingPeers.contains(peer) else { return false }
 
         // Enforce netgroup diversity on every outbound dial, not just during
         // periodic refresh. Without this, an attacker can occupy all outbound
@@ -371,11 +414,10 @@ public actor Ivy {
         // peer's advertised (real target) host — occupy a netgroup slot against
         // its own upgrade. Excluding `peer` keeps the guard identical for a dial
         // to a NEW peer (no existing connection → nothing excluded).
-        let sameSubnetCount = connections.filter { pid, conn in
-            pid != peer && NetGroup.group(conn.endpoint.host) == targetSubnet
-        }.count + connectingEndpoints.values.filter {
-            NetGroup.group($0.host) == targetSubnet
-        }.count
+        let sameSubnetCount = directPeerCount(inNetgroup: targetSubnet, excluding: peer)
+            + connectingEndpoints.values.filter {
+                NetGroup.group($0.host) == targetSubnet
+            }.count
         guard sameSubnetCount < 2 else { return false }
 
         connectingPeers.insert(peer)
@@ -426,7 +468,7 @@ public actor Ivy {
     /// Chain ports advertised by each connected peer via identify messages.
     /// Keyed by peer ID, value is [directory: port].
     public var connectedPeerChainPorts: [PeerID: [String: UInt16]] {
-        peerChainPorts.filter { connections[$0.key] != nil }
+        peerChainPorts.filter { hasAnyConnection($0.key) }
     }
 
     public var directPeerCount: Int { connections.count }
@@ -721,7 +763,7 @@ public actor Ivy {
             return
         }
 
-        let wasCurrentConnection = connections[peer] != nil
+        let wasCurrentConnection = hasAnyConnection(peer)
         if wasCurrentConnection {
             connections.removeValue(forKey: peer)
             untrackInboundConnection(peer)
@@ -776,7 +818,7 @@ public actor Ivy {
     /// (`reconnectTasks`/`reconnectAttempts`) so a peer never has both a direct
     /// reconnect and a relay failover in flight.
     func scheduleRelayFailover(to endpoint: PeerEndpoint, peer: PeerID) {
-        guard connections[peer] == nil,
+        guard !hasAnyConnection(peer),
               !connectingPeers.contains(peer),
               reconnectTasks[peer] == nil else { return }
         guard (reconnectAttempts[peer] ?? 0) < Self.maxRelayFailoverAttempts else {
@@ -796,7 +838,7 @@ public actor Ivy {
     func runScheduledRelayFailover(to endpoint: PeerEndpoint, peer: PeerID) async {
         reconnectTasks.removeValue(forKey: peer)
         guard running,
-              connections[peer] == nil,
+              !hasAnyConnection(peer),
               !connectingPeers.contains(peer),
               !intentionallyDisconnectedPeers.contains(peer) else { return }
         // Top up the carrier pool first so the failover has somewhere to go.
@@ -809,7 +851,7 @@ public actor Ivy {
     }
 
     func scheduleReconnect(to endpoint: PeerEndpoint, peer: PeerID) {
-        guard connections[peer] == nil,
+        guard !hasAnyConnection(peer),
               !connectingPeers.contains(peer),
               reconnectTasks[peer] == nil else { return }
 
@@ -838,7 +880,7 @@ public actor Ivy {
     func runScheduledReconnect(to endpoint: PeerEndpoint, peer: PeerID) async {
         reconnectTasks.removeValue(forKey: peer)
         guard running,
-              connections[peer] == nil,
+              !hasAnyConnection(peer),
               !connectingPeers.contains(peer),
               !intentionallyDisconnectedPeers.contains(peer) else { return }
 
@@ -863,10 +905,10 @@ public actor Ivy {
     public func connectViaRelay(to endpoint: PeerEndpoint) async throws {
         let targetKey = endpoint.publicKey
         let target = PeerID(publicKey: targetKey)
-        guard connections[target] == nil else { return }
+        guard !hasAnyConnection(target) else { return }
 
         let candidates = connections.compactMap { (pid, conn) -> (peer: PeerID, group: String)? in
-            (conn.channel != nil && pid.publicKey != targetKey) ? (pid, carrierNetgroup(conn)) : nil
+            (conn.isDirect && pid.publicKey != targetKey) ? (pid, carrierNetgroup(conn)) : nil
         }
         // Netgroups already carrying one of our relayed connections: a NEW
         // circuit prefers a carrier outside them, so relay-only reachability
@@ -956,7 +998,7 @@ public actor Ivy {
     /// set thins out (`ensureRelayCarrierConnections`). Bounded and
     /// diversity-preferring; `config.knownRelays` remains just another seed.
     func noteRelayCarrierSuccess(_ relayPeer: PeerID) {
-        guard let conn = connections[relayPeer], conn.channel != nil,
+        guard let conn = directCarrier(to: relayPeer),
               !relayPeer.publicKey.hasPrefix("inbound-"),
               conn.endpoint.port != 0,
               conn.endpoint.host != "relay", conn.endpoint.host != "unknown" else { return }
@@ -1002,7 +1044,7 @@ public actor Ivy {
         // — so it must NOT suppress the direct redial, which upgrades it to a real
         // socket via the M1 supersede path (redialRelayCarrierSeed dials
         // allowRelayFallback:false, so a failure records toward eviction).
-        for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)]?.channel == nil {
+        for (key, seed) in relayCarrierSeeds where !isDirectlyConnected(PeerID(publicKey: key)) {
             Task { await self.redialRelayCarrierSeed(key: key, endpoint: seed.endpoint) }
         }
         // DIRECT-ONLY top-up: a relay reachable only via another relay is not a
@@ -1012,7 +1054,7 @@ public actor Ivy {
         // carrier and block all future top-up. Skip only when a LIVE DIRECT channel
         // to the relay already exists — a pre-existing RELAYED connection (channel
         // == nil) must NOT suppress a direct top-up dial.
-        for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)]?.channel == nil {
+        for relay in config.knownRelays where !isDirectlyConnected(PeerID(publicKey: relay.publicKey)) {
             Task { try? await self.connect(to: relay, allowRelayFallback: false) }
         }
     }
@@ -1030,7 +1072,7 @@ public actor Ivy {
         let relayCapableKeys = Set(relayCarrierSeeds.keys)
             .union(config.knownRelays.map { $0.publicKey })
         return connections.compactMap { (pid, conn) in
-            (conn.channel != nil && relayCapableKeys.contains(pid.publicKey)) ? conn : nil
+            (conn.isDirect && relayCapableKeys.contains(pid.publicKey)) ? conn : nil
         }
     }
 
@@ -1163,7 +1205,7 @@ public actor Ivy {
             // impersonate a victim). Account + forward under `peer.publicKey`.
             let realSrc = peer.publicKey
             let dst = PeerID(publicKey: dstKey)
-            guard tally.shouldAllow(peer: peer), connections[dst] != nil else {
+            guard tally.shouldAllow(peer: peer), hasAnyConnection(dst) else {
                 fireToPeer(peer, .relayStatus(code: 1, nonce: nonce)); return
             }
             // Initiator netgroup from OUR view of its connection (socket-observed
@@ -1447,7 +1489,7 @@ public actor Ivy {
         let closest = router.closestPeers(to: Array(targetHash), count: config.maxConcurrentRequests)
         var sent = 0
         for entry in closest {
-            let reachable = connections[entry.id] != nil || localPeers[entry.id] != nil
+            let reachable = hasAnyConnection(entry.id) || localPeers[entry.id] != nil
             guard reachable else { continue }
             fireToPeer(entry.id, .dhtForward(cid: cid, ttl: 0))
             sent += 1
@@ -1518,7 +1560,7 @@ public actor Ivy {
 
     func reachablePinLookupTargets(for cidHash: [UInt8]) -> [Router.BucketEntry] {
         router.closestPeers(to: cidHash, count: config.maxConcurrentRequests).filter { entry in
-            let reachable = connections[entry.id] != nil || localPeers[entry.id] != nil
+            let reachable = hasAnyConnection(entry.id) || localPeers[entry.id] != nil
             return reachable
         }
     }
@@ -1967,7 +2009,7 @@ public actor Ivy {
     }
 
     func timeoutUnidentifiedPeer(_ peer: PeerID) {
-        if connections[peer] != nil, peer.publicKey.hasPrefix("inbound-") {
+        if hasAnyConnection(peer), peer.publicKey.hasPrefix("inbound-") {
             disconnect(peer)
         }
     }
