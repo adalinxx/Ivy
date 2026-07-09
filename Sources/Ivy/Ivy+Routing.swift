@@ -223,32 +223,63 @@ extension Ivy {
     }
 
     /// True if `host` is NOT a globally-routable IP literal: a non-IP string, or
-    /// an address in loopback / RFC1918-private / link-local / IPv6 unique-local
-    /// / unspecified space. Reuses `NetGroup.group` for parsing (v4:/v6:/raw:
-    /// tagging) so a single canonical parser decides both bucketing and routability.
+    /// an address in any non-global / special-use range. Parses the FULL address
+    /// (all four IPv4 octets / all eight IPv6 hextets) via the canonical
+    /// `NetGroup` parser, NOT the coarse /16-/32 group grain — so a /24 or /32
+    /// special range (e.g. an RFC 5737 TEST-NET) is classified precisely without
+    /// over-rejecting the real-public space surrounding it.
     func isNonRoutableDiscoveredHost(_ host: String) -> Bool {
-        let group = NetGroup.group(host)
-        if group.hasPrefix("v4:") {
-            let parts = group.dropFirst(3).split(separator: ".")
-            guard parts.count == 2, let a = Int(parts[0]), let b = Int(parts[1]) else { return true }
-            switch a {
-            case 0, 10, 127: return true                   // unspecified/this-net, private, loopback
-            case 169: return b == 254                       // link-local 169.254/16
-            case 172: return (16...31).contains(b)          // private 172.16/12
-            case 192: return b == 168                       // private 192.168/16
-            case 100: return (64...127).contains(b)         // CGNAT/shared 100.64/10 (RFC 6598)
-            case 240...255: return true                     // reserved 240/4 (incl. broadcast)
-            default: return false
-            }
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let octets = NetGroup.ipv4Octets(trimmed) {
+            return Self.isNonRoutableIPv4(octets)
         }
-        if group.hasPrefix("v6:") {
-            let parts = group.dropFirst(3).split(separator: ".")
-            guard let first = parts.first, let h = UInt16(first, radix: 16) else { return true }
-            if h == 0 { return true }                       // ::/16 (::, ::1, docs) — non-global
-            if (0xfe80...0xfebf).contains(h) { return true } // link-local fe80::/10
-            if (0xfc00...0xfdff).contains(h) { return true } // unique-local fc00::/7
+        // IPv4-mapped ("::ffff:a.b.c.d") / -compatible ("::a.b.c.d") IPv6: the
+        // meaningful network is the embedded IPv4, so classify by that.
+        if trimmed.contains(":"), let mapped = NetGroup.embeddedMappedIPv4(trimmed),
+           let octets = NetGroup.ipv4Octets(mapped) {
+            return Self.isNonRoutableIPv4(octets)
+        }
+        if trimmed.contains(":"), let hextets = NetGroup.ipv6Hextets(trimmed) {
+            return Self.isNonRoutableIPv6(hextets)
+        }
+        return true   // not an IP literal
+    }
+
+    /// Precise IPv4 special-use classification over the full dotted-quad.
+    static func isNonRoutableIPv4(_ o: [Int]) -> Bool {
+        let (a, b, c) = (o[0], o[1], o[2])
+        switch a {
+        case 0: return true                              // "this network" 0.0.0.0/8 (RFC 1122)
+        case 10: return true                             // private 10.0.0.0/8 (RFC 1918)
+        case 127: return true                            // loopback 127.0.0.0/8 (RFC 1122)
+        case 100: return (64...127).contains(b)          // CGNAT/shared 100.64.0.0/10 (RFC 6598)
+        case 169: return b == 254                        // link-local 169.254.0.0/16 (RFC 3927)
+        case 172: return (16...31).contains(b)           // private 172.16.0.0/12 (RFC 1918)
+        case 192:
+            if b == 168 { return true }                  // private 192.168.0.0/16 (RFC 1918)
+            if b == 0 && c == 2 { return true }          // TEST-NET-1 192.0.2.0/24 (RFC 5737)
             return false
+        case 198:
+            if b == 18 || b == 19 { return true }        // benchmarking 198.18.0.0/15 (RFC 2544)
+            if b == 51 && c == 100 { return true }       // TEST-NET-2 198.51.100.0/24 (RFC 5737)
+            return false
+        case 203:
+            if b == 0 && c == 113 { return true }        // TEST-NET-3 203.0.113.0/24 (RFC 5737)
+            return false
+        case 224...239: return true                      // multicast 224.0.0.0/4 (RFC 5771)
+        case 240...255: return true                      // reserved 240.0.0.0/4, incl. broadcast (RFC 1112)
+        default: return false
         }
-        return true   // raw: — not an IP literal
+    }
+
+    /// Precise IPv6 special-use classification over the full eight hextets.
+    static func isNonRoutableIPv6(_ h: [UInt16]) -> Bool {
+        let first = h[0]
+        if first == 0 { return true }                    // ::, ::1, IPv4-compat/mapped, discard — non-global (RFC 4291)
+        if (0xfe80...0xfebf).contains(first) { return true } // link-local fe80::/10 (RFC 4291)
+        if (0xfc00...0xfdff).contains(first) { return true } // unique-local fc00::/7 (RFC 4193)
+        if (0xff00...0xffff).contains(first) { return true } // multicast ff00::/8 (RFC 4291)
+        if first == 0x2001 && h[1] == 0x0db8 { return true } // documentation 2001:db8::/32 (RFC 3849)
+        return false
     }
 }

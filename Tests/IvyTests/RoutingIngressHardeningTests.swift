@@ -238,7 +238,8 @@ struct RoutingIngressHardeningTests {
 
     @Test("A public node rejects discovered endpoints in non-routable address space")
     func publicNodeRejectsNonRoutableDiscoveredEndpoints() async {
-        // A node with a declared ROUTABLE externalAddress is public-facing.
+        // A node with a declared, GENUINELY globally-routable externalAddress is
+        // public-facing (8.8.8.8 is real global unicast, not a special-use range).
         let publicNode = Ivy(config: IvyConfig(
             publicKey: "routing-public-node",
             listenPort: 0,
@@ -246,23 +247,28 @@ struct RoutingIngressHardeningTests {
             enableLocalDiscovery: false,
             healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
             enablePEX: false,
-            externalAddress: (host: "203.0.113.5", port: 4001)
+            externalAddress: (host: "8.8.8.8", port: 4001)
         ))
         let source = PeerID(publicKey: "routing-public-source")
         func ep(_ host: String) -> PeerEndpoint {
             PeerEndpoint(publicKey: "disc-\(host)", host: host, port: 4001)
         }
 
-        // Non-routable / internal / non-IP: all rejected (no SSRF steering).
+        // Non-routable / special-use / internal / non-IP: all rejected (no SSRF
+        // steering into private hosts OR into special-use/documentation ranges).
         for host in ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1",
                      "169.254.1.1", "100.64.0.1", "240.0.0.1", "255.255.255.255",
+                     // Newly-classified special-use ranges (multicast / benchmarking /
+                     // RFC 5737 TEST-NET-1/2/3 / IPv6 multicast / RFC 3849 docs).
+                     "224.0.0.1", "239.0.0.1", "198.18.0.1", "192.0.2.1",
+                     "198.51.100.7", "203.0.113.5", "ff02::1", "2001:db8::1",
                      "::1", "fe80::1", "fc00::1", "not-an-ip", "example.com"] {
             #expect(!(await publicNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
-                    "public node must reject non-routable/internal host \(host)")
+                    "public node must reject non-routable/special-use host \(host)")
         }
-        // Genuinely routable addresses still pass.
-        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("198.51.100.7"), source: "test", from: source))
-        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2001:db8::1"), source: "test", from: source))
+        // Genuinely globally-routable addresses still pass.
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("1.1.1.1"), source: "test", from: source))
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2606:4700:4700::1111"), source: "test", from: source))
 
         // A node WITHOUT a public externalAddress (local/test mode) still accepts
         // loopback/private peers — the filter must not break local operation.
