@@ -46,7 +46,7 @@ extension Ivy {
             let closest = router.closestPeers(to: cidHash, count: 3)
             for entry in closest {
                 guard entry.id != peer, entry.id != localID else { continue }
-                let reachable = connections[entry.id] != nil
+                let reachable = hasAnyConnection(entry.id)
                 guard reachable else { continue }
                 fireToPeer(entry.id, .dhtForward(cid: cid, ttl: ttl - 1))
             }
@@ -341,14 +341,14 @@ extension Ivy {
         var seen: Set<String> = []
 
         for p in providerRecords[rootCID] ?? [] {
-            guard connections[p] != nil || localPeers[p] != nil else { continue }
+            guard hasAnyConnection(p) || localPeers[p] != nil else { continue }
             guard tally.shouldAllow(peer: p) else { continue }
             guard !isDeficiencySuppressed(rootCID: rootCID, peer: p) else { continue }
             if seen.insert(p.publicKey).inserted { candidates.append(p) }
         }
         for pk in storedPinAnnouncements(for: rootCID) {
             let pid = PeerID(publicKey: pk)
-            guard connections[pid] != nil || localPeers[pid] != nil else { continue }
+            guard hasAnyConnection(pid) || localPeers[pid] != nil else { continue }
             guard tally.shouldAllow(peer: pid) else { continue }
             guard !isDeficiencySuppressed(rootCID: rootCID, peer: pid) else { continue }
             if seen.insert(pid.publicKey).inserted { candidates.append(pid) }
@@ -356,7 +356,7 @@ extension Ivy {
         if candidates.count < 2 {
             let discovered = await findPinnersViaDHT(rootCID: rootCID)
             for pid in discovered {
-                guard connections[pid] != nil || localPeers[pid] != nil else { continue }
+                guard hasAnyConnection(pid) || localPeers[pid] != nil else { continue }
                 guard tally.shouldAllow(peer: pid) else { continue }
                 guard !isDeficiencySuppressed(rootCID: rootCID, peer: pid) else { continue }
                 if seen.insert(pid.publicKey).inserted { candidates.append(pid) }
