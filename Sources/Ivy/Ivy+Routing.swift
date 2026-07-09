@@ -272,9 +272,40 @@ extension Ivy {
         }
     }
 
+    /// If `h` is an IPv6 transition form that embeds an IPv4 address, returns the
+    /// four embedded octets so they can be run through the v4 special-use
+    /// classifier; nil otherwise. Covers NAT64 (RFC 6052), 6to4 (RFC 3964) and
+    /// Teredo (RFC 4380) — mirrors Bitcoin Core's IsRFC6052/3964/4380 handling.
+    static func embeddedTransitionIPv4(_ h: [UInt16]) -> [Int]? {
+        func octets(_ hi: UInt16, _ lo: UInt16) -> [Int] {
+            [Int(hi >> 8), Int(hi & 0xff), Int(lo >> 8), Int(lo & 0xff)]
+        }
+        // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): 0064:ff9b then 64 zero
+        // bits; the embedded IPv4 is the last two hextets.
+        if h[0] == 0x0064, h[1] == 0xff9b, h[2] == 0, h[3] == 0, h[4] == 0, h[5] == 0 {
+            return octets(h[6], h[7])
+        }
+        // 6to4 2002::/16 (RFC 3964): the embedded IPv4 is hextets[1..2].
+        if h[0] == 0x2002 {
+            return octets(h[1], h[2])
+        }
+        // Teredo 2001:0000::/32 (RFC 4380): the client IPv4 is the last two
+        // hextets XOR 0xffff. Precisely 2001:0000: (second hextet 0) — distinct
+        // from documentation 2001:db8::/32 and from plain global 2001::/16.
+        if h[0] == 0x2001, h[1] == 0x0000 {
+            return octets(h[6] ^ 0xffff, h[7] ^ 0xffff)
+        }
+        return nil
+    }
+
     /// Precise IPv6 special-use classification over the full eight hextets.
     static func isNonRoutableIPv6(_ h: [UInt16]) -> Bool {
         let first = h[0]
+        // Transition forms embedding an IPv4 (NAT64/6to4/Teredo): classify by the
+        // embedded v4, so an internal/special-use v4 wrapped in a transition
+        // prefix can't slip past as "routable IPv6" (SSRF on a translation host).
+        // A wrapped globally-routable v4 stays routable.
+        if let v4 = embeddedTransitionIPv4(h) { return isNonRoutableIPv4(v4) }
         if first == 0 { return true }                    // ::, ::1, IPv4-compat/mapped, discard — non-global (RFC 4291)
         if (0xfe80...0xfebf).contains(first) { return true } // link-local fe80::/10 (RFC 4291)
         if (0xfc00...0xfdff).contains(first) { return true } // unique-local fc00::/7 (RFC 4193)
