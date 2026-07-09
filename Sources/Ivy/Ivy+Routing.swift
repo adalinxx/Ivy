@@ -198,11 +198,18 @@ extension Ivy {
         // A publicly-reachable node rejects discovered endpoints that point at
         // non-routable address space (RFC1918, loopback, link-local, IPv6
         // unique-local, unspecified) or a non-IP string — a peer must not be able
-        // to steer it into dialing an internal host (SSRF). Gated to public nodes
-        // (a declared, routable externalAddress): a node configured for local/test
-        // operation legitimately talks to loopback/private peers, so the filter
-        // must not apply to it.
-        if let ext = config.externalAddress, !isNonRoutableDiscoveredHost(ext.host),
+        // to steer it into dialing an internal host (SSRF). Gated to public nodes,
+        // where "public" is the EFFECTIVE public address: an operator-declared
+        // externalAddress OR, absent that, the node's OWN STUN-derived reflexive
+        // publicAddress (both are advertised by sendIdentify, so both make the node
+        // effectively reachable from the public Internet). Read at call time so a
+        // node that becomes public mid-session via STUN is covered. Using the node's
+        // own observed reflexive address introduces no SSRF surface — it is not
+        // attacker-supplied. A node with neither (local/test) legitimately talks to
+        // loopback/private peers, so the filter must not apply to it; and a
+        // (defensively) non-routable effective host is treated as not-public.
+        let effectivePublicHost = config.externalAddress?.host ?? publicAddress?.host
+        if let publicHost = effectivePublicHost, !isNonRoutableDiscoveredHost(publicHost),
            isNonRoutableDiscoveredHost(host) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false

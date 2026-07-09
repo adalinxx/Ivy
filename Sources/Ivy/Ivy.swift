@@ -372,6 +372,10 @@ public actor Ivy {
     func reconnectDelayForTesting(peer: PeerID) -> Duration {
         reconnectDelay(for: peer)
     }
+
+    func setPublicAddressForTesting(_ address: ObservedAddress?) {
+        publicAddress = address
+    }
 #endif
 
     public var connectedPeers: [PeerID] {
