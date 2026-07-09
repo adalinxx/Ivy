@@ -492,7 +492,12 @@ public actor Ivy {
         peerChainPorts.filter { hasAnyConnection($0.key) }
     }
 
-    public var directPeerCount: Int { connections.count }
+    /// Total peer connections — direct AND relayed — excluding in-process
+    /// `localPeers` (test transports). A relayed connection is a valid link for
+    /// reachability, parent-subscription, and sync, so it is counted here; do NOT
+    /// read this as a count of direct sockets. For direct-only questions use the
+    /// explicit `isDirect` accessors / `directCarrier(to:)`.
+    public var peerConnectionCount: Int { connections.count }
 
     /// Register a child chain's listen port so it is included in future
     /// identify messages. Remote peers use this to discover the exact port
