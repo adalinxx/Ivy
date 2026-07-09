@@ -90,8 +90,8 @@ struct TCPIntegrationTests {
         // Wait for connection to establish
         try await Task.sleep(for: .milliseconds(500))
 
-        let peers1 = await ivy1.directPeerCount
-        let peers2 = await ivy2.directPeerCount
+        let peers1 = await ivy1.peerConnectionCount
+        let peers2 = await ivy2.peerConnectionCount
 
         // ivy2 connected to ivy1 outbound; ivy1 accepted inbound
         #expect(peers1 >= 1, "Node 1 should have at least 1 peer")
@@ -344,7 +344,7 @@ struct TCPIntegrationTests {
         // Wait for bootstrap connection
         try await Task.sleep(for: .seconds(2))
 
-        let peers2 = await ivy2.directPeerCount
+        let peers2 = await ivy2.peerConnectionCount
         #expect(peers2 >= 1, "Node 2 should auto-connect to bootstrap peer")
 
         await ivy1.stop()
@@ -439,19 +439,19 @@ struct TCPIntegrationTests {
         // Connect
         try await ivy2.connect(to: PeerEndpoint(publicKey: kp1.publicKey, host: "127.0.0.1", port: p1))
         try await Task.sleep(for: .seconds(1))
-        let peersBefore = await ivy2.directPeerCount
+        let peersBefore = await ivy2.peerConnectionCount
         #expect(peersBefore >= 1)
 
         // Disconnect
         await ivy2.disconnect(PeerID(publicKey: kp1.publicKey))
         try await Task.sleep(for: .milliseconds(500))
-        let peersAfter = await ivy2.directPeerCount
+        let peersAfter = await ivy2.peerConnectionCount
         #expect(peersAfter == 0, "Should have 0 peers after disconnect")
 
         // Reconnect
         try await ivy2.connect(to: PeerEndpoint(publicKey: kp1.publicKey, host: "127.0.0.1", port: p1))
         try await Task.sleep(for: .seconds(1))
-        let peersReconnect = await ivy2.directPeerCount
+        let peersReconnect = await ivy2.peerConnectionCount
         #expect(peersReconnect >= 1, "Should reconnect successfully")
 
         // Verify data still flows
@@ -854,7 +854,7 @@ struct TCPIntegrationTests {
         try await Task.sleep(for: .seconds(2))
 
         // Node 1 should see 3 peers (inbound from 2, 3, 4)
-        let peers1 = await ivy1.directPeerCount
+        let peers1 = await ivy1.peerConnectionCount
         #expect(peers1 >= 3, "Hub node should have 3+ peers")
 
         // Broadcast from node 1 should reach all
@@ -997,7 +997,7 @@ struct NetworkRobustnessTests {
         try await ivyFinal.connect(to: PeerEndpoint(publicKey: kp1.publicKey, host: "127.0.0.1", port: p1))
         try await Task.sleep(for: .milliseconds(500))
 
-        let peers = await ivyFinal.directPeerCount
+        let peers = await ivyFinal.peerConnectionCount
         #expect(peers >= 1, "Should still be able to connect after churn")
 
         await ivyFinal.stop()
@@ -1130,7 +1130,7 @@ struct NetworkRobustnessTests {
         #expect(repA >= repB, "Peer A (successes+bytes) should have >= reputation than Peer B (failures)")
 
         // Both should still be connectable (score doesn't prevent connections)
-        let peersCount = await ivy1.directPeerCount
+        let peersCount = await ivy1.peerConnectionCount
         #expect(peersCount >= 2, "Both peers should still be connected despite differing scores")
 
         await ivy1.stop()
