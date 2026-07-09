@@ -330,6 +330,28 @@ public actor Ivy {
         }.count
     }
 
+    /// Atomically retire a peer's current RELAYED connection so a DIRECT dial can
+    /// take over `connections[peer]`. No-op unless the peer holds a relayed conn.
+    ///
+    /// M1: `reserveOutgoingDial` lets a direct dial UPGRADE a peer that currently
+    /// holds only a relayed (channel-less) connection. Overwriting
+    /// `connections[peer]` alone would orphan the stale relayed conn: it never
+    /// sees a stream-end (only `cancel()` ends its `handleInbound`), and once
+    /// `connections[peer]` is the new conn its teardown hits the `current !== conn`
+    /// early-return — so its side-indices are never cleared. Retire it as one unit
+    /// here: clear the claimed-key route, drop it from the inbound set, and cancel
+    /// it. (`stale.cancel()` alone is insufficient for exactly the early-return
+    /// reason above.) A healthy DIRECT conn is already deduped by
+    /// `reserveOutgoingDial` and never reaches here.
+    func supersedeRelayedConnection(for peer: PeerID) {
+        guard let stale = relayedConn(to: peer) else { return }
+        if let claimed = stale.relayedClaimedKey {
+            relayedConnByClaimedKey.removeValue(forKey: claimed)
+        }
+        untrackInboundConnection(peer)
+        stale.cancel()
+    }
+
     // MARK: - Connection Management
 
     public func connect(to endpoint: PeerEndpoint) async throws {
@@ -366,23 +388,7 @@ public actor Ivy {
             return
         }
 
-        // M1: `reserveOutgoingDial` lets this direct dial UPGRADE a peer that
-        // currently holds only a relayed (channel == nil) connection. Overwriting
-        // `connections[peer]` alone would orphan the stale relayed conn: it never
-        // sees a stream-end (only `cancel()` ends its `handleInbound`), and once
-        // `connections[peer]` is the new conn its teardown hits the `current !==
-        // conn` early-return — so its side-indices are never cleared. Supersede it
-        // explicitly here: clear the claimed-key route, drop it from the inbound
-        // set, and cancel it. (`stale.cancel()` alone is insufficient for exactly
-        // the early-return reason above.) A healthy DIRECT conn (channel != nil)
-        // is already deduped by `reserveOutgoingDial` and never reaches here.
-        if let stale = relayedConn(to: peer) {
-            if let claimed = stale.relayedClaimedKey {
-                relayedConnByClaimedKey.removeValue(forKey: claimed)
-            }
-            untrackInboundConnection(peer)
-            stale.cancel()
-        }
+        supersedeRelayedConnection(for: peer)
         connections[peer] = conn
         finishOutgoingDial(to: peer, connected: true)
         router.addPeer(peer, endpoint: endpoint, tally: tally)
