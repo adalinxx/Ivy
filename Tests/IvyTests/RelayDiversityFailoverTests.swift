@@ -126,6 +126,34 @@ struct RelayDiversityFailoverTests {
         if !viaR1 { await R1.stop() }
     }
 
+    // MARK: - Outbound observed-address capture (H1 root cause)
+
+    /// An OUTBOUND dial must capture the unforgeable L3 remote as `observedHost`
+    /// BEFORE identify runs — otherwise carrier netgroup diversity falls through
+    /// to the peer's self-advertised (forgeable) endpoint host. Before the fix
+    /// outbound connections had `observedHost == nil`; after, it is the dialed IP
+    /// and drives `carrierNetgroup`.
+    @Test("an outbound dial captures the observed L3 address for netgroup diversity")
+    func outboundDialCapturesObservedHost() async throws {
+        let (pubR, skR) = keypair(); let (pubA, skA) = keypair()
+        let (portR, portA): (UInt16, UInt16) = (19771, 19772)
+        let R = Ivy(config: cfg(pub: pubR, priv: skR, port: portR, relay: true))
+        let A = Ivy(config: cfg(pub: pubA, priv: skA, port: portA, relay: false))
+        try await R.start(); try await A.start()
+
+        let rID = PeerID(publicKey: pubR)
+        try await A.connect(to: PeerEndpoint(publicKey: pubR, host: "127.0.0.1", port: portR))
+        let connected = await waitUntil { await A.connections[rID] != nil }
+        #expect(connected)
+
+        let observed = await A.connections[rID]?.observedHost
+        #expect(observed == "127.0.0.1", "outbound dial must record the dialed L3 remote")
+        let group = await A.carrierNetgroup(A.connections[rID]!)
+        #expect(group == NetGroup.group("127.0.0.1"), "carrier netgroup derives from the observed address")
+
+        await A.stop(); await R.stop()
+    }
+
     // MARK: - No-dial invariant
 
     /// The relay path bridges only PRE-EXISTING mutual connections. A
@@ -318,24 +346,74 @@ struct RelayCarrierSeedTests {
     @Test("seed set is bounded and prefers netgroup diversity on displacement")
     func seedsBoundedAndDiverse() async {
         let node = makeNode()
-        await node.recordRelayCarrierSeed(key: "k1", endpoint: ep("k1", "10.0.0.1"))
-        await node.recordRelayCarrierSeed(key: "k2", endpoint: ep("k2", "20.0.0.1"))
-        await node.recordRelayCarrierSeed(key: "k3", endpoint: ep("k3", "10.0.9.9"))  // duplicates k1's /16
+        // Diversity keys on the observed netgroup passed in, not the endpoint host.
+        func record(_ key: String, _ host: String) async {
+            await node.recordRelayCarrierSeed(key: key, endpoint: ep(key, host), group: NetGroup.group(host))
+        }
+        await record("k1", "10.0.0.1")
+        await record("k2", "20.0.0.1")
+        await record("k3", "10.0.9.9")  // duplicates k1's /16
         #expect(await node.relayCarrierSeeds.count == 3)
 
         // Full + newcomer from an ALREADY-covered netgroup: no displacement.
-        await node.recordRelayCarrierSeed(key: "k4", endpoint: ep("k4", "20.0.5.5"))
+        await record("k4", "20.0.5.5")
         #expect(await node.relayCarrierSeeds["k4"] == nil)
         #expect(await node.relayCarrierSeeds.count == 3)
 
         // Full + newcomer ADDING a netgroup: displaces one member of the
         // duplicated group, so the set covers {10.0, 20.0, 30.0}.
-        await node.recordRelayCarrierSeed(key: "k5", endpoint: ep("k5", "30.0.0.1"))
+        await record("k5", "30.0.0.1")
         let seeds = await node.relayCarrierSeeds
         #expect(seeds.count == 3)
         #expect(seeds["k5"] != nil)
         #expect(seeds["k2"] != nil)
         #expect((seeds["k1"] != nil) != (seeds["k3"] != nil), "exactly one duplicated-group member survives")
+    }
+
+    /// A carrier's netgroup for diversity MUST come from its unforgeable observed
+    /// L3 address — never the self-advertised endpoint host, which identify
+    /// overwrites with peer-controlled listenAddrs. Two carriers whose advertised
+    /// hosts claim DISTINCT netgroups but whose OBSERVED sockets are the SAME
+    /// netgroup must collapse to one group (RED before the fix: advertised-derived
+    /// groups look distinct; GREEN after: observed collapses them).
+    @Test("carrierNetgroup derives from the observed address, not the advertised host")
+    func carrierNetgroupUsesObservedNotAdvertised() async {
+        let node = makeNode()
+
+        // Advertised host claims 8.8.0.0/16; observed socket is 10.0.0.0/16.
+        let forged = PeerConnection(
+            id: PeerID(publicKey: "forged"),
+            endpoint: PeerEndpoint(publicKey: "forged", host: "8.8.4.4", port: 4001),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        forged.observedHost = "10.0.7.7"
+        // A second carrier advertising a DIFFERENT fake netgroup, same observed /16.
+        let forged2 = PeerConnection(
+            id: PeerID(publicKey: "forged2"),
+            endpoint: PeerEndpoint(publicKey: "forged2", host: "9.9.9.9", port: 4001),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        forged2.observedHost = "10.0.8.8"
+
+        let g1 = await node.carrierNetgroup(forged)
+        let g2 = await node.carrierNetgroup(forged2)
+        #expect(g1 == NetGroup.group("10.0.7.7"), "must use the observed address")
+        #expect(g1 != NetGroup.group("8.8.4.4"), "must NOT use the advertised host")
+        #expect(g1 == g2, "distinct advertised netgroups collapse to one observed netgroup")
+
+        // No observed address → single sentinel group (cannot forge freshness),
+        // never the mutable advertised host.
+        let noObserved = PeerConnection(
+            id: PeerID(publicKey: "noobs"),
+            endpoint: PeerEndpoint(publicKey: "noobs", host: "1.2.3.4", port: 4001),
+            channel: nil,
+            relayForward: { _ in }
+        )
+        let gs = await node.carrierNetgroup(noObserved)
+        #expect(gs == Ivy.unknownCarrierNetgroup)
+        #expect(gs != NetGroup.group("1.2.3.4"))
     }
 }
 

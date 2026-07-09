@@ -93,6 +93,12 @@ public final class PeerConnection: @unchecked Sendable {
         ).get()
 
         let peerConn = PeerConnection(id: id, endpoint: endpoint, channel: channel, maxFrameSize: maxFrameSize)
+        // Pin the netgroup to the unforgeable L3 remote for OUTBOUND dials too.
+        // For an outbound connection the observed remote is exactly the address
+        // we dialed, captured BEFORE identify can overwrite `endpoint` with the
+        // peer's self-advertised listenAddrs — so diversity/netgroup accounting
+        // (carrierNetgroup) can never be steered by a forged advertisement.
+        peerConn.observedHost = channel.remoteAddress?.ipAddress
         let peerHandler = PeerChannelHandler(connection: peerConn)
         try await channel.pipeline.addHandler(peerHandler).get()
 
