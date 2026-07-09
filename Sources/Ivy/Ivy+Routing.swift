@@ -236,6 +236,8 @@ extension Ivy {
             case 169: return b == 254                       // link-local 169.254/16
             case 172: return (16...31).contains(b)          // private 172.16/12
             case 192: return b == 168                       // private 192.168/16
+            case 100: return (64...127).contains(b)         // CGNAT/shared 100.64/10 (RFC 6598)
+            case 240...255: return true                     // reserved 240/4 (incl. broadcast)
             default: return false
             }
         }
