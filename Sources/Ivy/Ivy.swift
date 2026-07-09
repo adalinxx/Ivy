@@ -68,6 +68,36 @@ public actor Ivy {
     /// Cap on concurrent relayed (channel-less) connections — bounds the phantom
     /// slot DoS where a relay/peer opens relayed entries that never identify.
     static let maxRelayedConnections = 64
+    /// Carriers that have successfully opened a circuit for us (endpoint by
+    /// public key), bounded and diversity-preferring — the re-dial pool for
+    /// `ensureRelayCarrierConnections`. `config.knownRelays` seeds the same
+    /// pool at start; a discovered carrier is just as good as a configured one.
+    /// A carrier we can re-dial to keep the relay pool populated. Stores the
+    /// dialable advertised `endpoint` AND the unforgeable observed `group`
+    /// (netgroup captured from the L3 socket at record time) — the group drives
+    /// the diversity-preserving eviction and is never re-derived from the
+    /// self-advertised endpoint host, which the peer controls.
+    struct RelayCarrierSeed: Sendable {
+        let endpoint: PeerEndpoint
+        let group: String
+    }
+    var relayCarrierSeeds: [String: RelayCarrierSeed] = [:]
+    static let maxRelayCarrierSeeds = 3
+    /// Consecutive re-dial failures per carrier seed. A seed that repeatedly
+    /// fails to (re)connect is a black hole — dropped from the pool once it hits
+    /// `maxRelayCarrierSeedDialFailures` so we stop re-dialing it forever. Reset
+    /// on any successful (re)connection.
+    var relayCarrierSeedFailures: [String: Int] = [:]
+    static let maxRelayCarrierSeedDialFailures = 3
+    /// How many relay-capable direct connections a relay-DEPENDENT node keeps
+    /// alive (bounded 2-3: one failover alternative + netgroup diversity,
+    /// without per-target multi-relay fan-out for the common direct case).
+    static let targetRelayCarrierCount = 2
+    /// Failover attempts per lost relayed connection before treating the peer
+    /// as gone (each attempt already fans out across EVERY connected carrier,
+    /// so unlike a direct re-dial there is no point retrying forever — demand
+    /// or gossip re-forms the circuit if the peer comes back).
+    static let maxRelayFailoverAttempts = 5
     var inboundConnectionIDs: Set<PeerID> = []
     var inboundConnectionOrder: [PeerID] = []
     var pendingRequests: [String: [CheckedContinuation<Data?, Never>]] = [:]
@@ -192,9 +222,16 @@ public actor Ivy {
             Task { try? await connect(to: bootstrap) }
         }
         // Stay connected to known relays so they are available as relay candidates
-        // for connectViaRelay when a direct dial to some other peer fails.
+        // for connectViaRelay when a direct dial to some other peer fails. These
+        // are only SEEDS: every connected peer is a carrier candidate, and
+        // carriers that successfully serve a circuit join `relayCarrierSeeds`
+        // on equal footing (see ensureRelayCarrierConnections).
         for relay in config.knownRelays where !config.bootstrapPeers.contains(where: { $0.publicKey == relay.publicKey }) {
-            Task { try? await connect(to: relay) }
+            // Direct-only, mirroring the seed/top-up carrier paths: a relayed
+            // (channel-less) connection to a relay is useless as a circuit carrier,
+            // and the relay fallback only fires when a direct carrier already
+            // exists — so this never blocks cold-boot reachability.
+            Task { try? await connect(to: relay, allowRelayFallback: false) }
         }
 
         let monitor = PeerHealthMonitor(
@@ -245,6 +282,7 @@ public actor Ivy {
         }
         reconnectTasks.removeAll()
         reconnectAttempts.removeAll()
+        relayCarrierSeedFailures.removeAll()
         intentionallyDisconnectedPeers.removeAll()
         clearPendingForwards()
     }
@@ -252,6 +290,15 @@ public actor Ivy {
     // MARK: - Connection Management
 
     public func connect(to endpoint: PeerEndpoint) async throws {
+        try await connect(to: endpoint, allowRelayFallback: true)
+    }
+
+    /// `allowRelayFallback == false` forces a DIRECT dial with no circuit-relay
+    /// fallback. Carrier-seed redial uses this: a seed reachable only via relay is
+    /// not a usable carrier (a relayed connection has `channel == nil`), so its
+    /// direct-dial failure must count toward eviction rather than silently opening
+    /// a channel-less relayed connection that falsely reads as a restored carrier.
+    func connect(to endpoint: PeerEndpoint, allowRelayFallback: Bool) async throws {
         let peer = PeerID(publicKey: endpoint.publicKey)
         guard reserveOutgoingDial(to: endpoint) else { return }
 
@@ -263,7 +310,7 @@ public actor Ivy {
             // P0: direct dial failed (likely NAT). Fall back to a circuit relay if
             // any relay-capable peer is connected. `endpoint.host == "relay"` is the
             // synthetic host of an already-relayed endpoint — never relay those.
-            if endpoint.host != "relay",
+            if allowRelayFallback, endpoint.host != "relay",
                connections.values.contains(where: { $0.channel != nil }) {
                 do { try await connectViaRelay(to: endpoint); return } catch { throw error }
             }
@@ -276,6 +323,23 @@ public actor Ivy {
             return
         }
 
+        // M1: `reserveOutgoingDial` lets this direct dial UPGRADE a peer that
+        // currently holds only a relayed (channel == nil) connection. Overwriting
+        // `connections[peer]` alone would orphan the stale relayed conn: it never
+        // sees a stream-end (only `cancel()` ends its `handleInbound`), and once
+        // `connections[peer]` is the new conn its teardown hits the `current !==
+        // conn` early-return — so its side-indices are never cleared. Supersede it
+        // explicitly here: clear the claimed-key route, drop it from the inbound
+        // set, and cancel it. (`stale.cancel()` alone is insufficient for exactly
+        // the early-return reason above.) A healthy DIRECT conn (channel != nil)
+        // is already deduped by `reserveOutgoingDial` and never reaches here.
+        if let stale = connections[peer], stale.channel == nil {
+            if let claimed = stale.relayedClaimedKey {
+                relayedConnByClaimedKey.removeValue(forKey: claimed)
+            }
+            untrackInboundConnection(peer)
+            stale.cancel()
+        }
         connections[peer] = conn
         finishOutgoingDial(to: peer, connected: true)
         router.addPeer(peer, endpoint: endpoint, tally: tally)
@@ -288,15 +352,27 @@ public actor Ivy {
 
     func reserveOutgoingDial(to endpoint: PeerEndpoint) -> Bool {
         let peer = PeerID(publicKey: endpoint.publicKey)
-        guard connections[peer] == nil, !connectingPeers.contains(peer) else { return false }
+        // A live DIRECT channel (channel != nil) blocks a redundant dial; but a
+        // RELAYED-only connection (channel == nil) must NOT — a direct dial legitimately
+        // UPGRADES it to a real socket (e.g. the knownRelays carrier top-up establishing
+        // a circuit-capable direct carrier). The upgrade supersedes the peer's own
+        // relayed conn, which is excluded from the per-netgroup tally below.
+        guard connections[peer]?.channel == nil, !connectingPeers.contains(peer) else { return false }
 
         // Enforce netgroup diversity on every outbound dial, not just during
         // periodic refresh. Without this, an attacker can occupy all outbound
         // slots in the 60-second window between refresh cycles [Heilman 2015].
         // Limit: 2 connections per netgroup (IPv4 /16, IPv6 /32).
         let targetSubnet = NetGroup.group(endpoint.host)
-        let sameSubnetCount = connections.values.filter {
-            NetGroup.group($0.endpoint.host) == targetSubnet
+        // Count only OTHER peers' connections in the netgroup. A direct dial that
+        // UPGRADES `peer`'s own existing (relayed, channel == nil) connection
+        // supersedes that connection rather than adding alongside it, so counting
+        // it here would let a re-keyed relayed conn — whose endpoint.host is the
+        // peer's advertised (real target) host — occupy a netgroup slot against
+        // its own upgrade. Excluding `peer` keeps the guard identical for a dial
+        // to a NEW peer (no existing connection → nothing excluded).
+        let sameSubnetCount = connections.filter { pid, conn in
+            pid != peer && NetGroup.group(conn.endpoint.host) == targetSubnet
         }.count + connectingEndpoints.values.filter {
             NetGroup.group($0.host) == targetSubnet
         }.count
@@ -328,6 +404,10 @@ public actor Ivy {
 
     func reconnectDelayForTesting(peer: PeerID) -> Duration {
         reconnectDelay(for: peer)
+    }
+
+    func setPublicAddressForTesting(_ address: ObservedAddress?) {
+        publicAddress = address
     }
 #endif
 
@@ -664,22 +744,67 @@ public actor Ivy {
 
         let wasIntentionalDisconnect = intentionallyDisconnectedPeers.remove(peer) != nil
         // Relayed connections have no dialable endpoint (host "relay"); don't try
-        // to reconnect to them directly — they re-form via the relay on demand.
+        // to reconnect to them directly — an IDENTIFIED relayed peer instead
+        // fails over to another carrier below (`scheduleRelayFailover`).
         // Drop the claimed-key index entry (kept across the identify re-key, so
         // clean it by the connection's own claimed key, not the current peer id).
         let wasRelayed = conn.relayForward != nil
         if let claimed = conn.relayedClaimedKey { relayedConnByClaimedKey.removeValue(forKey: claimed) }
         // N1: this carrier is gone — reap relayed connections routed through it.
         // They are channel-less (isLive forever) and would otherwise leak a slot.
+        // Each reaped orphan's own teardown then schedules its relay failover.
         for orphan in connections.values where orphan.relayCarrierConn === conn {
             orphan.cancel()
         }
         if wasCurrentConnection,
-           !wasRelayed,
            !peer.publicKey.hasPrefix("inbound-"),
            running,
            !wasIntentionalDisconnect {
-            scheduleReconnect(to: endpoint, peer: peer)
+            if wasRelayed {
+                // Fast failover: the relayed link died (its carrier tore down, or
+                // the probe loop declared the circuit silent). Re-establish through
+                // another carrier NOW instead of waiting for future demand.
+                scheduleRelayFailover(to: endpoint, peer: peer)
+            } else {
+                scheduleReconnect(to: endpoint, peer: peer)
+            }
+        }
+    }
+
+    /// Schedule a bounded, backed-off attempt to re-form a lost RELAYED
+    /// connection through another carrier. Shares the reconnect bookkeeping
+    /// (`reconnectTasks`/`reconnectAttempts`) so a peer never has both a direct
+    /// reconnect and a relay failover in flight.
+    func scheduleRelayFailover(to endpoint: PeerEndpoint, peer: PeerID) {
+        guard connections[peer] == nil,
+              !connectingPeers.contains(peer),
+              reconnectTasks[peer] == nil else { return }
+        guard (reconnectAttempts[peer] ?? 0) < Self.maxRelayFailoverAttempts else {
+            reconnectAttempts.removeValue(forKey: peer)
+            return
+        }
+        let delay = reconnectDelay(for: peer)
+        config.logger.info("Relayed connection to \(String(peer.publicKey.prefix(16)))… lost — failing over to another carrier in \(String(describing: delay))")
+        let task = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self else { return }
+            await self.runScheduledRelayFailover(to: endpoint, peer: peer)
+        }
+        reconnectTasks[peer] = task
+    }
+
+    func runScheduledRelayFailover(to endpoint: PeerEndpoint, peer: PeerID) async {
+        reconnectTasks.removeValue(forKey: peer)
+        guard running,
+              connections[peer] == nil,
+              !connectingPeers.contains(peer),
+              !intentionallyDisconnectedPeers.contains(peer) else { return }
+        // Top up the carrier pool first so the failover has somewhere to go.
+        ensureRelayCarrierConnections()
+        do {
+            try await connectViaRelay(to: endpoint)
+        } catch {
+            scheduleRelayFailover(to: endpoint, peer: peer)
         }
     }
 
@@ -729,15 +854,27 @@ public actor Ivy {
     /// Establish a RELAYED connection to `endpoint` through one of our connected
     /// relay-capable peers. The result lives in `connections[target]` with a nil
     /// channel, so identify/want/sync flow over it exactly like a direct link.
+    ///
+    /// Carrier selection is NETGROUP-DIVERSE: candidates are tried grouped by
+    /// the carrier's socket-address netgroup, preferring groups that do not
+    /// already carry one of our relayed connections (see `diverseCarrierOrder`).
+    /// INVARIANT: this never dials — it only bridges over connections we
+    /// already hold; an unreachable target fails with `noRelayAvailable`.
     public func connectViaRelay(to endpoint: PeerEndpoint) async throws {
         let targetKey = endpoint.publicKey
         let target = PeerID(publicKey: targetKey)
         guard connections[target] == nil else { return }
 
-        let candidates = connections.compactMap { (pid, conn) -> PeerID? in
-            (conn.channel != nil && pid.publicKey != targetKey) ? pid : nil
+        let candidates = connections.compactMap { (pid, conn) -> (peer: PeerID, group: String)? in
+            (conn.channel != nil && pid.publicKey != targetKey) ? (pid, carrierNetgroup(conn)) : nil
         }
-        for relayPeer in candidates {
+        // Netgroups already carrying one of our relayed connections: a NEW
+        // circuit prefers a carrier outside them, so relay-only reachability
+        // spreads across >=2 distinct netgroups whenever the peer set allows.
+        let activeCarrierGroups = Set(connections.values.compactMap { conn in
+            conn.relayCarrierConn.map { carrierNetgroup($0) }
+        })
+        for relayPeer in Self.diverseCarrierOrder(candidates: candidates, activeCarrierGroups: activeCarrierGroups) {
             nextRelayRequestNonce &+= 1
             let nonce = nextRelayRequestNonce
             let requestKey = PendingRelayRequestKey(relayPeer: relayPeer, nonce: nonce)
@@ -751,14 +888,218 @@ public actor Ivy {
             }
             if success {
                 openRelayedConnection(claimedKey: targetKey, endpoint: endpoint, via: relayPeer)
+                noteRelayCarrierSuccess(relayPeer)
+                reconnectAttempts.removeValue(forKey: target)  // reset failover backoff
                 return
             }
         }
         throw IvyError.noRelayAvailable
     }
 
+    /// Sentinel netgroup for a carrier with no unforgeable observed address.
+    /// ALL such carriers collapse onto this one group so a peer cannot fabricate
+    /// many distinct "fresh" netgroups (which win diverse-first ordering) via its
+    /// self-advertised endpoint. Distinct from every `NetGroup.group` output
+    /// (which is always `v4:`/`v6:`/`raw:`-prefixed), so it never collides.
+    static let unknownCarrierNetgroup = "unknown:no-observed-addr"
+
+    /// Netgroup of a carrier connection, from an address the peer CANNOT forge:
+    /// the L3 remote observed on the socket (captured on both the inbound accept
+    /// and the outbound dial, before identify runs). NEVER falls back to the
+    /// self-advertised `conn.endpoint.host` — during identify that field is
+    /// overwritten with the peer's own listenAddrs, so using it would let an
+    /// attacker forge arbitrarily many netgroups and capture every relayed
+    /// circuit (the relay-layer eclipse this diversity is meant to prevent).
+    /// A carrier without an observed address (should not happen for a live TCP
+    /// carrier) is collapsed onto a single sentinel group so it cannot forge
+    /// freshness.
+    func carrierNetgroup(_ conn: PeerConnection) -> String {
+        guard let host = conn.observedHost, !host.isEmpty else { return Self.unknownCarrierNetgroup }
+        return NetGroup.group(host)
+    }
+
+    /// Order relay-carrier candidates netgroup-diverse-first: round-robin across
+    /// netgroups (so consecutive attempts hit DISTINCT groups), with groups that
+    /// already carry a relayed connection sorted last. Without this, candidates
+    /// were tried in dictionary order and the first success won — a relay-only
+    /// node could end up with every circuit riding one carrier (or one netgroup),
+    /// a single-operator eclipse [Heilman 2015 applied to the relay layer].
+    /// Shuffled within and across groups so selection is not positionally biased.
+    static func diverseCarrierOrder(
+        candidates: [(peer: PeerID, group: String)],
+        activeCarrierGroups: Set<String>
+    ) -> [PeerID] {
+        var byGroup: [String: [PeerID]] = [:]
+        for candidate in candidates.shuffled() {
+            byGroup[candidate.group, default: []].append(candidate.peer)
+        }
+        func roundRobin(_ groups: [String]) -> [PeerID] {
+            var queues = groups.compactMap { byGroup[$0] }
+            var out: [PeerID] = []
+            var advanced = true
+            while advanced {
+                advanced = false
+                for i in queues.indices where !queues[i].isEmpty {
+                    out.append(queues[i].removeFirst())
+                    advanced = true
+                }
+            }
+            return out
+        }
+        let fresh = byGroup.keys.filter { !activeCarrierGroups.contains($0) }.shuffled()
+        let used = byGroup.keys.filter { activeCarrierGroups.contains($0) }.shuffled()
+        return roundRobin(fresh) + roundRobin(used)
+    }
+
+    /// Remember a carrier that successfully opened a circuit for us, so a node
+    /// that has NEEDED relays can re-dial known-good carriers when its carrier
+    /// set thins out (`ensureRelayCarrierConnections`). Bounded and
+    /// diversity-preferring; `config.knownRelays` remains just another seed.
+    func noteRelayCarrierSuccess(_ relayPeer: PeerID) {
+        guard let conn = connections[relayPeer], conn.channel != nil,
+              !relayPeer.publicKey.hasPrefix("inbound-"),
+              conn.endpoint.port != 0,
+              conn.endpoint.host != "relay", conn.endpoint.host != "unknown" else { return }
+        // Diversity keys on the UNFORGEABLE observed netgroup, not the advertised
+        // endpoint host (which identify overwrites with the peer's listenAddrs).
+        recordRelayCarrierSeed(key: relayPeer.publicKey, endpoint: conn.endpoint, group: carrierNetgroup(conn))
+        relayCarrierSeedFailures.removeValue(forKey: relayPeer.publicKey)
+    }
+
+    /// Insert into the bounded carrier-seed set. When full, a newcomer only
+    /// displaces an existing seed if it ADDS a netgroup the set lacks (evicting
+    /// one member of a duplicated group), keeping the set diversity-maximal.
+    /// `group` is the observed (unforgeable) netgroup of the carrier.
+    func recordRelayCarrierSeed(key: String, endpoint: PeerEndpoint, group: String) {
+        if relayCarrierSeeds[key] != nil || relayCarrierSeeds.count < Self.maxRelayCarrierSeeds {
+            relayCarrierSeeds[key] = RelayCarrierSeed(endpoint: endpoint, group: group)
+            return
+        }
+        let newGroup = group
+        let groups = relayCarrierSeeds.mapValues { $0.group }
+        guard !groups.values.contains(newGroup) else { return }
+        var byGroup: [String: [String]] = [:]
+        for (seedKey, seedGroup) in groups { byGroup[seedGroup, default: []].append(seedKey) }
+        guard let evict = byGroup.values.first(where: { $0.count > 1 })?.sorted().first else { return }
+        relayCarrierSeeds.removeValue(forKey: evict)
+        relayCarrierSeeds[key] = RelayCarrierSeed(endpoint: endpoint, group: group)
+    }
+
+    /// Keep-N-carriers: a node that depends on relayed reachability keeps a
+    /// small set of relay-capable DIRECT connections alive so failover always
+    /// has somewhere to go. Reuses existing machinery — it only re-dials
+    /// known-good carrier seeds / knownRelays via `connect` (which dedupes);
+    /// it never discovers or probes new addresses.
+    func ensureRelayCarrierConnections() {
+        let hasRelayedConns = connections.values.contains { $0.relayForward != nil }
+        guard hasRelayedConns || !relayCarrierSeeds.isEmpty else { return }
+        let carriers = relayCapableDirectCarriers()
+        let groups = Set(carriers.map { carrierNetgroup($0) })
+        if carriers.count >= Self.targetRelayCarrierCount, groups.count >= 2 { return }
+        // DIRECT-ONLY: skip a seed redial only when a LIVE DIRECT channel to the
+        // seed already exists. A relayed-only seed connection (channel == nil) is
+        // not a usable carrier — it is not counted by relayCapableDirectCarriers()
+        // — so it must NOT suppress the direct redial, which upgrades it to a real
+        // socket via the M1 supersede path (redialRelayCarrierSeed dials
+        // allowRelayFallback:false, so a failure records toward eviction).
+        for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)]?.channel == nil {
+            Task { await self.redialRelayCarrierSeed(key: key, endpoint: seed.endpoint) }
+        }
+        // DIRECT-ONLY top-up: a relay reachable only via another relay is not a
+        // usable carrier (a relayed connection has channel == nil), so a failed
+        // direct dial must count as a failed top-up rather than silently open a
+        // channel-less relayed connection that would falsely read as a restored
+        // carrier and block all future top-up. Skip only when a LIVE DIRECT channel
+        // to the relay already exists — a pre-existing RELAYED connection (channel
+        // == nil) must NOT suppress a direct top-up dial.
+        for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)]?.channel == nil {
+            Task { try? await self.connect(to: relay, allowRelayFallback: false) }
+        }
+    }
+
+    /// Direct connections to peers KNOWN to accept relayConnect — the only
+    /// connections that can actually carry a relayed circuit. Relay capability is
+    /// a peer we've PROVEN serves relays (`relayCarrierSeeds`, populated by
+    /// `noteRelayCarrierSuccess` after a successful circuit) or a configured
+    /// `knownRelays` endpoint. An ordinary non-relay direct peer ignores
+    /// relayConnect, so counting it as a carrier would let a relay-dependent node
+    /// with a couple of plain peers stop replenishing its real carrier pool.
+    /// Requires a live channel (`channel != nil`): a relayed connection cannot
+    /// itself be a carrier.
+    func relayCapableDirectCarriers() -> [PeerConnection] {
+        let relayCapableKeys = Set(relayCarrierSeeds.keys)
+            .union(config.knownRelays.map { $0.publicKey })
+        return connections.compactMap { (pid, conn) in
+            (conn.channel != nil && relayCapableKeys.contains(pid.publicKey)) ? conn : nil
+        }
+    }
+
+    /// Re-dial a carrier seed, tracking consecutive failures so a black-holed
+    /// seed is eventually evicted instead of re-dialed forever (L1). A success
+    /// clears the failure count; hitting `maxRelayCarrierSeedDialFailures`
+    /// consecutive failures drops the seed from the pool (size stays bounded at
+    /// `maxRelayCarrierSeeds`). Threshold 3 tolerates transient loss / NAT flaps
+    /// while still reclaiming a genuinely dead carrier.
+    func redialRelayCarrierSeed(key: String, endpoint: PeerEndpoint) async {
+        do {
+            // DIRECT-ONLY: a seed only reachable via relay cannot serve as a
+            // carrier, so a failed direct dial must count toward eviction (below)
+            // rather than open a channel-less relayed connection that would falsely
+            // read as a restored carrier and suppress future direct redials.
+            try await connect(to: endpoint, allowRelayFallback: false)
+            relayCarrierSeedFailures.removeValue(forKey: key)
+        } catch {
+            let failures = (relayCarrierSeedFailures[key] ?? 0) + 1
+            if failures >= Self.maxRelayCarrierSeedDialFailures {
+                relayCarrierSeeds.removeValue(forKey: key)
+                relayCarrierSeedFailures.removeValue(forKey: key)
+            } else {
+                relayCarrierSeedFailures[key] = failures
+            }
+        }
+    }
+
     func timeoutRelayRequest(_ requestKey: PendingRelayRequestKey) {
         if let cont = pendingRelayRequests.removeValue(forKey: requestKey) { cont.resume(returning: false) }
+    }
+
+    /// Active liveness probing for a relayed connection. A relayed circuit has
+    /// no socket of its own, so without probes the only inbound floor is the
+    /// health monitor's idle-gated keepalive (worst case ~240s over two hops)
+    /// — which is why the old passive stale bound had to be 300s. Pinging the
+    /// circuit every `relayedProbeInterval` makes a healthy circuit's inbound
+    /// floor ~30s, so `relayedFailoverTimeout` (90s = ~3 unanswered probes)
+    /// can declare it silent and fail over quickly. The loop dies with the
+    /// connection (superseded, closed, or removed).
+    func startRelayedProbe(for conn: PeerConnection) {
+        Task { [weak self, weak conn] in
+            while true {
+                try? await Task.sleep(for: PeerConnection.relayedProbeInterval)
+                guard let self, let conn else { return }
+                guard await self.probeRelayedConnection(conn) else { return }
+            }
+        }
+    }
+
+    /// One probe tick. Returns false when the loop should stop (connection
+    /// gone/superseded, or declared silent and torn down — the teardown path
+    /// then schedules the carrier failover).
+    func probeRelayedConnection(_ conn: PeerConnection) -> Bool {
+        // I1 (acknowledged): each probe tick sends a frame over the circuit, so a
+        // relayed circuit is kept alive right up to the relay's 3600s hard cap —
+        // idle-reclaim of an abandoned relayed circuit is effectively disabled.
+        // This is accepted: relay resource bounds still hold via the per-relay
+        // circuit-count, rate, and absolute-lifetime caps in RelayService.
+        // No `running` check needed: stop() clears `connections`, which ends
+        // every probe loop on its next tick via this identity check.
+        guard connections[conn.id] === conn else { return false }
+        if conn.inboundIdle >= PeerConnection.relayedFailoverTimeout {
+            config.logger.info("Relayed connection to \(String(conn.id.publicKey.prefix(16)))… silent past failover bound — tearing down")
+            conn.cancel()
+            return false
+        }
+        conn.fireAndForgetMessage(.ping(nonce: UInt64.random(in: 1...UInt64.max)))
+        return true
     }
 
     func resolveRelayRequest(from relayPeer: PeerID, code: UInt8, nonce: UInt64) {
@@ -804,6 +1145,7 @@ public actor Ivy {
         delegate?.ivy(self, didConnect: tempID)
         Task { await handleInbound(conn) }
         sendIdentify(to: conn)
+        startRelayedProbe(for: conn)
         let toTimeout = tempID
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(30))
@@ -824,7 +1166,10 @@ public actor Ivy {
             guard tally.shouldAllow(peer: peer), connections[dst] != nil else {
                 fireToPeer(peer, .relayStatus(code: 1, nonce: nonce)); return
             }
-            if await relayService.createCircuit(initiator: realSrc, target: dstKey) {
+            // Initiator netgroup from OUR view of its connection (socket-observed
+            // when available) — feeds the reserved-headroom admission.
+            let initiatorGroup = connections[peer].map { carrierNetgroup($0) } ?? ""
+            if await relayService.createCircuit(initiator: realSrc, target: dstKey, initiatorGroup: initiatorGroup) {
                 fireToPeer(peer, .relayStatus(code: 0, nonce: nonce))
                 fireToPeer(dst, .relayConnect(srcKey: realSrc, dstKey: dstKey, nonce: nonce))
             } else {
@@ -1659,6 +2004,36 @@ public actor Ivy {
 
     func registerConnectionForTesting(_ conn: PeerConnection, as peer: PeerID) {
         connections[peer] = conn
+    }
+
+    /// Install a relayed connection in the exact post-identify re-keyed state that
+    /// production reaches: `openRelayedConnection` creates it under a temporary
+    /// `inbound-relay-*` id — populating `relayedConnByClaimedKey`, the inbound
+    /// tracking set, and its own `handleInbound` loop — then `handleIdentify`'s
+    /// re-key branch moves it to the peer's claimed key. Returns the relayed conn.
+    @discardableResult
+    func installReKeyedRelayedConnectionForTesting(claimedKey: String, via carrier: PeerConnection) -> PeerConnection? {
+        connections[carrier.id] = carrier
+        openRelayedConnection(
+            claimedKey: claimedKey,
+            endpoint: PeerEndpoint(publicKey: claimedKey, host: "relay", port: 0),
+            via: carrier.id)
+        guard let conn = relayedConnByClaimedKey[claimedKey] else { return nil }
+        let temp = conn.id
+        let realID = PeerID(publicKey: claimedKey)
+        connections.removeValue(forKey: temp)
+        conn.id = realID
+        connections[realID] = conn
+        remapInboundConnection(from: temp, to: realID)
+        return conn
+    }
+
+    func relayedConnByClaimedKeyForTesting(_ key: String) -> PeerConnection? {
+        relayedConnByClaimedKey[key]
+    }
+
+    func isInboundTrackedForTesting(_ peer: PeerID) -> Bool {
+        inboundConnectionIDs.contains(peer)
     }
 
     func connectionPeersForTesting() -> [PeerID] {

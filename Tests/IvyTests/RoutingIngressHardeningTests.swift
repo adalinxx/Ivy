@@ -236,6 +236,81 @@ struct RoutingIngressHardeningTests {
         peerSide.close()
     }
 
+    @Test("A public node rejects discovered endpoints in non-routable address space")
+    func publicNodeRejectsNonRoutableDiscoveredEndpoints() async {
+        // A node with a declared, GENUINELY globally-routable externalAddress is
+        // public-facing (8.8.8.8 is real global unicast, not a special-use range).
+        let publicNode = Ivy(config: IvyConfig(
+            publicKey: "routing-public-node",
+            listenPort: 0,
+            bootstrapPeers: [],
+            enableLocalDiscovery: false,
+            healthConfig: PeerHealthConfig(keepaliveInterval: .seconds(999), staleTimeout: .seconds(999), maxMissedPongs: 99, enabled: false),
+            enablePEX: false,
+            externalAddress: (host: "8.8.8.8", port: 4001)
+        ))
+        let source = PeerID(publicKey: "routing-public-source")
+        func ep(_ host: String) -> PeerEndpoint {
+            PeerEndpoint(publicKey: "disc-\(host)", host: host, port: 4001)
+        }
+
+        // Non-routable / special-use / internal / non-IP: all rejected (no SSRF
+        // steering into private hosts OR into special-use/documentation ranges).
+        for host in ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1",
+                     "169.254.1.1", "100.64.0.1", "240.0.0.1", "255.255.255.255",
+                     // Newly-classified special-use ranges (multicast / benchmarking /
+                     // RFC 5737 TEST-NET-1/2/3 / IPv6 multicast / RFC 3849 docs).
+                     "224.0.0.1", "239.0.0.1", "198.18.0.1", "192.0.2.1",
+                     "198.51.100.7", "203.0.113.5", "ff02::1", "2001:db8::1",
+                     "::1", "fe80::1", "fc00::1",
+                     // IPv6 transition forms wrapping an INTERNAL IPv4 must be
+                     // classified by the embedded v4 (SSRF via NAT64/6to4/Teredo
+                     // translation host), not passed through as routable IPv6.
+                     "64:ff9b::a9fe:a9fe",   // NAT64 (RFC 6052) → 169.254.169.254 metadata
+                     "64:ff9b::0a00:0001",   // NAT64 (RFC 6052) → 10.0.0.1 private
+                     "2002:0a00:0001::1",    // 6to4 (RFC 3964) → 10.0.0.1 private
+                     "2001::f5ff:fffe",      // Teredo (RFC 4380) → 10.0.0.1 private
+                     "not-an-ip", "example.com"] {
+            #expect(!(await publicNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
+                    "public node must reject non-routable/special-use host \(host)")
+        }
+        // Genuinely globally-routable addresses still pass.
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("1.1.1.1"), source: "test", from: source))
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2606:4700:4700::1111"), source: "test", from: source))
+        // Transition forms wrapping a PUBLIC IPv4 embed a routable address, so
+        // they must stay ACCEPTED — proves we extract-and-classify the embedded
+        // v4 rather than blanket-rejecting the transition prefix.
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("64:ff9b::0808:0808"), source: "test", from: source))  // NAT64 of 8.8.8.8
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2002:0808:0808::1"), source: "test", from: source))   // 6to4 of 8.8.8.8
+
+        // A node WITHOUT a public externalAddress (local/test mode) still accepts
+        // loopback/private peers — the filter must not break local operation.
+        let localNode = Ivy(config: routingConfig(publicKey: "routing-local-node"))
+        #expect(await localNode.isAcceptableDiscoveredEndpoint(ep("127.0.0.1"), source: "test", from: source))
+        #expect(await localNode.isAcceptableDiscoveredEndpoint(ep("10.0.0.1"), source: "test", from: source))
+    }
+
+    @Test("A STUN-reflexive-public node (no externalAddress) rejects non-routable discovered endpoints")
+    func stunPublicNodeRejectsNonRoutableDiscoveredEndpoints() async {
+        // No declared externalAddress, but the node became publicly reachable via
+        // STUN: start() stores a reflexive publicAddress and sendIdentify advertises
+        // it. Such a node is effectively public, so the SSRF non-routable filter
+        // must apply — even though config.externalAddress is nil.
+        let stunNode = Ivy(config: routingConfig(publicKey: "routing-stun-public-node"))
+        await stunNode.setPublicAddressForTesting(ObservedAddress(host: "8.8.8.8", port: 4001))
+        let source = PeerID(publicKey: "routing-stun-public-source")
+        func ep(_ host: String) -> PeerEndpoint {
+            PeerEndpoint(publicKey: "stun-disc-\(host)", host: host, port: 4001)
+        }
+
+        for host in ["10.0.0.1", "169.254.169.254", "127.0.0.1", "192.168.1.1"] {
+            #expect(!(await stunNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
+                    "STUN-public node must reject non-routable host \(host)")
+        }
+        // Genuinely routable endpoints still pass.
+        #expect(await stunNode.isAcceptableDiscoveredEndpoint(ep("1.1.1.1"), source: "test", from: source))
+    }
+
     @Test("findNode handler is gated by Tally before enumerating routing table")
     func findNodeIsGatedBeforeReplyingWithNeighbors() async throws {
         let tallyConfig = TallyConfig(rateLimitBytesPerSecond: 1)

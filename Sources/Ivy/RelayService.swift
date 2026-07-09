@@ -13,6 +13,9 @@ actor RelayService {
     struct Circuit: Sendable {
         let peerA: String
         let peerB: String
+        /// Netgroup of the INITIATOR's observed socket address (empty when the
+        /// call site had none). Read by the reserved-headroom admission below.
+        let initiatorGroup: String
         let created: ContinuousClock.Instant          // hard-lifetime backstop
         var lastActivity: ContinuousClock.Instant      // sliding idle timeout — renewed on relayed traffic
         var windowStart: ContinuousClock.Instant       // start of the current byte-rate window
@@ -39,8 +42,15 @@ actor RelayService {
     }
 
     private var circuits: [String: Circuit] = [:]
-    private let maxCircuitsPerPeer = 4
-    private let maxTotalCircuits = 128
+    static let maxCircuitsPerPeer = 4
+    static let maxTotalCircuits = 128
+    /// The LAST few circuit slots are reserved for initiators from netgroups
+    /// that do not already hold a circuit: a single-netgroup Sybil flood can
+    /// saturate at most (maxTotalCircuits - headroom) slots and can never take
+    /// the reserved ones, so a legitimate NAT'd node from a fresh netgroup
+    /// always finds room. Unknown-group initiators are refused in the reserved
+    /// zone (fail closed).
+    static let reservedNetgroupHeadroom = 8
 
     // Node-wide AGGREGATE relayed-byte ceiling across ALL circuits (same window as the per-circuit
     // rate). The per-circuit rate alone bounds one circuit, but 128 circuits × 8 MB/min would let a
@@ -56,19 +66,27 @@ actor RelayService {
     }
 
     /// Open a circuit between `initiator` and `target` if within caps. Idempotent.
-    func createCircuit(initiator: String, target: String) -> Bool {
+    /// `initiatorGroup` is the initiator's observed-address netgroup (empty if
+    /// unknown); it only gates admission inside the reserved headroom zone.
+    func createCircuit(initiator: String, target: String, initiatorGroup: String = "") -> Bool {
         pruneExpired()
         let key = circuitKey(initiator, target)
         guard circuits[key] == nil else { return true }  // already open
-        guard circuits.count < maxTotalCircuits else { return false }
+        guard circuits.count < Self.maxTotalCircuits else { return false }
+
+        // Reserved headroom: the last slots admit only netgroup-NOVEL initiators.
+        if circuits.count >= Self.maxTotalCircuits - Self.reservedNetgroupHeadroom {
+            let occupiedGroups = Set(circuits.values.map { $0.initiatorGroup })
+            guard !initiatorGroup.isEmpty, !occupiedGroups.contains(initiatorGroup) else { return false }
+        }
 
         let peerCircuits = circuits.values.filter {
             $0.peerA == initiator || $0.peerB == initiator
         }.count
-        guard peerCircuits < maxCircuitsPerPeer else { return false }
+        guard peerCircuits < Self.maxCircuitsPerPeer else { return false }
 
         let now: ContinuousClock.Instant = .now
-        circuits[key] = Circuit(peerA: initiator, peerB: target, created: now, lastActivity: now, windowStart: now)
+        circuits[key] = Circuit(peerA: initiator, peerB: target, initiatorGroup: initiatorGroup, created: now, lastActivity: now, windowStart: now)
         return true
     }
 
