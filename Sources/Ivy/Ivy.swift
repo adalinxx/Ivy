@@ -331,7 +331,12 @@ public actor Ivy {
 
     func reserveOutgoingDial(to endpoint: PeerEndpoint) -> Bool {
         let peer = PeerID(publicKey: endpoint.publicKey)
-        guard connections[peer] == nil, !connectingPeers.contains(peer) else { return false }
+        // A live DIRECT channel (channel != nil) blocks a redundant dial; but a
+        // RELAYED-only connection (channel == nil) must NOT — a direct dial legitimately
+        // UPGRADES it to a real socket (e.g. the knownRelays carrier top-up establishing
+        // a circuit-capable direct carrier). A relayed connection uses the sentinel
+        // netgroup, so permitting the upgrade does not distort per-subnet diversity.
+        guard connections[peer]?.channel == nil, !connectingPeers.contains(peer) else { return false }
 
         // Enforce netgroup diversity on every outbound dial, not just during
         // periodic refresh. Without this, an attacker can occupy all outbound
@@ -966,8 +971,15 @@ public actor Ivy {
         for (key, seed) in relayCarrierSeeds where connections[PeerID(publicKey: key)] == nil {
             Task { await self.redialRelayCarrierSeed(key: key, endpoint: seed.endpoint) }
         }
-        for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)] == nil {
-            Task { try? await self.connect(to: relay) }
+        // DIRECT-ONLY top-up: a relay reachable only via another relay is not a
+        // usable carrier (a relayed connection has channel == nil), so a failed
+        // direct dial must count as a failed top-up rather than silently open a
+        // channel-less relayed connection that would falsely read as a restored
+        // carrier and block all future top-up. Skip only when a LIVE DIRECT channel
+        // to the relay already exists — a pre-existing RELAYED connection (channel
+        // == nil) must NOT suppress a direct top-up dial.
+        for relay in config.knownRelays where connections[PeerID(publicKey: relay.publicKey)]?.channel == nil {
+            Task { try? await self.connect(to: relay, allowRelayFallback: false) }
         }
     }
 
