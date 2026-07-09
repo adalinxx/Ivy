@@ -14,23 +14,45 @@ public final class PeerConnection: @unchecked Sendable {
     /// accounting reads THIS (never the advertised host) so a peer cannot forge
     /// its network group via the identify frame. Nil for outbound dials.
     public internal(set) var observedHost: String? = nil
+    /// The mutually-exclusive transport this connection rides on. Modeling it as a
+    /// sum type (rather than four loose optionals) makes inconsistent states —
+    /// direct-with-a-claimed-key, relayed-with-a-channel — UNREPRESENTABLE: a
+    /// `.direct` has exactly a `Channel`, a `.relayed` has exactly a forward
+    /// closure + claimed key + optional carrier. The legacy `channel`/
+    /// `relayForward`/`relayedClaimedKey`/`relayCarrierConn` accessors are derived
+    /// from this, so call sites are unchanged.
+    enum Transport {
+        /// A normal direct TCP connection, backed by a live socket.
+        case direct(Channel)
+        /// A relayed connection: outbound frames are wrapped in a `relayData`
+        /// envelope and sent through a relay peer via `forward`, so identify/want/
+        /// sync flow over it exactly like a direct connection.
+        /// - claimedKey: the public key the peer CLAIMS (routes inbound relayData
+        ///   and cleans up the relay index on teardown); unverified until a signed
+        ///   identify re-keys the connection, like a direct `inbound-<uuid>` conn.
+        /// - carrier: the carrier connection this circuit rides. When the carrier
+        ///   tears down it reaps every relayed conn pointing at it (channel-less
+        ///   conns are otherwise `isLive` forever and would leak a slot).
+        case relayed(claimedKey: String?, forward: @Sendable (Data) -> Void, carrier: PeerConnection?)
+    }
+    let transport: Transport
     /// nil for a RELAYED connection (frames go through `relayForward` instead of
     /// a direct socket); non-nil for a normal direct TCP connection.
-    let channel: Channel?
-    /// When set, this connection is relayed: outbound frames are wrapped in a
-    /// `relayData` envelope and sent through a relay peer, so identify/want/sync
-    /// flow over it exactly like a direct connection. nil for direct connections.
-    let relayForward: (@Sendable (Data) -> Void)?
-    /// For a relayed connection, the public key the peer CLAIMS (used to route
-    /// inbound relayData and to clean up the relay index on teardown). The claim
-    /// is unverified until a signed identify re-keys the connection to its real
-    /// identity — exactly like a direct inbound `inbound-<uuid>` connection.
-    let relayedClaimedKey: String?
-    /// For a relayed connection, the carrier connection it is routed through. When
-    /// the carrier tears down, the carrier's `handleInbound` teardown reaps every
-    /// relayed connection pointing at it (they are channel-less and otherwise
-    /// `isLive` forever, so they'd leak a slot). nil for direct connections.
-    let relayCarrierConn: PeerConnection?
+    var channel: Channel? { if case let .direct(ch) = transport { return ch }; return nil }
+    /// Non-nil iff relayed: the closure that wraps outbound frames in a `relayData`
+    /// envelope and sends them through the carrier. nil for direct connections.
+    var relayForward: (@Sendable (Data) -> Void)? {
+        if case let .relayed(_, forward, _) = transport { return forward }; return nil
+    }
+    /// For a relayed connection, the public key the peer CLAIMS. nil for direct.
+    var relayedClaimedKey: String? {
+        if case let .relayed(key, _, _) = transport { return key }; return nil
+    }
+    /// For a relayed connection, the carrier connection it is routed through.
+    /// nil for direct connections (and for a relayed conn with no carrier).
+    var relayCarrierConn: PeerConnection? {
+        if case let .relayed(_, _, carrier) = transport { return carrier }; return nil
+    }
     private let maxFrameSize: UInt32
     private var closed = false
     /// Last time an inbound frame arrived. For a channel-less RELAYED connection this is the
@@ -61,10 +83,15 @@ public final class PeerConnection: @unchecked Sendable {
          relayCarrierConn: PeerConnection? = nil) {
         self.id = id
         self.endpoint = endpoint
-        self.channel = channel
-        self.relayForward = relayForward
-        self.relayedClaimedKey = relayedClaimedKey
-        self.relayCarrierConn = relayCarrierConn
+        // A live socket is always DIRECT; otherwise this is a relayed circuit
+        // (every construction passes exactly one of `channel` / `relayForward`).
+        if let channel {
+            self.transport = .direct(channel)
+        } else {
+            self.transport = .relayed(claimedKey: relayedClaimedKey,
+                                      forward: relayForward ?? { _ in },
+                                      carrier: relayCarrierConn)
+        }
         self.maxFrameSize = maxFrameSize
         let (stream, continuation) = AsyncStream<Message>.makeStream(
             bufferingPolicy: .bufferingNewest(Self.inboundBufferLimit)
@@ -132,13 +159,13 @@ public final class PeerConnection: @unchecked Sendable {
     public var messages: AsyncStream<Message> { inbound }
 
     /// Canonical transport-kind query: true iff this is a normal DIRECT TCP
-    /// connection (backed by a live socket `channel`). The single authority for
-    /// "direct vs relayed" — read this instead of testing `channel != nil`.
-    var isDirect: Bool { channel != nil }
+    /// connection (backed by a live socket). The single authority for
+    /// "direct vs relayed" — read this instead of matching `transport`.
+    var isDirect: Bool { if case .direct = transport { return true }; return false }
     /// Canonical transport-kind query: true iff this is a RELAYED connection
     /// (channel-less; frames flow through `relayForward`). Exact complement of
-    /// `isDirect` — read this instead of testing `channel == nil`.
-    var isRelayed: Bool { channel == nil }
+    /// `isDirect`.
+    var isRelayed: Bool { if case .relayed = transport { return true }; return false }
 
     var isLive: Bool {
         if let channel { return channel.isActive || !closed }
