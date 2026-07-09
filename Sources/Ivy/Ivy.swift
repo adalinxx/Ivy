@@ -227,7 +227,11 @@ public actor Ivy {
         // carriers that successfully serve a circuit join `relayCarrierSeeds`
         // on equal footing (see ensureRelayCarrierConnections).
         for relay in config.knownRelays where !config.bootstrapPeers.contains(where: { $0.publicKey == relay.publicKey }) {
-            Task { try? await connect(to: relay) }
+            // Direct-only, mirroring the seed/top-up carrier paths: a relayed
+            // (channel-less) connection to a relay is useless as a circuit carrier,
+            // and the relay fallback only fires when a direct carrier already
+            // exists — so this never blocks cold-boot reachability.
+            Task { try? await connect(to: relay, allowRelayFallback: false) }
         }
 
         let monitor = PeerHealthMonitor(
@@ -319,6 +323,23 @@ public actor Ivy {
             return
         }
 
+        // M1: `reserveOutgoingDial` lets this direct dial UPGRADE a peer that
+        // currently holds only a relayed (channel == nil) connection. Overwriting
+        // `connections[peer]` alone would orphan the stale relayed conn: it never
+        // sees a stream-end (only `cancel()` ends its `handleInbound`), and once
+        // `connections[peer]` is the new conn its teardown hits the `current !==
+        // conn` early-return — so its side-indices are never cleared. Supersede it
+        // explicitly here: clear the claimed-key route, drop it from the inbound
+        // set, and cancel it. (`stale.cancel()` alone is insufficient for exactly
+        // the early-return reason above.) A healthy DIRECT conn (channel != nil)
+        // is already deduped by `reserveOutgoingDial` and never reaches here.
+        if let stale = connections[peer], stale.channel == nil {
+            if let claimed = stale.relayedClaimedKey {
+                relayedConnByClaimedKey.removeValue(forKey: claimed)
+            }
+            untrackInboundConnection(peer)
+            stale.cancel()
+        }
         connections[peer] = conn
         finishOutgoingDial(to: peer, connected: true)
         router.addPeer(peer, endpoint: endpoint, tally: tally)
@@ -1970,6 +1991,36 @@ public actor Ivy {
 
     func registerConnectionForTesting(_ conn: PeerConnection, as peer: PeerID) {
         connections[peer] = conn
+    }
+
+    /// Install a relayed connection in the exact post-identify re-keyed state that
+    /// production reaches: `openRelayedConnection` creates it under a temporary
+    /// `inbound-relay-*` id — populating `relayedConnByClaimedKey`, the inbound
+    /// tracking set, and its own `handleInbound` loop — then `handleIdentify`'s
+    /// re-key branch moves it to the peer's claimed key. Returns the relayed conn.
+    @discardableResult
+    func installReKeyedRelayedConnectionForTesting(claimedKey: String, via carrier: PeerConnection) -> PeerConnection? {
+        connections[carrier.id] = carrier
+        openRelayedConnection(
+            claimedKey: claimedKey,
+            endpoint: PeerEndpoint(publicKey: claimedKey, host: "relay", port: 0),
+            via: carrier.id)
+        guard let conn = relayedConnByClaimedKey[claimedKey] else { return nil }
+        let temp = conn.id
+        let realID = PeerID(publicKey: claimedKey)
+        connections.removeValue(forKey: temp)
+        conn.id = realID
+        connections[realID] = conn
+        remapInboundConnection(from: temp, to: realID)
+        return conn
+    }
+
+    func relayedConnByClaimedKeyForTesting(_ key: String) -> PeerConnection? {
+        relayedConnByClaimedKey[key]
+    }
+
+    func isInboundTrackedForTesting(_ peer: PeerID) -> Bool {
+        inboundConnectionIDs.contains(peer)
     }
 
     func connectionPeersForTesting() -> [PeerID] {
