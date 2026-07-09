@@ -262,13 +262,26 @@ struct RoutingIngressHardeningTests {
                      // RFC 5737 TEST-NET-1/2/3 / IPv6 multicast / RFC 3849 docs).
                      "224.0.0.1", "239.0.0.1", "198.18.0.1", "192.0.2.1",
                      "198.51.100.7", "203.0.113.5", "ff02::1", "2001:db8::1",
-                     "::1", "fe80::1", "fc00::1", "not-an-ip", "example.com"] {
+                     "::1", "fe80::1", "fc00::1",
+                     // IPv6 transition forms wrapping an INTERNAL IPv4 must be
+                     // classified by the embedded v4 (SSRF via NAT64/6to4/Teredo
+                     // translation host), not passed through as routable IPv6.
+                     "64:ff9b::a9fe:a9fe",   // NAT64 (RFC 6052) → 169.254.169.254 metadata
+                     "64:ff9b::0a00:0001",   // NAT64 (RFC 6052) → 10.0.0.1 private
+                     "2002:0a00:0001::1",    // 6to4 (RFC 3964) → 10.0.0.1 private
+                     "2001::f5ff:fffe",      // Teredo (RFC 4380) → 10.0.0.1 private
+                     "not-an-ip", "example.com"] {
             #expect(!(await publicNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
                     "public node must reject non-routable/special-use host \(host)")
         }
         // Genuinely globally-routable addresses still pass.
         #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("1.1.1.1"), source: "test", from: source))
         #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2606:4700:4700::1111"), source: "test", from: source))
+        // Transition forms wrapping a PUBLIC IPv4 embed a routable address, so
+        // they must stay ACCEPTED — proves we extract-and-classify the embedded
+        // v4 rather than blanket-rejecting the transition prefix.
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("64:ff9b::0808:0808"), source: "test", from: source))  // NAT64 of 8.8.8.8
+        #expect(await publicNode.isAcceptableDiscoveredEndpoint(ep("2002:0808:0808::1"), source: "test", from: source))   // 6to4 of 8.8.8.8
 
         // A node WITHOUT a public externalAddress (local/test mode) still accepts
         // loopback/private peers — the filter must not break local operation.
