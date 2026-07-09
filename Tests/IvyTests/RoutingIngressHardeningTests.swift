@@ -255,7 +255,8 @@ struct RoutingIngressHardeningTests {
 
         // Non-routable / internal / non-IP: all rejected (no SSRF steering).
         for host in ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1",
-                     "169.254.1.1", "::1", "fe80::1", "fc00::1", "not-an-ip", "example.com"] {
+                     "169.254.1.1", "100.64.0.1", "240.0.0.1", "255.255.255.255",
+                     "::1", "fe80::1", "fc00::1", "not-an-ip", "example.com"] {
             #expect(!(await publicNode.isAcceptableDiscoveredEndpoint(ep(host), source: "test", from: source)),
                     "public node must reject non-routable/internal host \(host)")
         }
