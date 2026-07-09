@@ -37,7 +37,7 @@ public enum NetGroup: Sendable {
 
     /// Extracts the embedded IPv4 from an IPv4-mapped ("::ffff:a.b.c.d") or
     /// IPv4-compatible ("::a.b.c.d") IPv6 literal; nil for any other input.
-    private static func embeddedMappedIPv4(_ host: String) -> String? {
+    static func embeddedMappedIPv4(_ host: String) -> String? {
         var s = host
         if s.hasPrefix("[") && s.hasSuffix("]") { s = String(s.dropFirst().dropLast()) }
         if let pct = s.firstIndex(of: "%") { s = String(s[s.startIndex..<pct]) }
@@ -64,22 +64,35 @@ public enum NetGroup: Sendable {
                 String(format: "%02x%02x", bytes[2], bytes[3])]
     }
 
-    /// First two octets of a dotted-quad IPv4 address ("192.168.1.1" → "192.168").
-    /// Returns nil if `host` is not a well-formed dotted-quad.
-    private static func ipv4Group(_ host: String) -> String? {
+    /// All four octets of a dotted-quad IPv4 address ("192.168.1.1" → [192,168,1,1]).
+    /// Returns nil if `host` is not a well-formed dotted-quad. This full-precision
+    /// parse lets routability classification pinpoint /24 and /32 special ranges
+    /// without the coarse /16 group grain over-rejecting their real-public neighbors.
+    static func ipv4Octets(_ host: String) -> [Int]? {
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4 else { return nil }
+        var octets: [Int] = []
         for part in parts {
             guard !part.isEmpty, part.count <= 3, let v = Int(part), (0...255).contains(v) else {
                 return nil
             }
+            octets.append(v)
         }
-        return "\(parts[0]).\(parts[1])"
+        return octets
     }
 
-    /// First two hextets (the /32) of an IPv6 address, normalized to four hex
-    /// digits ("2001:db8::1" → "2001.0db8"). Returns nil if unparseable.
-    private static func ipv6Group(_ host: String) -> String? {
+    /// First two octets of a dotted-quad IPv4 address ("192.168.1.1" → "192.168").
+    /// Returns nil if `host` is not a well-formed dotted-quad.
+    private static func ipv4Group(_ host: String) -> String? {
+        guard let octets = ipv4Octets(host) else { return nil }
+        return "\(octets[0]).\(octets[1])"
+    }
+
+    /// The eight 16-bit hextets of an IPv6 address, fully expanded ("2001:db8::1"
+    /// → [0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]). Returns nil if unparseable. Exposed
+    /// at full precision so routability classification can pinpoint /8, /10, /32
+    /// special ranges instead of only the coarse /32 group grain.
+    static func ipv6Hextets(_ host: String) -> [UInt16]? {
         var s = host
         // Strip surrounding brackets ("[::1]").
         if s.hasPrefix("[") && s.hasSuffix("]") {
@@ -125,11 +138,13 @@ public enum NetGroup: Sendable {
             expanded = all
         }
         guard expanded.count == 8 else { return nil }
+        return expanded.map { UInt16($0, radix: 16) ?? 0 }
+    }
 
-        func normalize(_ h: String) -> String {
-            let v = UInt16(h, radix: 16) ?? 0
-            return String(format: "%04x", v)
-        }
-        return normalize(expanded[0]) + "." + normalize(expanded[1])
+    /// First two hextets (the /32) of an IPv6 address, normalized to four hex
+    /// digits ("2001:db8::1" → "2001.0db8"). Returns nil if unparseable.
+    private static func ipv6Group(_ host: String) -> String? {
+        guard let h = ipv6Hextets(host) else { return nil }
+        return String(format: "%04x", h[0]) + "." + String(format: "%04x", h[1])
     }
 }
