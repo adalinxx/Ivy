@@ -6,6 +6,9 @@ public struct IvyConfig: Sendable {
     public static let defaultMaxInboundConnections: Int = 256
 
     public let publicKey: String
+    /// Public-overlay participation versus a single identity-pinned operational
+    /// session. Defaults to the existing public overlay behavior.
+    public let topology: IvyTopology
     public let listenPort: UInt16
     public let bootstrapPeers: [PeerEndpoint]
     public let enableLocalDiscovery: Bool
@@ -30,51 +33,28 @@ public struct IvyConfig: Sendable {
     /// chains or applications that need larger wire payloads.
     public let maxFrameSize: UInt32
     /// Upper bound on distinct in-flight CIDs/volume queries tracked in `pendingRequests` /
-    /// `pendingVolumeRequests`. Prevents an attacker (or a runaway local
-    /// caller) from allocating unbounded continuations by repeatedly asking
-    /// for unique CIDs faster than `requestTimeout` drains them.
+    /// `pendingVolumeRequests`.
     public let maxPendingRequests: Int
-    /// Per-CID/query cap on coalesced waiters. Many concurrent local callers for
-    /// the same content legitimately fan-in to one pending request; this caps
-    /// the fan-in so one hot request can't grow one continuation list forever.
+    /// Per-CID/query cap on coalesced waiters.
     public let maxWaitersPerPendingCID: Int
     /// Maximum number of peers to broadcast a `want` request to when DHT provider
-    /// records are empty. Caps the O(N) duplicate-work cost of the broadcast fallback.
-    /// DHT providers are always preferred; this only applies to the fallback path.
+    /// records are empty.
     public let maxWantCandidates: Int
-    /// Minimum trailing-zero bits of SHA256(publicKey) required to accept a
-    /// peer's identify message. Each additional bit doubles the expected work
-    /// to generate a valid peer key, making Sybil routing-table poisoning
-    /// progressively more expensive. 0 = disabled (accept any key).
+    /// Minimum trailing-zero bits of SHA256(publicKey) required to accept a peer.
     public let minPeerKeyBits: Int
-    /// Per-peer token-bucket burst for inbound findNode (DHT neighbor) requests.
-    /// Normal iterative lookups touch a peer a handful of times per round; this
-    /// allows healthy lookup traffic while a flood that exceeds the bucket is
-    /// dropped. Mirrors the gossip-relay token-bucket pattern.
+    /// Per-peer token-bucket burst for inbound findNode requests.
     public let findNodeBurst: Double
     /// Refill rate (tokens/sec) for the per-peer findNode bucket.
     public let findNodeRefillPerSec: Double
-    /// Maximum PEX entries accepted from a single response round. Caps how many
-    /// candidate endpoints one peer can inject per exchange (defaults to
-    /// `pexMaxPeers`, the same bound the responder side already honors).
+    /// Maximum PEX entries accepted from a single response round.
     public let pexMaxAcceptedPerRound: Int
-    /// Minimum Tally reputation a PEX responder must have for its entries to be
-    /// accepted. Default 0 is intentionally permissive: an unknown/fresh peer
-    /// scores 0 (`Tally.reputation(for:)` returns 0 with no ledger), so the
-    /// default does NOT break bootstrap. Operators can raise it to ignore
-    /// candidate feeds from low-reputation peers.
+    /// Minimum Tally reputation a PEX responder must have.
     public let pexMinResponderScore: Double
 
-    /// Operator-declared public P2P endpoint advertised in identify, overriding
-    /// STUN/observed addresses. Required for cloud/NAT nodes whose locally
-    /// observed address (e.g. a fly `172.x` private IP) is not externally
-    /// dialable — without it, peers learn an unreachable address and the node
-    /// can never be joined from outside its private network.
+    /// Operator-declared public P2P endpoint advertised in identify, overriding STUN.
     public let externalAddress: (host: String, port: UInt16)?
 
-    /// Serve as a circuit relay: forward `relayData` between peers we are each
-    /// directly connected to, so NAT'd nodes can reach each other through us.
-    /// Public/backbone nodes set this true.
+    /// Serve as a circuit relay. Public/backbone nodes set this true.
     public let relayEnabled: Bool
     /// Relay peers this node will route through when a direct dial fails.
     public let knownRelays: [PeerEndpoint]
@@ -111,9 +91,11 @@ public struct IvyConfig: Sendable {
         pexMinResponderScore: Double = 0,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
-        knownRelays: [PeerEndpoint] = []
+        knownRelays: [PeerEndpoint] = [],
+        topology: IvyTopology = .publicOverlay
     ) {
         self.publicKey = publicKey
+        self.topology = topology
         self.listenPort = listenPort
         self.bootstrapPeers = bootstrapPeers
         self.enableLocalDiscovery = enableLocalDiscovery
@@ -145,5 +127,15 @@ public struct IvyConfig: Sendable {
         self.externalAddress = externalAddress
         self.relayEnabled = relayEnabled
         self.knownRelays = knownRelays
+    }
+
+    /// Effective PEX policy. A pinned session cannot opt back into public discovery
+    /// merely by setting `enablePEX`.
+    public var shouldRunPEX: Bool {
+        topology.participatesInPublicDiscovery && enablePEX
+    }
+
+    public var shouldRunLocalDiscovery: Bool {
+        topology.participatesInPublicDiscovery && enableLocalDiscovery
     }
 }
