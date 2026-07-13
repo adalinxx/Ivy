@@ -75,4 +75,23 @@ final class IvyTopologyTests: XCTestCase {
         XCTAssertTrue(config.shouldRunPEX)
         XCTAssertTrue(config.shouldRunLocalDiscovery)
     }
+
+    func testPinnedConnectionRejectsSubstituteBeforeNetworkIO() async throws {
+        let config = IvyConfig(
+            publicKey: rawKey,
+            topology: .pinnedPeer(publicKey: rawKey)
+        )
+        let ivy = Ivy(config: config)
+        let substitute = PeerEndpoint(publicKey: otherKey, host: "127.0.0.1", port: 4002)
+
+        do {
+            try await ivy.connectInConfiguredTopology(to: substitute)
+            XCTFail("a pinned session must reject a substitute identity")
+        } catch {
+            XCTAssertEqual(
+                error as? IvyTopologyError,
+                .peerOutsidePinnedTopology(expected: rawKey, actual: otherKey)
+            )
+        }
+    }
 }
