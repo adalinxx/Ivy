@@ -28,35 +28,17 @@ public struct IvyConfig: Sendable {
     public let logger: any IvyLogger
     public let relayFee: UInt64
     public let baseThresholdMultiplier: UInt64
-    /// Maximum serialized Ivy wire-frame payload this node will send or accept.
-    /// This is node policy, not a consensus rule; operators can raise it for
-    /// chains or applications that need larger wire payloads.
     public let maxFrameSize: UInt32
-    /// Upper bound on distinct in-flight CIDs/volume queries tracked in `pendingRequests` /
-    /// `pendingVolumeRequests`.
     public let maxPendingRequests: Int
-    /// Per-CID/query cap on coalesced waiters.
     public let maxWaitersPerPendingCID: Int
-    /// Maximum number of peers to broadcast a `want` request to when DHT provider
-    /// records are empty.
     public let maxWantCandidates: Int
-    /// Minimum trailing-zero bits of SHA256(publicKey) required to accept a peer.
     public let minPeerKeyBits: Int
-    /// Per-peer token-bucket burst for inbound findNode requests.
     public let findNodeBurst: Double
-    /// Refill rate (tokens/sec) for the per-peer findNode bucket.
     public let findNodeRefillPerSec: Double
-    /// Maximum PEX entries accepted from a single response round.
     public let pexMaxAcceptedPerRound: Int
-    /// Minimum Tally reputation a PEX responder must have.
     public let pexMinResponderScore: Double
-
-    /// Operator-declared public P2P endpoint advertised in identify, overriding STUN.
     public let externalAddress: (host: String, port: UInt16)?
-
-    /// Serve as a circuit relay. Public/backbone nodes set this true.
     public let relayEnabled: Bool
-    /// Relay peers this node will route through when a direct dial fails.
     public let knownRelays: [PeerEndpoint]
 
     public init(
@@ -97,18 +79,25 @@ public struct IvyConfig: Sendable {
         self.publicKey = publicKey
         self.topology = topology
         self.listenPort = listenPort
-        self.bootstrapPeers = bootstrapPeers
-        self.enableLocalDiscovery = enableLocalDiscovery
+
+        // A pinned session cannot be widened by caller-provided discovery or relay
+        // settings. Keep only the expected bootstrap identity and neutralize every
+        // public-overlay discovery mechanism at construction time.
+        self.bootstrapPeers = bootstrapPeers.filter { topology.allowsPeer(publicKey: $0.publicKey) }
+        self.enableLocalDiscovery = topology.participatesInPublicDiscovery && enableLocalDiscovery
+        self.stunServers = topology.participatesInPublicDiscovery ? stunServers : []
+        self.enablePEX = topology.participatesInPublicDiscovery && enablePEX
+        self.relayEnabled = topology.participatesInPublicDiscovery && relayEnabled
+        self.knownRelays = topology.participatesInPublicDiscovery ? knownRelays : []
+
         self.tallyConfig = tallyConfig
         self.kBucketSize = kBucketSize
         self.maxConcurrentRequests = maxConcurrentRequests
         self.requestTimeout = requestTimeout
         self.relayTimeout = relayTimeout
         self.serviceType = serviceType
-        self.stunServers = stunServers
         self.defaultTTL = defaultTTL
         self.healthConfig = healthConfig
-        self.enablePEX = enablePEX
         self.pexInterval = pexInterval
         self.pexMaxPeers = pexMaxPeers
         self.signingKey = signingKey
@@ -125,17 +114,8 @@ public struct IvyConfig: Sendable {
         self.pexMaxAcceptedPerRound = pexMaxAcceptedPerRound ?? pexMaxPeers
         self.pexMinResponderScore = pexMinResponderScore
         self.externalAddress = externalAddress
-        self.relayEnabled = relayEnabled
-        self.knownRelays = knownRelays
     }
 
-    /// Effective PEX policy. A pinned session cannot opt back into public discovery
-    /// merely by setting `enablePEX`.
-    public var shouldRunPEX: Bool {
-        topology.participatesInPublicDiscovery && enablePEX
-    }
-
-    public var shouldRunLocalDiscovery: Bool {
-        topology.participatesInPublicDiscovery && enableLocalDiscovery
-    }
+    public var shouldRunPEX: Bool { enablePEX }
+    public var shouldRunLocalDiscovery: Bool { enableLocalDiscovery }
 }
