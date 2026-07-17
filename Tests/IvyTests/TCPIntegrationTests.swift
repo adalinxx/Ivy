@@ -428,16 +428,14 @@ struct TCPIntegrationTests {
 
         try await left.start()
         try await right.start()
-        async let leftDial: Void = left.connect(to: TransportTestHarness.endpoint(
-            rightIdentity,
-            port: rightPort))
-        async let rightDial: Void = right.connect(to: TransportTestHarness.endpoint(
-            leftIdentity,
-            port: leftPort))
-        _ = try await (leftDial, rightDial)
-
+        let rightEndpoint = TransportTestHarness.endpoint(rightIdentity, port: rightPort)
+        let leftEndpoint = TransportTestHarness.endpoint(leftIdentity, port: leftPort)
         let rightID = TransportTestHarness.key(rightIdentity).peerID
         let leftID = TransportTestHarness.key(leftIdentity).peerID
+        async let leftDial: Void = left.connect(to: rightEndpoint)
+        async let rightDial: Void = right.connect(to: leftEndpoint)
+        _ = try await (leftDial, rightDial)
+
         #expect(try await TransportTestHarness.eventually {
             let leftCount = await left.peerConnectionCount
             let rightCount = await right.peerConnectionCount
