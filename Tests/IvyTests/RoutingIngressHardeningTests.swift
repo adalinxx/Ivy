@@ -31,7 +31,10 @@ struct RoutingIngressHardeningTests {
     @Test("Solicited neighbors obey identity, address, and key-work policy")
     func solicitedNeighborsAreValidated() async throws {
         let requiredBits = 2
-        let node = routingNode("routing-policy", minPeerKeyBits: requiredBits)
+        let node = routingNode(
+            "routing-policy",
+            minPeerKeyBits: requiredBits,
+            externalAddress: (host: "127.0.0.1", port: 4001))
         let peerID = PeerID(publicKey: deterministicTestPeerKey("routing-policy-peer"))
         await node.addTestRoute(peerID, port: 1)
         let nonce: UInt64 = 1
@@ -57,7 +60,9 @@ struct RoutingIngressHardeningTests {
 
     @Test("Unsolicited and wrong-peer neighbors cannot mutate routing")
     func neighborsRequireTheExpectedPeerAndNonce() async throws {
-        let node = routingNode("routing-correlation")
+        let node = routingNode(
+            "routing-correlation",
+            externalAddress: (host: "127.0.0.1", port: 4001))
         let wrongID = PeerID(publicKey: deterministicTestPeerKey("routing-wrong-peer"))
         let queriedID = PeerID(publicKey: deterministicTestPeerKey("routing-queried-peer"))
         let advertised = testRoutingEndpoint("routing-advertised", port: 4001)
@@ -99,12 +104,20 @@ struct RoutingIngressHardeningTests {
             #expect(await node.isAcceptableDiscoveredEndpoint(endpoint, source: "test", from: source))
         }
 
-        let localNode = routingNode("routing-local")
+        let localNode = routingNode(
+            "routing-local",
+            externalAddress: (host: "127.0.0.1", port: 4001))
         let privateEndpoint = PeerEndpoint(publicKey: endpointKey, host: "10.0.0.1", port: 4001)
         #expect(await localNode.isAcceptableDiscoveredEndpoint(
             privateEndpoint,
             source: "test",
             from: source))
+
+        let unknownNode = routingNode("routing-unknown")
+        #expect(!(await unknownNode.isAcceptableDiscoveredEndpoint(
+            privateEndpoint,
+            source: "test",
+            from: source)))
 
         let domainNode = routingNode(
             "routing-domain",

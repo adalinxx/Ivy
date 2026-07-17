@@ -47,7 +47,7 @@ struct ResilienceTests {
             endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 1),
             channel: channel)
 
-        for value in 0..<PeerConnection.inboundBufferLimit {
+        for value in 0..<connection.inboundBufferLimit {
             #expect(connection.feedRecord(Data([UInt8(value)])))
         }
         #expect(!connection.feedRecord(Data([0xff])))
@@ -58,8 +58,10 @@ struct ResilienceTests {
             if let byte = record.first { received.append(byte) }
         }
 
-        #expect(received.count == PeerConnection.inboundBufferLimit)
+        #expect(received.count == connection.inboundBufferLimit)
         #expect(received.first == 0)
-        #expect(received.last == 255)
+        #expect(received.last == UInt8(connection.inboundBufferLimit - 1))
+        #expect(connection.inboundBufferLimit * Int(IvyConfig.defaultMaxFrameSize)
+            <= PeerConnection.inboundBufferByteBudget)
     }
 }

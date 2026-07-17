@@ -116,7 +116,6 @@ public actor Ivy {
     var connectingEndpoints: [PeerID: PeerEndpoint] = [:]
     var reconnectAttempts: [PeerID: Int] = [:]
     var reconnectTasks: [PeerID: Task<Void, Never>] = [:]
-    var intentionallyDisconnectedPeers: Set<PeerID> = []
     static let reconnectBaseDelayMs: UInt64 = 500
     static let reconnectMaxDelayMs: UInt64 = 30_000
     static let reconnectJitterMs: UInt64 = 250
@@ -216,7 +215,6 @@ public actor Ivy {
         }
         reconnectTasks.removeAll()
         reconnectAttempts.removeAll()
-        intentionallyDisconnectedPeers.removeAll()
     }
 
     // MARK: - Authenticated Connections
@@ -375,7 +373,6 @@ public actor Ivy {
             publicKey: key.hex,
             host: endpoint.host,
             port: endpoint.port)
-        intentionallyDisconnectedPeers.remove(key.peerID)
         return true
     }
 
@@ -389,11 +386,10 @@ public actor Ivy {
     }
 
     public func disconnect(_ peer: PeerID) {
-        guard let key = try? PeerKey(peer.publicKey),
-              let session = authenticatedSession(for: key) else { return }
-        intentionallyDisconnectedPeers.insert(key.peerID)
+        guard let key = try? PeerKey(peer.publicKey) else { return }
         reconnectTasks.removeValue(forKey: key.peerID)?.cancel()
         reconnectAttempts.removeValue(forKey: key.peerID)
+        guard let session = authenticatedSession(for: key) else { return }
         teardownAuthenticatedSession(session, reconnect: false)
         session.connection.cancel()
     }
@@ -410,8 +406,7 @@ public actor Ivy {
               running,
               authenticatedSession(for: key) == nil,
               !connectingPeers.contains(peer),
-              reconnectTasks[peer] == nil,
-              !intentionallyDisconnectedPeers.contains(peer) else { return }
+              reconnectTasks[peer] == nil else { return }
 
         let delay = reconnectDelay(for: peer)
         reconnectTasks[peer] = Task { [weak self] in
@@ -440,7 +435,7 @@ public actor Ivy {
         role: AuthenticatedPeerRole
     ) async {
         reconnectTasks.removeValue(forKey: peer)
-        guard running, !intentionallyDisconnectedPeers.contains(peer) else { return }
+        guard running else { return }
         await maintainConfiguredConnection(to: endpoint, role: role)
     }
 
@@ -864,10 +859,8 @@ public actor Ivy {
             delegate?.ivy(self, didDisconnect: key.peerID)
         }
 
-        let intentional = intentionallyDisconnectedPeers.remove(key.peerID) != nil
         guard reconnect,
               running,
-              !intentional,
               let endpoint = configuredReconnectEndpoint(for: key, role: session.role) else { return }
         scheduleReconnect(
             to: endpoint,

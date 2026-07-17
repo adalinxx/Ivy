@@ -36,7 +36,8 @@ struct PendingRequestCapsTests {
                 enabled: false
             ),
             maxPendingRequests: maxPending,
-            maxWaitersPerRequest: maxWaiters
+            maxWaitersPerRequest: maxWaiters,
+            externalAddress: ("127.0.0.1", 4001)
         )
     }
 

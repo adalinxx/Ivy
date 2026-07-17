@@ -155,14 +155,12 @@ extension Ivy {
             return false
         }
 
-        // Public nodes must not let discovered records steer them into internal
-        // addresses. A configured domain is conservatively treated as public;
-        // an explicit private IP still supports LAN and test deployments.
-        let effectivePublicHost = config.externalAddress?.host ?? publicAddress?.host
-        let isPublicNode = effectivePublicHost.map { host in
-            !isIPAddressLiteral(host) || !isNonRoutableDiscoveredHost(host)
+        // Unknown/public reachability must not let discovered records steer the
+        // node into internal addresses. An explicit private IP opts into LAN use.
+        let allowsPrivateDiscovery = config.externalAddress.map { address in
+            isIPAddressLiteral(address.host) && isNonRoutableDiscoveredHost(address.host)
         } ?? false
-        if isPublicNode,
+        if !allowsPrivateDiscovery,
            isNonRoutableDiscoveredHost(host) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false

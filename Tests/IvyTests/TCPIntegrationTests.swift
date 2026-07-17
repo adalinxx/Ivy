@@ -139,7 +139,10 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             let serverCount = await server.peerConnectionCount
             let clientCount = await client.peerConnectionCount
-            return serverCount == 1 && clientCount == 1
+            return serverCount == 1
+                && clientCount == 1
+                && serverRecorder.authenticatedPeers.count == 1
+                && clientRecorder.authenticatedPeers.count == 1
         })
         #expect(serverRecorder.authenticatedPeers.map(\.key) == [
             TransportTestHarness.key(clientIdentity),

@@ -4,6 +4,7 @@ import Tally
 
 public struct IvyConfig: Sendable {
     public static let defaultMaxFrameSize: UInt32 = 4 * 1024 * 1024
+    public static let maximumFrameSize: UInt32 = 16 * 1024 * 1024
     public static let defaultMaxConnections = 256
     public static let defaultSTUNServers: [(String, Int)] = [
         ("stun.l.google.com", 19302),
@@ -89,8 +90,8 @@ public struct IvyConfig: Sendable {
     }
 
     public func validate() throws {
-        guard maxFrameSize >= 256 else {
-            throw IvyModeError.invalidConfiguration("maxFrameSize must be at least 256")
+        guard (256...Self.maximumFrameSize).contains(maxFrameSize) else {
+            throw IvyModeError.invalidConfiguration("maxFrameSize is outside the supported range")
         }
         guard maxConnections > 0,
               maxConnectionsPerNetgroup > 0,
