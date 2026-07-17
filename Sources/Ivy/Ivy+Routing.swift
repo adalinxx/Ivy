@@ -1,7 +1,5 @@
 import Foundation
-import NIOCore
 import Tally
-import Crypto
 
 extension Ivy {
     // MARK: - DHT
@@ -9,11 +7,9 @@ extension Ivy {
     public func findNode(target: String) async -> [PeerEndpoint] {
         let targetHash = Router.hash(target)
         let lookupParallelism = min(Self.kademliaLookupParallelism, max(1, config.kBucketSize))
-        // Convergence normally stops the lookup; k rounds is only a safety guard.
         let maxLookupRounds = max(1, config.kBucketSize)
         var candidatesByKey: [String: Router.BucketEntry] = [:]
         var queried: Set<String> = []
-        var previousCandidateKeys: [String] = []
 
         for _ in 0..<maxLookupRounds {
             for entry in router.closestPeers(to: targetHash, count: config.kBucketSize) {
@@ -21,41 +17,63 @@ extension Ivy {
             }
 
             let candidates = closestCandidateEntries(candidatesByKey.values, to: targetHash)
-            let candidateKeys = candidates.map { $0.id.publicKey }
-            let toQuery = candidates
-                .filter {
-                    !queried.contains($0.id.publicKey) &&
-                    (hasAnyConnection($0.id) || localPeers[$0.id] != nil)
-                }
+            let batch = candidates
+                .filter { !queried.contains($0.id.publicKey) }
                 .prefix(lookupParallelism)
+            guard !batch.isEmpty else { break }
 
-            if toQuery.isEmpty { break }
-
-            var nonces: [UInt64] = []
-            nonces.reserveCapacity(toQuery.count)
-            for entry in toQuery {
+            for entry in batch {
                 queried.insert(entry.id.publicKey)
-                let nonce = makeFindNodeNonce()
-                nonces.append(nonce)
-                requestNeighbors(from: entry.id, targetHash: targetHash, nonce: nonce, timeout: .milliseconds(500))
             }
 
-            let responses = await collectNeighborResponses(nonces: nonces)
+            await withTaskGroup(of: Void.self) { group in
+                for entry in batch where !hasEndpointSession(entry.id) {
+                    group.addTask { [weak self] in
+                        guard let self else { return }
+                        do {
+                            try await self.connect(to: entry.endpoint)
+                        } catch {
+                            await self.removeFailedRoutingPeer(entry.id)
+                        }
+                    }
+                }
+            }
+
+            let retained = Set(router.allPeers().map { $0.id.publicKey })
+            for entry in batch where !hasEndpointSession(entry.id)
+                && !retained.contains(entry.id.publicKey) {
+                candidatesByKey.removeValue(forKey: entry.id.publicKey)
+            }
+
+            let queryable = batch.filter { hasEndpointSession($0.id) }
+            let responses = await withTaskGroup(
+                of: [PeerEndpoint].self,
+                returning: [[PeerEndpoint]].self
+            ) { group in
+                for entry in queryable {
+                    group.addTask { [weak self] in
+                        guard let self else { return [] }
+                        return await self.requestNeighbors(
+                            from: entry.id,
+                            targetHash: targetHash,
+                            timeout: .milliseconds(500))
+                    }
+                }
+                var result: [[PeerEndpoint]] = []
+                for await response in group where !response.isEmpty {
+                    result.append(response)
+                }
+                return result
+            }
             for endpoint in responses.flatMap({ $0 }) {
                 let id = PeerID(publicKey: endpoint.publicKey)
                 candidatesByKey[id.publicKey] = Router.BucketEntry(
                     id: id,
                     hash: Router.hash(id.publicKey),
-                    endpoint: endpoint,
-                    lastSeen: .now
+                    endpoint: endpoint
                 )
             }
 
-            let stabilized = candidateKeys == previousCandidateKeys
-            previousCandidateKeys = candidateKeys
-            if stabilized && !candidates.contains(where: { !queried.contains($0.id.publicKey) }) {
-                break
-            }
         }
 
         for entry in router.closestPeers(to: targetHash, count: config.kBucketSize) {
@@ -64,105 +82,40 @@ extension Ivy {
         return closestCandidateEntries(candidatesByKey.values, to: targetHash).map { $0.endpoint }
     }
 
-    // MARK: - Peer Exchange (PEX)
-
-    func startPEX() {
-        pexTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: .seconds(30))
-            while !Task.isCancelled {
-                await self.runPEXRound()
-                try? await Task.sleep(for: self.config.pexInterval)
+    func startRoutingRefresh() {
+        routingRefreshTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch {
+                return
             }
-        }
-    }
-
-    func runPEXRound() async {
-        let peerList = Array(connections.keys)
-        guard !peerList.isEmpty else { return }
-
-        let target = peerList.randomElement()!
-        let nonce = UInt64.random(in: 0...UInt64.max)
-
-        let discovered: [PeerEndpoint] = await withTaskCancellationHandler {
-            await withCheckedContinuation { cont in
-                guard !Task.isCancelled else { cont.resume(returning: []); return }
-                pendingPEX[nonce] = cont
-                fireToPeer(target, .pexRequest(nonce: nonce))
-                Task {
-                    try? await Task.sleep(for: .seconds(10))
-                    if let pending = self.pendingPEX.removeValue(forKey: nonce) {
-                        pending.resume(returning: [])
-                    }
+            while !Task.isCancelled {
+                let interval: Duration
+                if let self {
+                    await self.refreshRoutingTable()
+                    interval = self.config.routingRefreshInterval
+                } else {
+                    return
+                }
+                do {
+                    try await Task.sleep(for: interval)
+                } catch {
+                    return
                 }
             }
-        } onCancel: {
-            Task { await self.resolvePendingPEX(nonce: nonce) }
-        }
-
-        for ep in discovered {
-            if addDiscoveredPeer(ep, source: "pex", from: target) != nil {
-                Task { try? await connect(to: ep) }
-            }
         }
     }
 
-    func handlePEXRequest(nonce: UInt64, from peer: PeerID) {
-        guard tally.shouldAllow(peer: peer) else { return }
-
-        let peerHash = router.cachedHash(peer.publicKey)
-        let maxPeers = config.pexMaxPeers
-
-        let allPeers = router.closestPeers(to: peerHash, count: maxPeers * 2)
-
-        var selected = [PeerEndpoint]()
-        selected.reserveCapacity(maxPeers)
-        for entry in allPeers {
-            if entry.id == peer || entry.id == localID { continue }
-            if entry.endpoint.host == "0.0.0.0" || entry.endpoint.host == "unknown" { continue }
-            selected.append(entry.endpoint)
-            if selected.count >= maxPeers { break }
-        }
-
-        fireToPeer(peer, .pexResponse(nonce: nonce, peers: selected))
+    func refreshRoutingTable() async {
+        guard case .overlay = config.mode else { return }
+        let target = secureRandom32().map { String(format: "%02x", $0) }.joined()
+        _ = await findNode(target: target)
     }
 
-    func handlePEXResponse(nonce: UInt64, peers: [PeerEndpoint], from peer: PeerID) {
-        guard let cont = pendingPEX.removeValue(forKey: nonce) else {
-            config.logger.warning("Ignoring unsolicited PEX response from \(peer.publicKey.prefix(16))…")
-            return
-        }
-
-        // Ignore candidate feeds from peers below the responder-score floor.
-        // Default floor is 0 (permissive), so fresh/unknown peers (rep 0) still
-        // bootstrap; operators can raise it to reject low-reputation feeders.
-        guard tally.reputation(for: peer) >= config.pexMinResponderScore else {
-            config.logger.warning("Ignoring PEX response from low-reputation \(peer.publicKey.prefix(16))…")
-            tally.recordFailure(peer: peer)
-            cont.resume(returning: [])
-            return
-        }
-
-        let validated = peers.filter { isAcceptableDiscoveredEndpoint($0, source: "pex", from: peer) }
-        // Cap accepted entries per round so one peer can't inject an unbounded
-        // candidate set in a single exchange.
-        let accepted = Array(validated.prefix(config.pexMaxAcceptedPerRound))
-        if validated.count == peers.count {
-            tally.recordSuccess(peer: peer)
-        } else {
-            tally.recordFailure(peer: peer)
-        }
-        cont.resume(returning: accepted)
+    private func removeFailedRoutingPeer(_ peer: PeerID) {
+        guard running, !hasEndpointSession(peer) else { return }
+        router.removePeer(peer)
     }
-
-#if DEBUG
-    func receivePEXResponseForTesting(nonce: UInt64, peers: [PeerEndpoint], from peer: PeerID) async -> [PeerEndpoint] {
-        await withCheckedContinuation { cont in
-            pendingPEX[nonce] = cont
-            handlePEXResponse(nonce: nonce, peers: peers, from: peer)
-        }
-    }
-#endif
 
     @discardableResult
     func addDiscoveredPeer(_ endpoint: PeerEndpoint, source: String, from peer: PeerID) -> PeerID? {
@@ -170,19 +123,26 @@ extension Ivy {
             return nil
         }
 
-        let discovered = PeerID(publicKey: endpoint.publicKey)
-        guard !hasAnyConnection(discovered) else { return nil }
-        router.addPeer(discovered, endpoint: endpoint, tally: tally)
+        guard let key = try? PeerKey(endpoint.publicKey) else { return nil }
+        let discovered = key.peerID
+        guard !hasEndpointSession(discovered) else { return nil }
+        router.addPeer(
+            discovered,
+            endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port)
+        )
         return discovered
     }
 
     func isAcceptableDiscoveredEndpoint(_ endpoint: PeerEndpoint, source: String, from peer: PeerID) -> Bool {
-        guard !endpoint.publicKey.isEmpty else {
+        if source != "session metadata", !config.mode.participatesInPublicDiscovery {
+            return false
+        }
+        guard let key = try? PeerKey(endpoint.publicKey), config.allowsEndpoint(key) else {
             config.logger.warning("Rejecting \(source) endpoint from \(peer.publicKey.prefix(16))…: empty public key")
             return false
         }
 
-        let discovered = PeerID(publicKey: endpoint.publicKey)
+        let discovered = key.peerID
         guard discovered != localID else { return false }
 
         let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -195,21 +155,14 @@ extension Ivy {
             return false
         }
 
-        // A publicly-reachable node rejects discovered endpoints that point at
-        // non-routable address space (RFC1918, loopback, link-local, IPv6
-        // unique-local, unspecified) or a non-IP string — a peer must not be able
-        // to steer it into dialing an internal host (SSRF). Gated to public nodes,
-        // where "public" is the EFFECTIVE public address: an operator-declared
-        // externalAddress OR, absent that, the node's OWN STUN-derived reflexive
-        // publicAddress (both are advertised by sendIdentify, so both make the node
-        // effectively reachable from the public Internet). Read at call time so a
-        // node that becomes public mid-session via STUN is covered. Using the node's
-        // own observed reflexive address introduces no SSRF surface — it is not
-        // attacker-supplied. A node with neither (local/test) legitimately talks to
-        // loopback/private peers, so the filter must not apply to it; and a
-        // (defensively) non-routable effective host is treated as not-public.
+        // Public nodes must not let discovered records steer them into internal
+        // addresses. A configured domain is conservatively treated as public;
+        // an explicit private IP still supports LAN and test deployments.
         let effectivePublicHost = config.externalAddress?.host ?? publicAddress?.host
-        if let publicHost = effectivePublicHost, !isNonRoutableDiscoveredHost(publicHost),
+        let isPublicNode = effectivePublicHost.map { host in
+            !isIPAddressLiteral(host) || !isNonRoutableDiscoveredHost(host)
+        } ?? false
+        if isPublicNode,
            isNonRoutableDiscoveredHost(host) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false
@@ -250,6 +203,11 @@ extension Ivy {
             return Self.isNonRoutableIPv6(hextets)
         }
         return true   // not an IP literal
+    }
+
+    private func isIPAddressLiteral(_ host: String) -> Bool {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        return NetGroup.ipv4Octets(trimmed) != nil || NetGroup.ipv6Hextets(trimmed) != nil
     }
 
     /// Precise IPv4 special-use classification over the full dotted-quad.

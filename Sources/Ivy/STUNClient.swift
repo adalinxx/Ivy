@@ -12,22 +12,16 @@ public struct ObservedAddress: Sendable, Equatable, Hashable {
     }
 }
 
-public actor STUNClient {
+actor STUNClient {
     private let group: EventLoopGroup
     private let servers: [(String, Int)]
 
-    public static let defaultServers: [(String, Int)] = [
-        ("stun.l.google.com", 19302),
-        ("stun1.l.google.com", 19302),
-        ("stun.cloudflare.com", 3478),
-    ]
-
-    public init(group: EventLoopGroup, servers: [(String, Int)] = STUNClient.defaultServers) {
+    init(group: EventLoopGroup, servers: [(String, Int)] = IvyConfig.defaultSTUNServers) {
         self.group = group
         self.servers = servers
     }
 
-    public func discoverPublicAddress() async -> ObservedAddress? {
+    func discoverPublicAddress() async -> ObservedAddress? {
         for (host, port) in servers {
             if let addr = await query(host: host, port: port) {
                 return addr
@@ -92,6 +86,7 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
     private let expectedRemoteAddress: SocketAddress?
     private let lock = NSLock()
     private var continuation: CheckedContinuation<ObservedAddress?, Never>?
+    private var response: ObservedAddress?
 
     init(expectedTransactionID: [UInt8]? = nil, expectedRemoteAddress: SocketAddress? = nil) {
         self.expectedTransactionID = expectedTransactionID
@@ -106,6 +101,10 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
                     continuation = nil
                     lock.unlock()
                     cont.resume(returning: nil)
+                } else if let response {
+                    self.response = nil
+                    lock.unlock()
+                    cont.resume(returning: response)
                 } else {
                     continuation = cont
                     lock.unlock()
@@ -130,6 +129,9 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
         lock.lock()
         let cont = continuation
         continuation = nil
+        if cont == nil, response == nil {
+            response = addr
+        }
         lock.unlock()
         cont?.resume(returning: addr)
     }

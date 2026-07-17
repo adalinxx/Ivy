@@ -25,20 +25,17 @@ public struct PeerHealthConfig: Sendable {
 actor PeerHealthMonitor {
     struct PeerHealth: Sendable {
         var lastActivity: ContinuousClock.Instant
-        var lastPingSent: ContinuousClock.Instant?
         var pendingPingNonce: UInt64?
         var missedPongs: Int = 0
     }
 
     private var peers: [PeerID: PeerHealth] = [:]
     private let config: PeerHealthConfig
-    private let tally: Tally
     private var monitorTask: Task<Void, Never>?
     private let onStale: @Sendable (PeerID) -> Void
 
-    init(config: PeerHealthConfig, tally: Tally, onStale: @escaping @Sendable (PeerID) -> Void) {
+    init(config: PeerHealthConfig, onStale: @escaping @Sendable (PeerID) -> Void) {
         self.config = config
-        self.tally = tally
         self.onStale = onStale
     }
 
@@ -47,7 +44,11 @@ actor PeerHealthMonitor {
         monitorTask?.cancel()
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: self?.config.keepaliveInterval ?? .seconds(60))
+                do {
+                    try await Task.sleep(for: self?.config.keepaliveInterval ?? .seconds(60))
+                } catch {
+                    return
+                }
                 guard let self else { return }
                 let staleList = await self.checkAndPing(sendPing: sendPing)
                 for peer in staleList {
@@ -83,19 +84,7 @@ actor PeerHealthMonitor {
             peers[peer]?.pendingPingNonce = nil
             peers[peer]?.missedPongs = 0
             peers[peer]?.lastActivity = .now
-            tally.recordSuccess(peer: peer)
         }
-    }
-
-    func isStale(_ peer: PeerID) -> Bool {
-        guard let health = peers[peer] else { return true }
-        return health.lastActivity.duration(to: .now) > config.staleTimeout
-    }
-
-    var trackedPeerCount: Int { peers.count }
-
-    func tracksPeer(_ peer: PeerID) -> Bool {
-        peers[peer] != nil
     }
 
     private func checkAndPing(sendPing: @Sendable (PeerID, UInt64) async -> Void) async -> [PeerID] {
@@ -106,7 +95,6 @@ actor PeerHealthMonitor {
 
             if sinceActivity > config.staleTimeout || health.missedPongs >= config.maxMissedPongs {
                 stale.append(peer)
-                tally.recordFailure(peer: peer)
                 continue
             }
 
@@ -118,7 +106,6 @@ actor PeerHealthMonitor {
 
                 let nonce = UInt64.random(in: 0...UInt64.max)
                 peers[peer]?.pendingPingNonce = nonce
-                peers[peer]?.lastPingSent = .now
                 await sendPing(peer, nonce)
             }
         }

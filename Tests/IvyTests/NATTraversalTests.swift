@@ -162,14 +162,10 @@ struct STUNSourceAddressTests {
         )
         let channel = await NIOAsyncTestingChannel(handler: handler)
 
-        let waiter = Task { await handler.waitForResponse() }
-        // Let the continuation install before delivering the datagram.
-        try await Task.sleep(for: .milliseconds(20))
-
         let payload = makeSTUNResponse(ip: "198.51.100.5", port: 4001, transactionID: txnID)
         try await channel.writeInbound(AddressedEnvelope(remoteAddress: expected, data: payload))
 
-        let result = await waiter.value
+        let result = await handler.waitForResponse()
         #expect(result == ObservedAddress(host: "198.51.100.5", port: 4001))
         _ = try? await channel.finish()
     }
