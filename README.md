@@ -35,6 +35,18 @@ accepts one endpoint identity and disables public discovery. Configured carriers
 govern outbound relay initiation; inbound offers grant transport only and never
 turn a carrier into an endpoint peer.
 
+## Network roles
+
+Ivy supplies three small primitives that applications compose:
+
+- `broadcastMessage` announces gossip to the currently connected peers.
+- `sendMessage` carries directed sync requests and responses.
+- `fetchContent` retrieves one exact content selection from available providers.
+
+The caller defines gossip IDs, deduplication, forwarding, sync order, and CID
+validation. Ivy authenticates the sender, bounds each operation, and keeps these
+application protocols independent.
+
 ## Exact content
 
 Register a source:
@@ -86,6 +98,12 @@ let result = await ivy.sendMessage(
 
 Ivy delivers incoming messages through `IvyDelegate` with an authenticated
 sender. `.enqueued` means local queue acceptance, not remote delivery.
+
+Each authenticated peer is an independent availability zone. Unavailable or
+caller-reported deficient content changes provider selection for that root; it
+does not disconnect the peer or prevent messages and other roots from using the
+same session. Tally reduces admission for weak evidence or verified transport
+violations under pressure, without turning local service history into a ban.
 
 ## Boundary
 

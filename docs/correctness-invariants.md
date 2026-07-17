@@ -23,9 +23,10 @@ Authentication proves a peer key, never application authority.
 | IVY-017 | Peer-global blame requires that peer's verified signature; carrier-controlled ambiguity remains unattributed. |
 | IVY-018 | Queue acceptance does not assert receipt, application acceptance, or durability. |
 | IVY-019 | Authorization, content validity, storage, consensus, fees, and settlement remain above Ivy. |
+| IVY-020 | Application unavailability or deficient content may change selection for that root, but cannot disconnect or globally condemn an authenticated peer. |
 
 Primary coverage: `SessionProtocolTests`, `IvyTopologyTests`,
 `InboundAdmissionTests`, `MessageFrameDecoderBoundTests`,
 `ContentExchangeTests`, `PendingRequestCapsTests`, `ProviderRefreshTests`,
-`RoutingIngressHardeningTests`, `RelayIntegrationTests`, and
+`ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`, and
 `TCPIntegrationTests`.

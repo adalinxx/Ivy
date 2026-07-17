@@ -28,6 +28,12 @@ Receive sequences strictly increase. Simultaneous sessions for one peer and
 role converge on the smaller session ID. Records are signed but not encrypted;
 confidentiality and forward secrecy belong above or below Ivy.
 
+Treat every authenticated endpoint connection as an independent availability
+zone, not a verdict about the peer. Application timeouts, unavailable content,
+and caller-reported deficiency leave the session open. Only transport safety
+failures such as invalid authentication, signed protocol violations, or hard
+bound exhaustion close it.
+
 ## Bounds
 
 - Every encoder, decoder, direct peer, and relay uses one 4 MiB frame-body cap.
@@ -43,6 +49,19 @@ Tally gates authenticated application work using peer-global traffic evidence
 and pressure. A relay packet's full signed carrier payload is recorded before
 forwarding admission, so relayed bytes consume the same peer budget as direct
 traffic. Local rate denial is not a protocol violation.
+
+Useful authenticated exchange therefore remains admissible deeper into local
+pressure. Low-evidence or violating peers receive less service, but Ivy does not
+evict an authenticated connection by score. Evidence decays, and application
+content deficiency remains root-scoped rather than becoming global blame.
+
+## Application protocols
+
+Ivy's generic records and exact content exchange are enough to compose gossip,
+sync, and retrieval. Broadcast messages announce gossip to current peers;
+directed messages carry sync control; content requests retrieve the selected
+bytes. Gossip identity, deduplication, forwarding, sync semantics, CID
+validation, and storage remain caller policy.
 
 ## Routing and content
 
@@ -71,7 +90,10 @@ does not erase a hint, and a failed address does not suppress a healthy address
 for the same identity.
 
 The caller may report content deficient after validation. Ivy then suppresses
-that peer briefly for that root; it does not create peer-global blame.
+that peer briefly for that root; it does not create peer-global blame, close the
+connection, or affect messages and other roots. A later fetch can use another
+connected provider, fresh discovery, or fallback as a separate availability
+zone.
 
 ## Relay and attribution
 

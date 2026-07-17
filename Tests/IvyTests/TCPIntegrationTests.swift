@@ -254,7 +254,7 @@ struct TCPIntegrationTests {
         await listener.stop()
     }
 
-    @Test("Authenticated TCP carries generic peer messages")
+    @Test("Authenticated TCP carries directed sync and broadcast gossip")
     func peerMessageDelivery() async throws {
         let serverIdentity = TransportTestHarness.identity("tcp-message-server")
         let clientIdentity = TransportTestHarness.identity("tcp-message-client")
@@ -283,6 +283,12 @@ struct TCPIntegrationTests {
             recorder.receivedMessage(topic: "node.state", payload: payload, from: clientID)
         })
 
+        let gossip = Data("new block".utf8)
+        await client.broadcastMessage(topic: "blocks.gossip", payload: gossip)
+        #expect(try await TransportTestHarness.eventually {
+            recorder.receivedMessage(topic: "blocks.gossip", payload: gossip, from: clientID)
+        })
+
         await client.stop()
         await server.stop()
     }
@@ -301,6 +307,8 @@ struct TCPIntegrationTests {
         ])
         let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
         let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let recorder = TransportTestRecorder()
+        await server.setTestDelegate(recorder)
         await server.setContentSource(source)
 
         try await server.start()
@@ -319,6 +327,18 @@ struct TCPIntegrationTests {
             child: Data("child bytes".utf8),
         ])
         #expect(response.servedBy == serverID)
+
+        await client.reportDeficientContent(rootCID: root, servedBy: serverID)
+        #expect(await client.peerConnectionCount == 1)
+        let sync = Data("next range".utf8)
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "sync.request",
+            payload: sync) == .enqueued(endpoint: serverID, route: .direct))
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            recorder.receivedMessage(topic: "sync.request", payload: sync, from: clientID)
+        })
 
         await client.stop()
         await server.stop()
