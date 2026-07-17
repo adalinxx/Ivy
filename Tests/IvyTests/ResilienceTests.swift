@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import NIOEmbedded
 import Testing
 @testable import Ivy
@@ -65,6 +66,27 @@ struct ResilienceTests {
         #expect(received.first == 0)
         #expect(received.last == UInt8(connection.inboundBufferLimit - 1))
         #expect(budget.currentUsage == 0)
+    }
+
+    @Test("outbound backpressure and cancellation reject writes without buffering")
+    func outboundBackpressure() throws {
+        let channel = EmbeddedChannel()
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
+        let connection = PeerConnection(
+            endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 4001),
+            channel: channel)
+
+        channel.isWritable = false
+        #expect(!connection.sendSerializedRecord(Data([1, 2, 3])))
+        #expect(try channel.readOutbound(as: ByteBuffer.self) == nil)
+
+        channel.isWritable = true
+        #expect(connection.sendSerializedRecord(Data([1, 2, 3])))
+        #expect(try channel.readOutbound(as: ByteBuffer.self) != nil)
+
+        connection.cancel()
+        #expect(!connection.sendSerializedRecord(Data([4])))
+        _ = try? channel.finish()
     }
 
     @Test("relayed queues share one inbound byte budget")

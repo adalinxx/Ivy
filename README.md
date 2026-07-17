@@ -30,7 +30,8 @@ A socket remains private until its signed session handshake completes.
 
 `IvyMode.overlay` uses authenticated Kademlia discovery. `.pinned(peer:)`
 accepts one endpoint identity and disables public discovery. Configured carriers
-are a separate role and never become endpoint peers.
+govern outbound relay initiation; inbound offers grant transport only and never
+turn a carrier into an endpoint peer.
 
 ## Exact content
 

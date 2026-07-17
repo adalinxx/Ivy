@@ -4,6 +4,10 @@ import Testing
 @testable import Ivy
 import Tally
 
+private struct TransportTestTimeout: Error {
+    let event: String
+}
+
 enum TransportTestHarness {
     private static let lock = NSLock()
     private nonisolated(unsafe) static var port =
@@ -35,6 +39,7 @@ enum TransportTestHarness {
     static func config(
         _ identity: Curve25519.Signing.PrivateKey,
         port: UInt16,
+        advertisedHost: String = "127.0.0.1",
         bootstrapPeers: [PeerEndpoint] = [],
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay,
@@ -53,7 +58,7 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
-            externalAddress: ("127.0.0.1", port),
+            externalAddress: (advertisedHost, port),
             relayEnabled: relayEnabled,
             carriers: carriers,
             mode: mode)
@@ -74,10 +79,22 @@ enum TransportTestHarness {
 final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var connected: [AuthenticatedPeer] = []
+    private var currentConnections: Set<String> = []
+    private var disconnected: [PeerID] = []
     private var received: [(PeerMessage, PeerID)] = []
 
     func ivy(_ ivy: Ivy, didConnect peer: AuthenticatedPeer) {
-        lock.withLock { connected.append(peer) }
+        lock.withLock {
+            connected.append(peer)
+            currentConnections.insert(peer.key.hex)
+        }
+    }
+
+    func ivy(_ ivy: Ivy, didDisconnect peer: PeerID) {
+        lock.withLock {
+            disconnected.append(peer)
+            currentConnections.remove(peer.publicKey)
+        }
     }
 
     func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: PeerID) {
@@ -86,6 +103,22 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
 
     var authenticatedPeers: [AuthenticatedPeer] {
         lock.withLock { connected }
+    }
+
+    func waitForConnect(_ peer: PeerID) async throws {
+        guard try await TransportTestHarness.eventually({
+            self.lock.withLock { self.currentConnections.contains(peer.publicKey) }
+        }) else {
+            throw TransportTestTimeout(event: "connect \(peer.publicKey)")
+        }
+    }
+
+    func waitForDisconnect(_ peer: PeerID) async throws {
+        guard try await TransportTestHarness.eventually({
+            self.lock.withLock { self.disconnected.contains(peer) }
+        }) else {
+            throw TransportTestTimeout(event: "disconnect \(peer.publicKey)")
+        }
     }
 
     func receivedMessage(topic: String, payload: Data, from peer: PeerID) -> Bool {
@@ -442,6 +475,43 @@ struct TCPIntegrationTests {
             await client.peerConnectionCount == 1
         })
 
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("an established configured peer reconnects after transport loss")
+    func establishedReconnect() async throws {
+        let serverIdentity = TransportTestHarness.identity("reconnect-established-server")
+        let clientIdentity = TransportTestHarness.identity("reconnect-established-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let serverEndpoint = TransportTestHarness.endpoint(serverIdentity, port: serverPort)
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let recorder = TransportTestRecorder()
+        let restartedServerRecorder = TransportTestRecorder()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            bootstrapPeers: [serverEndpoint],
+            mode: .pinned(peer: serverID.publicKey)))
+        await client.setTestDelegate(recorder)
+
+        try await server.start()
+        try await client.start()
+        try await recorder.waitForConnect(serverID)
+
+        await server.stop()
+        try await recorder.waitForDisconnect(serverID)
+        await server.setTestDelegate(restartedServerRecorder)
+        try await server.start()
+        await client.runPendingReconnectForTesting(serverID)
+        try await recorder.waitForConnect(serverID)
+        try await restartedServerRecorder.waitForConnect(clientID)
+
+        #expect(await client.peerConnectionCount == 1)
+        #expect(await server.peerConnectionCount == 1)
         await client.stop()
         await server.stop()
     }

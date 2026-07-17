@@ -17,7 +17,11 @@ extension Ivy {
     // MARK: - DHT
 
     public func findNode(target: String) async -> [PeerEndpoint] {
-        let generation = runGeneration
+        await findNode(target: target, generation: runGeneration)
+    }
+
+    func findNode(target: String, generation: UInt64) async -> [PeerEndpoint] {
+        guard isCurrentRun(generation) else { return [] }
         let targetHash = Router.hash(target)
         let lookupParallelism = min(Self.kademliaLookupParallelism, max(1, config.kBucketSize))
         let maxLookupRounds = max(1, config.kBucketSize)
@@ -43,16 +47,19 @@ extension Ivy {
                 for entry in batch where !hasEndpointSession(entry.id) {
                     group.addTask { [weak self] in
                         guard let self else { return }
+                        guard await self.isCurrentRun(generation) else { return }
                         do {
                             _ = try await self.connectEndpointIfAdmitted(
                                 to: entry.endpoint,
-                                allowRelayFallback: true)
+                                allowRelayFallback: true,
+                                requiredGeneration: generation)
                         } catch {
                             await self.removeFailedRoutingPeer(entry.id, generation: generation)
                         }
                     }
                 }
             }
+            guard isCurrentRun(generation) else { return [] }
 
             let retained = Set(router.allPeers().map { $0.id.publicKey })
             for entry in batch where !hasEndpointSession(entry.id)
@@ -71,6 +78,7 @@ extension Ivy {
                         return await self.requestNeighbors(
                             from: entry.id,
                             targetHash: targetHash,
+                            generation: generation,
                             timeout: .milliseconds(500))
                     }
                 }
@@ -80,6 +88,7 @@ extension Ivy {
                 }
                 return result
             }
+            guard isCurrentRun(generation) else { return [] }
             for endpoint in responses.flatMap({ $0 }) {
                 let id = PeerID(publicKey: endpoint.publicKey)
                 candidatesByKey[id.publicKey] = Router.BucketEntry(
@@ -91,6 +100,7 @@ extension Ivy {
 
         }
 
+        guard isCurrentRun(generation) else { return [] }
         for entry in router.closestPeers(to: targetHash, count: config.kBucketSize) {
             candidatesByKey[entry.id.publicKey] = entry
         }
@@ -125,7 +135,7 @@ extension Ivy {
     func refreshRoutingTable(generation: UInt64) async {
         guard isCurrentRun(generation), case .overlay = config.mode else { return }
         let target = secureRandom32().map { String(format: "%02x", $0) }.joined()
-        _ = await findNode(target: target)
+        _ = await findNode(target: target, generation: generation)
     }
 
     func removeFailedRoutingPeer(_ peer: PeerID, generation: UInt64) {

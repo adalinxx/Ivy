@@ -24,6 +24,7 @@ public struct PeerHealthConfig: Sendable {
 
 actor PeerHealthMonitor {
     struct PeerHealth: Sendable {
+        let sessionID: SessionID
         var lastActivity: ContinuousClock.Instant
         var pendingPingNonce: UInt64?
         var missedPongs: Int = 0
@@ -32,14 +33,25 @@ actor PeerHealthMonitor {
     private var peers: [PeerID: PeerHealth] = [:]
     private let config: PeerHealthConfig
     private var monitorTask: Task<Void, Never>?
-    private let onStale: @Sendable (PeerID) -> Void
+    private let onStale: @Sendable (PeerID, SessionID) -> Void
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private let nextNonce: @Sendable () -> UInt64
 
-    init(config: PeerHealthConfig, onStale: @escaping @Sendable (PeerID) -> Void) {
+    init(
+        config: PeerHealthConfig,
+        onStale: @escaping @Sendable (PeerID, SessionID) -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
+        nextNonce: @escaping @Sendable () -> UInt64 = { UInt64.random(in: .min ... .max) }
+    ) {
         self.config = config
         self.onStale = onStale
+        self.now = now
+        self.nextNonce = nextNonce
     }
 
-    func startMonitoring(sendPing: @escaping @Sendable (PeerID, UInt64) async -> Void) {
+    func startMonitoring(
+        sendPing: @escaping @Sendable (PeerID, SessionID, UInt64) async -> Void
+    ) {
         guard config.enabled else { return }
         monitorTask?.cancel()
         monitorTask = Task { [weak self] in
@@ -51,8 +63,8 @@ actor PeerHealthMonitor {
                 }
                 guard let self else { return }
                 let staleList = await self.checkAndPing(sendPing: sendPing)
-                for peer in staleList {
-                    self.onStale(peer)
+                for (peer, sessionID) in staleList {
+                    self.onStale(peer, sessionID)
                 }
             }
         }
@@ -63,57 +75,77 @@ actor PeerHealthMonitor {
         monitorTask = nil
     }
 
-    func trackPeer(_ peer: PeerID) {
-        if peers[peer] == nil {
-            peers[peer] = PeerHealth(lastActivity: .now)
-        }
+    func trackPeer(_ peer: PeerID, sessionID: SessionID) {
+        guard peers[peer]?.sessionID != sessionID else { return }
+        peers[peer] = PeerHealth(sessionID: sessionID, lastActivity: now())
     }
 
-    func removePeer(_ peer: PeerID) {
+    func removePeer(_ peer: PeerID, sessionID: SessionID) {
+        guard peers[peer]?.sessionID == sessionID else { return }
         peers.removeValue(forKey: peer)
     }
 
-    func recordActivity(from peer: PeerID) {
-        peers[peer]?.lastActivity = .now
+    func recordActivity(from peer: PeerID, sessionID: SessionID) {
+        guard peers[peer]?.sessionID == sessionID else { return }
+        peers[peer]?.lastActivity = now()
+        peers[peer]?.pendingPingNonce = nil
         peers[peer]?.missedPongs = 0
     }
 
-    func recordPong(from peer: PeerID, nonce: UInt64) {
-        guard let health = peers[peer] else { return }
+    func recordPong(from peer: PeerID, sessionID: SessionID, nonce: UInt64) {
+        guard let health = peers[peer], health.sessionID == sessionID else { return }
         if health.pendingPingNonce == nonce {
             peers[peer]?.pendingPingNonce = nil
             peers[peer]?.missedPongs = 0
-            peers[peer]?.lastActivity = .now
+            peers[peer]?.lastActivity = now()
         }
     }
 
-    private func checkAndPing(sendPing: @Sendable (PeerID, UInt64) async -> Void) async -> [PeerID] {
-        var stale: [PeerID] = []
+    func checkAndPing(
+        sendPing: @Sendable (PeerID, SessionID, UInt64) async -> Void
+    ) async -> [(PeerID, SessionID)] {
+        var stale: [(PeerID, SessionID)] = []
+        var pendingPings: [(PeerID, SessionID, UInt64)] = []
+        let current = now()
 
         for (peer, var health) in peers {
-            let sinceActivity = health.lastActivity.duration(to: .now)
+            let sinceActivity = health.lastActivity.duration(to: current)
 
-            if sinceActivity > config.staleTimeout || health.missedPongs >= config.maxMissedPongs {
-                stale.append(peer)
+            if sinceActivity >= config.staleTimeout {
+                stale.append((peer, health.sessionID))
                 continue
             }
 
-            if sinceActivity > config.keepaliveInterval {
+            if sinceActivity >= config.keepaliveInterval {
                 if health.pendingPingNonce != nil {
                     health.missedPongs += 1
-                    peers[peer] = health
+                    if health.missedPongs >= config.maxMissedPongs {
+                        stale.append((peer, health.sessionID))
+                        continue
+                    }
                 }
 
-                let nonce = UInt64.random(in: 0...UInt64.max)
-                peers[peer]?.pendingPingNonce = nonce
-                await sendPing(peer, nonce)
+                let nonce = nextNonce()
+                health.pendingPingNonce = nonce
+                peers[peer] = health
+                pendingPings.append((peer, health.sessionID, nonce))
             }
         }
 
-        for peer in stale {
+        for (peer, sessionID) in stale where peers[peer]?.sessionID == sessionID {
             peers.removeValue(forKey: peer)
+        }
+
+        for (peer, sessionID, nonce) in pendingPings {
+            guard let health = peers[peer],
+                  health.sessionID == sessionID,
+                  health.pendingPingNonce == nonce
+            else { continue }
+            await sendPing(peer, sessionID, nonce)
         }
 
         return stale
     }
+
+    func health(for peer: PeerID) -> PeerHealth? { peers[peer] }
 }

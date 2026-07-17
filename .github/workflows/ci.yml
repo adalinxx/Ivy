@@ -5,13 +5,56 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
 
 jobs:
   test:
-    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
       - run: swift build
+      - run: swift build -c release
       - run: swift test
+      - name: Test optimized build with internal test seams
+        run: >-
+          swift test -c release
+          --scratch-path .build-release-testing
+          -Xswiftc -DIVY_TESTING
+      - name: Replay a representative alternate seed
+        env:
+          IVY_TEST_SEED: "0x5eedcafe"
+        run: swift test --skip-build --filter seeded
+
+  sanitizer:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift test --scratch-path .build-${{ matrix.sanitizer }} --sanitize ${{ matrix.sanitizer }}
+
+  stress:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+      - name: Replay alternate state-machine seeds
+        run: |
+          for seed in $(seq 1 20); do
+            echo "seed ${seed}/20"
+            IVY_TEST_SEED=${seed} swift test --skip-build --filter seeded
+          done

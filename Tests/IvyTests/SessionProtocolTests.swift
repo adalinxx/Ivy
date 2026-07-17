@@ -44,6 +44,87 @@ struct SessionProtocolTests {
         return (signedI, signedR, try SessionID(initiator: signedI, responder: signedR), initiator, responder)
     }
 
+    @Test("frozen v8 session vectors")
+    func frozenV8Vectors() throws {
+        let route = Data(repeating: 0x11, count: 32)
+        let initiator = try PeerKey(rawRepresentation: Data(repeating: 0x22, count: 32))
+        let responder = try PeerKey(rawRepresentation: Data(repeating: 0x33, count: 32))
+        let metadata = Data([0, 0])
+        let helloI = SessionHelloInitiator(
+            routeBinding: route,
+            initiator: initiator,
+            responder: responder,
+            nonce: Data(repeating: 0x44, count: 32),
+            metadata: metadata)
+        let helloIHex = "0008"
+            + String(repeating: "11", count: 32)
+            + String(repeating: "22", count: 32)
+            + String(repeating: "33", count: 32)
+            + String(repeating: "44", count: 32)
+            + "000000020000"
+        let expectedHelloI = try #require(Data(hexString: helloIHex))
+        #expect(helloI.encode() == expectedHelloI)
+        #expect(try SessionHelloInitiator.decode(expectedHelloI) == helloI)
+
+        let signedI = SignedSessionHelloInitiator(
+            hello: helloI,
+            signature: Data(repeating: 0x55, count: 64))
+        let expectedWireI = try #require(Data(hexString:
+            "495659080100000088" + helloIHex + String(repeating: "55", count: 64)))
+        #expect(SessionWireRecord.helloInitiator(signedI).serialize() == expectedWireI)
+        #expect(try SessionWireRecord.deserialize(expectedWireI) == .helloInitiator(signedI))
+
+        let helloR = SessionHelloResponder(
+            routeBinding: route,
+            responder: responder,
+            initiator: initiator,
+            initiatorNonce: Data(repeating: 0x44, count: 32),
+            responderNonce: Data(repeating: 0x66, count: 32),
+            metadata: metadata)
+        let helloRHex = "0008"
+            + String(repeating: "11", count: 32)
+            + String(repeating: "33", count: 32)
+            + String(repeating: "22", count: 32)
+            + String(repeating: "44", count: 32)
+            + String(repeating: "66", count: 32)
+            + "000000020000"
+        let signedR = SignedSessionHelloResponder(
+            hello: helloR,
+            signature: Data(repeating: 0x77, count: 64))
+        let expectedWireR = try #require(Data(hexString:
+            "4956590802000000a8" + helloRHex + String(repeating: "77", count: 64)))
+        #expect(SessionWireRecord.helloResponder(signedR).serialize() == expectedWireR)
+        #expect(try SessionWireRecord.deserialize(expectedWireR) == .helloResponder(signedR))
+
+        let sessionID = try SessionID(bytes: Data(repeating: 0x88, count: 32))
+        let finish = SessionFinish(
+            sessionID: sessionID,
+            sender: initiator,
+            receiver: responder,
+            signature: Data(repeating: 0x99, count: 64))
+        let expectedFinish = try #require(Data(hexString:
+            "4956590803"
+                + String(repeating: "88", count: 32)
+                + String(repeating: "22", count: 32)
+                + String(repeating: "33", count: 32)
+                + String(repeating: "99", count: 64)))
+        #expect(SessionWireRecord.finish(finish).serialize() == expectedFinish)
+        #expect(try SessionWireRecord.deserialize(expectedFinish) == .finish(finish))
+
+        let dataRecord = SessionDataRecord(
+            sessionID: sessionID,
+            sequence: 1,
+            payload: Data([0xaa, 0xbb]),
+            signature: Data(repeating: 0xcc, count: 64))
+        let expectedData = try #require(Data(hexString:
+            "4956590804"
+                + String(repeating: "88", count: 32)
+                + "000000000000000100000002aabb"
+                + String(repeating: "cc", count: 64)))
+        #expect(SessionWireRecord.data(dataRecord).serialize() == expectedData)
+        #expect(try SessionWireRecord.deserialize(expectedData) == .data(dataRecord))
+    }
+
     @Test("metadata contains only canonical listen addresses")
     func canonicalMetadata() throws {
         let a = ListenAddress(host: "a.example", port: 4001)

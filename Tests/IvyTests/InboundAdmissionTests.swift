@@ -61,11 +61,41 @@ struct InboundAdmissionTests {
             healthConfig: PeerHealthConfig(enabled: false),
             externalAddress: ("127.0.0.1", port)))
 
+        let startBarrier = TestBarrier("lifecycle start")
+        let stopQueued = TestBarrier("queued stop")
+        let restartQueued = TestBarrier("queued restart")
+        await ivy.setLifecycleStartHookForTesting {
+            do {
+                try await startBarrier.arriveAndWait()
+            } catch {
+                Issue.record("\(error)")
+            }
+        }
+        await ivy.setLifecycleRequestHookForTesting { request in
+            if request == 2 {
+                do {
+                    try await stopQueued.arriveAndWait()
+                } catch {
+                    Issue.record("\(error)")
+                }
+            } else if request == 3 {
+                do {
+                    try await restartQueued.arriveAndWait()
+                } catch {
+                    Issue.record("\(error)")
+                }
+            }
+        }
+
         let starting = Task { try await ivy.start() }
-        await Task.yield()
+        try await startBarrier.waitForArrivals()
         let stopping = Task { await ivy.stop() }
-        await Task.yield()
+        try await stopQueued.waitForArrivals()
         let restarting = Task { try await ivy.start() }
+        try await restartQueued.waitForArrivals()
+        await stopQueued.release()
+        await restartQueued.release()
+        await startBarrier.release()
         try await starting.value
         await stopping.value
         try await restarting.value
