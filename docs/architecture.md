@@ -1,117 +1,223 @@
 # Architecture
 
-Ivy is the network boundary beneath a node. It authenticates peers, bounds
-network work, attributes accepted records, and supplies endpoint routing. It
-does not interpret application state.
+Ivy is the authenticated network boundary beneath an application. It turns an
+untrusted byte stream into bounded records attributed to cryptographic peer
+identities. It does not decide whether an identity is authorized to act for an
+application.
 
 ```text
-node: consensus, chain/process authority, validation, retention, storage
-  |
-Ivy: authenticated sessions, routing, relay, exact byte transfer
-  |
-TCP / carrier route
+application policy
+  authority | validation | storage | protocol semantics
+                         |
+                         v
+Ivy actor
+  lifecycle | sessions | admission | routing | content | relay
+                         |
+                         v
+SwiftNIO channels
+  direct TCP or configured carrier transport
 ```
 
-## Sessions and attribution
+## Connection state machine
 
-Each process has an Ed25519 `PeerKey`. A socket begins as private pending state.
-The initiator and responder sign a transcript containing both identities, fresh
-nonces, the route binding, and canonical bounded metadata. The transcript yields
-a session ID; the initiator's signed finish proves receipt of the responder's
-hello. Only then can the socket enter authenticated endpoint or carrier state.
+```text
+socket
+  |
+  | reserve global and netgroup capacity before reading
+  v
+pending
+  |
+  | signed transcript + route-bound finish
+  v
+authenticated endpoint OR authenticated carrier
+  |
+  | close, timeout, policy denial, or stop
+  v
+closed
+```
 
-Every application record binds its sender, receiver, session ID, sequence, and
-payload under a signature. Incoming sequences must strictly increase. Duplicate
-sessions for one peer and role converge on the lexicographically smallest
-session ID.
+Inbound capacity is reserved synchronously when a channel becomes active.
+Automatic reads remain disabled until actor admission accepts that reservation.
+This prevents a connection flood from buffering arbitrary input while waiting
+for actor scheduling.
 
-Attribution requires a valid signature from the identity being charged. Invalid
-nested bytes on a relay route are ambiguous between the endpoint and carrier, so
-Ivy closes the route without assigning a violation. Signed metadata is likewise
-an authenticated claim, not proof of application authority.
+Pending sockets are private. They cannot enter routing, call delegates, serve
+content, carry application messages, or consume authenticated peer identity.
+
+## Sessions and identity
+
+Each process owns an Ed25519 `PeerKey`. Initiator and responder sign a canonical
+handshake transcript containing both identities, fresh nonces, route binding,
+and bounded metadata. The transcript derives one session ID. The initiator's
+signed finish proves receipt of the responder's hello before promotion.
+
+Every application record binds the sender, receiver, session ID, sequence, and
+payload under a signature. Receive sequences strictly increase; send sequences
+cannot wrap. Simultaneous direct cross-dials for the same peer and role converge
+on the lexicographically smaller session ID.
+
+Endpoint and carrier identities are separate roles. Configuration rejects role
+collisions, including the local identity, pinned identity, bootstrap endpoints,
+and configured carriers.
+
+Authentication proves control of a key. Process authorization, membership, and
+scope remain application policy.
+
+## Restart-safe lifecycle
+
+Lifecycle operations are serialized, so overlapping `start`, `stop`, and
+`start` calls take effect in call order. Each run has a monotonically increasing
+generation. Listener work, STUN, health checks, routing refresh, dials,
+reconnects, relay setup, provider queries, and content fetch leaders are tagged
+with their owning generation or token.
+
+`stop()` invalidates the generation, closes channels, clears pending work, and
+resumes waiters. A completion from an older run cannot remove, publish, or
+replace state owned by a newer run.
+
+## Bounded work
+
+Ivy applies limits before or at each allocation boundary:
+
+| Resource | Bound |
+| --- | --- |
+| Frame body | Fixed protocol maximum of 4 MiB |
+| Session metadata | Canonical encoding up to 64 KiB |
+| Strings and collections | Per-field protocol limits |
+| Connections | Global and network-group admission limits |
+| Requests and provider queries | Configured pending-operation limits |
+| Identical-request followers | Configured waiter limit |
+| Content fan-out | Configured candidate limit |
+| Routing, provider roots, and hints | Kademlia or fixed local limits |
+| Relay routes | Global and per-peer limits plus idle expiry |
+
+The fixed frame law is not negotiated. Every direct peer and carrier therefore
+rejects the same oversized body. For content serving, Ivy subtracts exact
+encoding and route overhead before asking storage to materialize bytes.
+
+Tally provides a second admission layer for authenticated application work:
+raw traffic, concrete protocol violations, global pressure, and challenges.
+Rate denial is not itself recorded as a violation.
 
 ## Endpoint routing
 
-Overlay nodes maintain a bounded Kademlia routing table. `findNode` performs an
-iterative lookup over authenticated endpoint responses. A periodic lookup for a
-random target refreshes the table. Discovered keys and addresses pass local
-admission and address checks before insertion. Private-address discovery is
-enabled only when the node explicitly advertises a private address for LAN use.
+Overlay mode maintains a bounded Kademlia table. Iterative `findNode` queries
+only authenticated endpoint sessions, correlates responses by nonce, and admits
+new endpoints after identity, address, mode, key-work, connection, and netgroup
+checks. A random periodic lookup refreshes the table.
 
-There is no peer-exchange protocol. Pending connections and configured carriers
-never enter endpoint routing. `knownPeerEndpoints` is a read-only snapshot; the
-node cannot mutate Ivy's routing state directly. Pinned mode admits one endpoint
-identity and does not participate in public discovery.
+Address policy is derived from parsed address bits. Equivalent IPv4 and
+IPv4-mapped IPv6 spellings therefore receive the same scope, SSRF, and netgroup
+classification. Private discovery is enabled only when the local process
+explicitly advertises a private address for LAN use.
 
-## Exact content selection
+There is no peer-exchange protocol. Bootstrap peers and configured carriers are
+configuration, pending connections are not routes, and `knownPeerEndpoints` is
+a read-only snapshot. Pinned mode accepts one endpoint identity and does not
+participate in public discovery.
 
-Content exchange transfers an explicit set of opaque entries:
+## Exact content transfer
+
+A request names one explicit opaque selection:
 
 ```text
-selection = rootCID + selected CIDs
+selection = rootCID + deduplicated selected identifiers
 ```
 
-The root is always requested. Additional identifiers are deduplicated and
-canonicalized. Ivy neither follows links from the root nor infers the rest of a
-DAG. A single-CID request and a partial-DAG request are therefore the same
-operation with different selections.
+The root is always included. Ivy neither follows root links nor infers the rest
+of a DAG. A single object, partial DAG, and complete application object are the
+same transport operation with different caller-selected identifiers.
 
-The responder asks its `IvyContentSource` for that exact selection. It returns
-all requested entries in one bounded response or reports unavailable. The first
-complete response from an expected peer wins and is returned with `servedBy`.
-Ivy checks response shape and request correlation, but treats every identifier
-and byte string as opaque. A selection that cannot fit one frame must be split by
-the caller; Ivy does not paginate or stream a response. The protocol frame body
-is fixed at 4 MiB so every conforming peer and relay enforces the same bound.
+Before invoking `IvyContentSource`, Ivy computes the exact aggregate byte budget
+remaining in one direct or relayed response frame. The source must return every
+selected entry exactly once within that budget. Duplicate, extra, missing, and
+oversized output becomes `contentUnavailable`; partial data is never published
+to the requester.
 
-The caller must validate each identifier against its bytes, interpret links,
-and store accepted data through its own CAS or `Volume` contract. Reporting a
-deficient response only suppresses that peer for the root locally and briefly;
-it is not a global reputation judgment.
+Local and network fetches enforce the same selection contract. Identical callers
+coalesce across the complete provider-search pipeline, not merely one wire
+attempt. The first complete response from an expected authenticated endpoint
+wins and carries `servedBy`. Ivy validates request correlation and response
+shape, but not content addresses.
 
-## Provider hints
+Selections larger than one frame are caller work. Streaming or pagination would
+require application-aware boundaries that Ivy does not possess.
 
-Provider discovery is a routing optimization. A hint associates a root with an
-endpoint and expiry near that root's Kademlia neighborhood. Hints are bounded,
-expire, and may be learned from authenticated peers or successful transfers.
+## Provider discovery
 
-A hint is not proof that the peer stores, pins, validates, or can serve the root.
-It carries no canonicity, ownership, credit, or storage authority. The requester
-authenticates the eventual serving session and validates the returned content at
-the node/storage boundary.
+A provider hint associates a root with a peer, optional endpoint, and expiry near
+that root's Kademlia neighborhood. Hints are bounded and may be learned from
+authenticated announcements or successful transfers.
+
+Hints are evidence about where to try, not what is true. They grant no storage,
+pinning, ownership, canonicity, credit, or authority. A fetch uses this bounded
+fallback order:
+
+1. Try cached endpoints and connected hinted peers.
+2. Query the DHT for fresh endpoints and try previously unattempted peers.
+3. Fall back to other connected endpoints within the candidate limit.
+
+Failed local dialing does not erase the hint. Distinct endpoints for the same
+identity remain distinct until a concrete failed endpoint is excluded, so a bad
+address cannot suppress a healthy replacement address.
+
+The application may report cryptographically invalid or otherwise deficient
+content after its own validation. Ivy then suppresses that peer only for that
+root and only briefly. Availability remains local routing state, not peer-global
+reputation.
 
 ## Peer messages
 
-`peerMessage(topic:payload:)` is the generic signed envelope for node-owned
-protocols. Ivy delivers it one hop and preserves authenticated sender
-attribution, but assigns no meaning to either field. Chain synchronization,
-parent-state continuity, spawn authorization, transaction propagation, and
-block gossip belong in node protocols carried by this envelope.
+`peerMessage(topic:payload:)` is the generic signed envelope for caller-owned
+protocols. Ivy delivers one hop and preserves authenticated sender attribution,
+but assigns no meaning to the topic or payload. Queue acceptance is not delivery
+acknowledgement.
+
+Synchronization, application gossip, continuity proofs, and transaction or
+block semantics belong in protocols carried by this envelope.
 
 ## Carrier relay
 
-Carrier identities are configured explicitly and authenticated separately from
-endpoint peers. A client attempts relay fallback only through those configured
-carriers. Route control is bounded and tied to the authenticated carrier session.
+Carrier endpoints are configured explicitly and authenticate in the carrier
+role. A client attempts relay fallback only through those carriers. Route setup,
+continuations, byte rate, idle time, and per-peer route count are bounded and
+tied to the authenticated carrier session.
 
-Once a route is ready, endpoint session records remain end-to-end signed and are
-nested unchanged inside signed carrier records. The carrier can transport or
-drop them, but cannot become the endpoint identity. Carriers do not enter the
-Kademlia table or provider set. Authenticated close records tear down both ends
-when a route expires or a participant disconnects.
+After setup, endpoint session records remain signed end to end and are nested
+unchanged inside carrier records. The carrier can forward, replay, reorder, or
+drop nested records, but cannot sign as the endpoint. Carriers never enter the
+Kademlia table or provider set. Authenticated close records tear down both route
+ends.
 
-## Library boundary
+## Attribution
 
-| Ivy owns | The node or storage layer owns |
+Ivy assigns peer-global evidence only after verifying the signature of the
+identity being charged.
+
+- Unsigned or unverifiable bytes are unattributed.
+- A signed malformed endpoint payload is attributable to that endpoint, even
+  through a relay.
+- A direct endpoint's signed transport violation is attributable to that
+  endpoint.
+- A replay or sequence failure on a relayed path is not automatically charged
+  to the endpoint because the carrier can replay a valid signed record.
+- Local queue pressure, dial failure, timeout, and content unavailability are
+  not protocol violations.
+
+This keeps Tally limited to peer-global authenticated evidence. Route health,
+provider availability, and endpoint retry state remain inside Ivy.
+
+## Ownership boundary
+
+| Ivy owns | The caller or storage layer owns |
 | --- | --- |
-| Session authentication and replay protection | Process authorization and chain membership |
-| Bounded frames, pending work, and lookups | CID/content validation and DAG interpretation |
-| Endpoint discovery and Kademlia refresh | CAS/`Volume` storage, pinning, and retention |
-| Configured carrier routes | Chain/spawn state and parent-state continuity |
-| Sender attribution and transport violations | Consensus, block/transaction gossip, and canonicity |
-| Authenticated traffic evidence and admission hooks | Fees, credit, settlement, and economic policy |
+| Session authentication and replay protection | Process authorization and membership |
+| Bounded frames, collections, admission, and pending work | Application batching and semantic limits |
+| Endpoint discovery and route maintenance | Service, chain, or shard topology |
+| Configured carrier routes | Carrier business or deployment policy |
+| Exact opaque selection transfer | CID validation and DAG interpretation |
+| Provider hints and local deficiency suppression | CAS/Volume publication, pinning, and retention |
+| Signed sender attribution and transport evidence | Consensus, canonicity, fees, credit, and settlement |
 
-Tally is used only for peer-global transport evidence and admission: authenticated
-bytes, concrete protocol violations, pressure, and challenges. Content
-availability and route outcomes stay local to Ivy; economic settlement does not
-belong here.
+See [correctness-invariants.md](correctness-invariants.md) for the laws used to
+review changes at these boundaries.

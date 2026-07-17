@@ -2,13 +2,15 @@ import Foundation
 import Tally
 
 public protocol IvyContentSource: Sendable {
-    /// Returns exactly the requested content entries it can serve. Ivy treats
-    /// CIDs and bytes as opaque; the aggregate data must not exceed `maxDataBytes`.
+    /// Return every requested entry exactly once within `maxDataBytes`, or `[]`.
+    /// `cids` is canonical and includes `rootCID`. Ivy treats identifiers and
+    /// bytes as opaque.
     func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry]
 }
 
 public struct AttributedContentResponse: Sendable, Equatable {
     public let entries: [String: Data]
+    /// The authenticated remote server, or `nil` for a local-source result.
     public let servedBy: PeerID?
 
     public static let empty = AttributedContentResponse(entries: [:], servedBy: nil)
