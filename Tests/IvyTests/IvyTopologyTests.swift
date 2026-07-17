@@ -124,6 +124,11 @@ struct IvyTopologyTests {
             try config.validate()
         }
 
+        let oversizedFrames = IvyConfig(signingKey: identity(1), maxFrameSize: .max)
+        #expect(throws: IvyModeError.invalidConfiguration("maxFrameSize is outside the supported range")) {
+            try oversizedFrames.validate()
+        }
+
         let invalidHealth = IvyConfig(
             signingKey: identity(1),
             healthConfig: PeerHealthConfig(keepaliveInterval: .zero))

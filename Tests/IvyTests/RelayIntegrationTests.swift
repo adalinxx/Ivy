@@ -38,7 +38,8 @@ struct RelayIntegrationTests {
         try await source.start()
         try await target.connect(to: carrierEndpoint)
         #expect(try await TransportTestHarness.eventually {
-            sourceRecorder.authenticatedPeers.contains {
+            let carrierCount = await carrier.peerConnectionCount
+            return carrierCount == 2 && sourceRecorder.authenticatedPeers.contains {
                 $0.key == carrierKey && $0.role == .carrier
             } && targetRecorder.authenticatedPeers.contains {
                 $0.key == carrierKey && $0.role == .endpoint

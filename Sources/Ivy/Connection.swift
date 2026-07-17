@@ -4,7 +4,8 @@ import NIOFoundationCompat
 import NIOPosix
 
 final class PeerConnection: @unchecked Sendable {
-    static let inboundBufferLimit = 256
+    static let maxInboundBufferedRecords = 256
+    static let inboundBufferByteBudget = Int(IvyConfig.maximumFrameSize)
 
     let connectionID = UUID()
     var endpoint: PeerEndpoint
@@ -17,6 +18,7 @@ final class PeerConnection: @unchecked Sendable {
 
     let transport: Transport
     private let maxFrameSize: UInt32
+    let inboundBufferLimit: Int
     private let stateLock = NSLock()
     private var closed = false
     private let inbound: AsyncStream<Data>
@@ -44,8 +46,9 @@ final class PeerConnection: @unchecked Sendable {
         self.endpoint = endpoint
         self.transport = .direct(channel)
         self.maxFrameSize = maxFrameSize
+        self.inboundBufferLimit = Self.bufferLimit(for: maxFrameSize)
         (self.inbound, self.inboundContinuation) = AsyncStream<Data>.makeStream(
-            bufferingPolicy: .bufferingOldest(Self.inboundBufferLimit))
+            bufferingPolicy: .bufferingOldest(inboundBufferLimit))
     }
 
     init(
@@ -57,8 +60,14 @@ final class PeerConnection: @unchecked Sendable {
         self.endpoint = endpoint
         self.transport = .relayed(routeID: routeID, carrier: carrier)
         self.maxFrameSize = maxFrameSize
+        self.inboundBufferLimit = Self.bufferLimit(for: maxFrameSize)
         (self.inbound, self.inboundContinuation) = AsyncStream<Data>.makeStream(
-            bufferingPolicy: .bufferingOldest(Self.inboundBufferLimit))
+            bufferingPolicy: .bufferingOldest(inboundBufferLimit))
+    }
+
+    private static func bufferLimit(for maxFrameSize: UInt32) -> Int {
+        let frameSize = max(1, Int(maxFrameSize))
+        return max(1, min(maxInboundBufferedRecords, inboundBufferByteBudget / frameSize))
     }
 
     static func dial(

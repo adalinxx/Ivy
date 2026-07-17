@@ -35,7 +35,8 @@ an authenticated claim, not proof of application authority.
 Overlay nodes maintain a bounded Kademlia routing table. `findNode` performs an
 iterative lookup over authenticated endpoint responses. A periodic lookup for a
 random target refreshes the table. Discovered keys and addresses pass local
-admission and address checks before insertion.
+admission and address checks before insertion. Private-address discovery is
+enabled only when the node explicitly advertises a private address for LAN use.
 
 There is no peer-exchange protocol. Pending connections and configured carriers
 never enter endpoint routing. `knownPeerEndpoints` is a read-only snapshot; the
