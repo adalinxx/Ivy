@@ -27,6 +27,8 @@ await ivy.stop()
 
 A socket remains private until its signed session handshake completes.
 `start()` and `stop()` are ordered and restart-safe.
+Sessions authenticate and replay-protect cleartext records; Ivy does not provide
+encryption or forward secrecy.
 
 `IvyMode.overlay` uses authenticated Kademlia discovery. `.pinned(peer:)`
 accepts one endpoint identity and disables public discovery. Configured carriers

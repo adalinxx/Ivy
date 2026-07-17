@@ -545,4 +545,47 @@ struct TCPIntegrationTests {
         await first.stop()
         await server.stop()
     }
+
+    @Test("a pinned reconnect cannot substitute another endpoint identity")
+    func pinnedReconnectRejectsSubstituteIdentity() async throws {
+        let expectedIdentity = TransportTestHarness.identity("reconnect-expected")
+        let substituteIdentity = TransportTestHarness.identity("reconnect-substitute")
+        let clientIdentity = TransportTestHarness.identity("reconnect-pinned-client")
+        let expectedPort = TransportTestHarness.nextPort()
+        let substitutePort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let expectedEndpoint = TransportTestHarness.endpoint(expectedIdentity, port: expectedPort)
+        let expectedID = TransportTestHarness.key(expectedIdentity).peerID
+        let recorder = TransportTestRecorder()
+        let expected = Ivy(config: TransportTestHarness.config(expectedIdentity, port: expectedPort))
+        let substitute = Ivy(config: TransportTestHarness.config(
+            substituteIdentity,
+            port: substitutePort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            bootstrapPeers: [expectedEndpoint],
+            mode: .pinned(peer: expectedID.publicKey)))
+        await client.setTestDelegate(recorder)
+
+        try await expected.start()
+        try await substitute.start()
+        try await client.start()
+        try await recorder.waitForConnect(expectedID)
+
+        await expected.stop()
+        try await recorder.waitForDisconnect(expectedID)
+        await client.setDialEndpointRewriteForTesting { endpoint in
+            PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: substitutePort)
+        }
+        await client.runPendingReconnectForTesting(expectedID)
+
+        #expect(await client.peerConnectionCount == 0)
+        #expect(await substitute.peerConnectionCount == 0)
+        await client.stop()
+        await substitute.stop()
+    }
 }

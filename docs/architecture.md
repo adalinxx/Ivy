@@ -15,7 +15,8 @@ SwiftNIO: direct TCP or configured carrier
 
 Inbound capacity is reserved by global and netgroup limits before automatic
 reads begin. Rejected sockets cannot buffer protocol input while waiting for the
-Ivy actor.
+Ivy actor. Capacity is a hard cap: Ivy rejects excess peers rather than evicting
+an authenticated connection by reputation.
 
 A pending socket is absent from routing, delegates, content, and application
 messages. Promotion requires a signed transcript over both identities, fresh
@@ -24,7 +25,8 @@ finish.
 
 Application records bind sender, receiver, session ID, sequence, and payload.
 Receive sequences strictly increase. Simultaneous sessions for one peer and
-role converge on the smaller session ID.
+role converge on the smaller session ID. Records are signed but not encrypted;
+confidentiality and forward secrecy belong above or below Ivy.
 
 ## Bounds
 
@@ -38,7 +40,9 @@ role converge on the smaller session ID.
 - Content framing overhead is subtracted before storage materializes bytes.
 
 Tally gates authenticated application work using peer-global traffic evidence
-and pressure. Local rate denial is not a protocol violation.
+and pressure. A relay packet's full signed carrier payload is recorded before
+forwarding admission, so relayed bytes consume the same peer budget as direct
+traffic. Local rate denial is not a protocol violation.
 
 ## Routing and content
 

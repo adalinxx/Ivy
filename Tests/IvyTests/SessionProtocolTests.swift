@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import NIOEmbedded
 import Testing
 @testable import Ivy
 
@@ -73,6 +74,11 @@ struct SessionProtocolTests {
             "495659080100000088" + helloIHex + String(repeating: "55", count: 64)))
         #expect(SessionWireRecord.helloInitiator(signedI).serialize() == expectedWireI)
         #expect(try SessionWireRecord.deserialize(expectedWireI) == .helloInitiator(signedI))
+        var legacyWireI = expectedWireI
+        legacyWireI[legacyWireI.startIndex + 3] = 0x07
+        #expect(throws: (any Error).self) {
+            try SessionWireRecord.deserialize(legacyWireI)
+        }
 
         let helloR = SessionHelloResponder(
             routeBinding: route,
@@ -222,12 +228,56 @@ struct SessionProtocolTests {
         #expect(gap)
         #expect(!replay)
         #expect(!earlier)
+        #expect(!receive.canAcceptIncoming(9))
+        #expect(receive.canAcceptIncoming(10))
 
         var send = SessionSequenceState(nextToSend: UInt64.max)
         let last = send.takeNextOutgoing()
         let exhausted = send.takeNextOutgoing()
         #expect(last == UInt64.max)
         #expect(exhausted == nil)
+    }
+
+    @Test("direct handshake rejects a mismatched route binding")
+    func directRouteBindingMismatch() async throws {
+        let localIdentity = identity(1)
+        let remoteIdentity = identity(2)
+        let local = peerKey(localIdentity)
+        let remote = peerKey(remoteIdentity)
+        let ivy = Ivy(config: IvyConfig(signingKey: localIdentity, stunServers: []))
+        let channel = EmbeddedChannel()
+        defer { _ = try? channel.finish() }
+        let connection = PeerConnection(
+            endpoint: PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001),
+            channel: channel,
+            inboundByteBudget: InboundByteBudget(limit: IvyConfig.defaultMaxInboundBufferedBytes))
+        let metadata = try #require(PeerMetadata().encode())
+        let matching = SessionHelloInitiator(
+            routeBinding: Ivy.directRouteBinding,
+            initiator: remote,
+            responder: local,
+            nonce: Data(repeating: 1, count: 32),
+            metadata: metadata)
+        let mismatched = SessionHelloInitiator(
+            routeBinding: Data(repeating: 1, count: 32),
+            initiator: remote,
+            responder: local,
+            nonce: matching.nonce,
+            metadata: metadata)
+
+        let acceptsMatching = await ivy.acceptsInboundHello(matching, on: connection)
+        let acceptsMismatched = await ivy.acceptsInboundHello(mismatched, on: connection)
+        #expect(acceptsMatching)
+        #expect(!acceptsMismatched)
+    }
+
+    @Test("duplicate sessions prefer the smaller session ID")
+    func preferredSessionID() throws {
+        let smaller = try SessionID(bytes: Data(repeating: 1, count: 32))
+        let larger = try SessionID(bytes: Data(repeating: 2, count: 32))
+
+        #expect(Ivy.preferredSessionID(larger, smaller) == smaller)
+        #expect(Ivy.preferredSessionID(smaller, larger) == smaller)
     }
 
     @Test("application frames are not session records")
