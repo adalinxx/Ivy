@@ -18,7 +18,7 @@ private actor BlockingContentSource: IvyContentSource {
     private var starts = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    func content(rootCID: String, cids: [String]) async -> [ContentEntry] {
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
         starts += 1
         await withCheckedContinuation { waiters.append($0) }
         return []
@@ -35,21 +35,29 @@ private actor BlockingContentSource: IvyContentSource {
 
 private actor TestContentSource: IvyContentSource {
     let entries: [String: Data]
-    private var receivedRequests: [(rootCID: String, cids: [String])] = []
+    private var receivedRequests: [(rootCID: String, cids: [String], maxDataBytes: Int)] = []
 
     init(entries: [String: Data]) {
         self.entries = entries
     }
 
-    func content(rootCID: String, cids: [String]) -> [ContentEntry] {
-        receivedRequests.append((rootCID, cids))
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        receivedRequests.append((rootCID, cids, maxDataBytes))
         return cids.compactMap { cid in
             entries[cid].map { ContentEntry(cid: cid, data: $0) }
         }
     }
 
-    func requests() -> [(rootCID: String, cids: [String])] {
+    func requests() -> [(rootCID: String, cids: [String], maxDataBytes: Int)] {
         receivedRequests
+    }
+}
+
+private struct RawContentSource: IvyContentSource {
+    let entries: [ContentEntry]
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        entries
     }
 }
 
@@ -87,6 +95,49 @@ struct ContentExchangeTests {
         #expect(requests.count == 1)
         #expect(requests.first?.rootCID == "root")
         #expect(requests.first?.cids == ["root", "child-a", "child-b"])
+        #expect(requests.first?.maxDataBytes == Message.contentResponseDataBudget(
+            for: ["root", "child-a", "child-b"],
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: false))
+    }
+
+    @Test("remote selection receives the exact direct aggregate data budget")
+    func remoteSelectionBudget() async {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "budgeted-content-server",
+            listenPort: 0))
+        let source = TestContentSource(entries: ["root": Data()])
+        await ivy.setContentSource(source)
+
+        await ivy.handleContentRequest(
+            requestID: 1,
+            rootCID: "root",
+            cids: [],
+            from: PeerID(publicKey: deterministicTestPeerKey("budgeted-content-client")))
+
+        let request = await source.requests().first
+        #expect(request?.cids == ["root"])
+        #expect(request?.maxDataBytes == Message.contentResponseDataBudget(
+            for: ["root"],
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: false))
+        #expect(request?.maxDataBytes != .max)
+    }
+
+    @Test("structurally impossible exact selection does not invoke storage")
+    func impossibleSelection() async {
+        let ivy = node("impossible-content-server")
+        let source = TestContentSource(entries: [:])
+        await ivy.setContentSource(source)
+        let cids = (0..<Int(MessageLimits.maxContentCIDCount)).map { "child-\($0)" }
+
+        await ivy.handleContentRequest(
+            requestID: 1,
+            rootCID: "root",
+            cids: cids,
+            from: PeerID(publicKey: deterministicTestPeerKey("impossible-content-client")))
+
+        #expect(await source.requests().isEmpty)
     }
 
     @Test("an empty selected identifier rejects the request")
@@ -111,6 +162,28 @@ struct ContentExchangeTests {
 
         #expect(response == .empty)
         #expect((await source.requests()).first?.cids == ["root", "missing-child"])
+    }
+
+    @Test("source output must exactly match the requested selection")
+    func exactSourceShape() async {
+        let ivy = node("exact-source-shape")
+        let root = ContentEntry(cid: "root", data: Data("root".utf8))
+        let child = ContentEntry(cid: "child", data: Data("child".utf8))
+
+        await ivy.setContentSource(RawContentSource(entries: [child, root]))
+        #expect(await ivy.fetchContent(rootCID: "root", cids: ["child"]).entries == [
+            "root": root.data,
+            "child": child.data,
+        ])
+
+        for invalid in [
+            [root, root],
+            [root, ContentEntry(cid: "extra", data: Data())],
+            [root],
+        ] {
+            await ivy.setContentSource(RawContentSource(entries: invalid))
+            #expect(await ivy.fetchContent(rootCID: "root", cids: ["child"]) == .empty)
+        }
     }
 
     @Test("only a complete response from an expected candidate resolves a fetch")

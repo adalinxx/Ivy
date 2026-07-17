@@ -94,4 +94,62 @@ struct RelayIntegrationTests {
         await source.stop()
         await carrier.stop()
     }
+
+    @Test("relay admission failure closes the route promptly")
+    func relayAdmissionFailureClosesRoute() async throws {
+        let carrierIdentity = TransportTestHarness.identity("relay-full-carrier")
+        let sourceIdentity = TransportTestHarness.identity("relay-full-source")
+        let targetIdentity = TransportTestHarness.identity("relay-full-target")
+        let carrierPort = TransportTestHarness.nextPort()
+        let sourcePort = TransportTestHarness.nextPort()
+        let targetPort = TransportTestHarness.nextPort()
+        let carrierEndpoint = TransportTestHarness.endpoint(carrierIdentity, port: carrierPort)
+        let targetEndpoint = TransportTestHarness.endpoint(targetIdentity, port: targetPort)
+        let carrier = Ivy(config: TransportTestHarness.config(
+            carrierIdentity,
+            port: carrierPort,
+            relayEnabled: true))
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: sourcePort,
+            carriers: [carrierEndpoint],
+            mode: .pinned(peer: targetEndpoint.publicKey)))
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            maxConnections: 1))
+
+        try await carrier.start()
+        try await target.start()
+        try await source.start()
+        try await target.connect(to: carrierEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await carrier.peerConnectionCount == 2
+        })
+
+        let completedPromptly = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do {
+                    try await source.connectViaRelay(to: targetEndpoint)
+                } catch {
+                    return true
+                }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                await source.stop()
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(completedPromptly)
+        #expect(await target.peerConnectionCount == 1)
+
+        await source.stop()
+        await target.stop()
+        await carrier.stop()
+    }
 }

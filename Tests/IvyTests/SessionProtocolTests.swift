@@ -155,4 +155,16 @@ struct SessionProtocolTests {
             try SessionWireRecord.deserialize(Message.ping(nonce: 1).serialize())
         }
     }
+
+    @Test("protocol violations require endpoint-authenticated evidence")
+    func violationAttribution() {
+        let peer = peerKey(identity(3))
+
+        #expect(Ivy.attributedPeer(peer, direct: true, evidence: .unverified) == nil)
+        #expect(Ivy.attributedPeer(peer, direct: false, evidence: .unverified) == nil)
+        #expect(Ivy.attributedPeer(peer, direct: true, evidence: .signedTransport) == peer)
+        #expect(Ivy.attributedPeer(peer, direct: false, evidence: .signedTransport) == nil)
+        #expect(Ivy.attributedPeer(peer, direct: true, evidence: .signedPayload) == peer)
+        #expect(Ivy.attributedPeer(peer, direct: false, evidence: .signedPayload) == peer)
+    }
 }

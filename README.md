@@ -48,7 +48,8 @@ entry and identifies the authenticated serving peer; otherwise it is empty. The
 caller validates identifiers and bytes, then decides what to retain or store.
 
 Implement `IvyContentSource` and register it with `setContentSource(_:)` to serve
-the same exact-selection contract.
+the same exact-selection contract. Ivy passes the exact aggregate data budget
+that can fit the selection in one authenticated protocol frame.
 
 ## Send node messages
 

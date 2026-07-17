@@ -1,9 +1,27 @@
+import Crypto
 import Foundation
 import Testing
 @testable import Ivy
 
 @Suite("Message")
 struct MessageTests {
+    private func signedDataRecord(_ payload: Data, keyByte: UInt8) throws -> SessionWireRecord {
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: keyByte, count: 32))
+        let receiverKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: keyByte + 1, count: 32))
+        let sender = try PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation)
+        let receiver = try PeerKey(rawRepresentation: receiverKey.publicKey.rawRepresentation)
+        let record = try SessionDataRecord.sign(
+            sessionID: SessionID(bytes: Data(repeating: keyByte, count: 32)),
+            sender: sender,
+            receiver: receiver,
+            sequence: 1,
+            payload: payload,
+            with: signingKey)
+        return .data(record)
+    }
+
     @Test("every v8 message roundtrips canonically")
     func roundtrip() throws {
         let endpoint = PeerEndpoint(publicKey: "peer", host: "192.0.2.1", port: 4001)
@@ -66,6 +84,66 @@ struct MessageTests {
         }
         #expect(responseID == 11)
         #expect(decoded == entries)
+    }
+
+    @Test("content response budgets exactly include direct and relayed framing")
+    func contentResponseBudgets() throws {
+        let frameSize: UInt32 = 512
+        let cids = ["root", "child"]
+        let directBudget = try #require(Message.contentResponseDataBudget(
+            for: cids,
+            maxFrameSize: frameSize,
+            relayed: false))
+        let relayedBudget = try #require(Message.contentResponseDataBudget(
+            for: cids,
+            maxFrameSize: frameSize,
+            relayed: true))
+        #expect(directBudget == 367)
+        #expect(relayedBudget == 217)
+
+        func response(_ dataBytes: Int) -> Data {
+            Message.contentResponse(requestID: 1, entries: [
+                ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: dataBytes)),
+                ContentEntry(cid: "child", data: Data()),
+            ]).serialize(maxFrameSize: frameSize)
+        }
+
+        #expect(try signedDataRecord(response(directBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+        #expect(try signedDataRecord(response(directBudget + 1), keyByte: 1)
+            .serialize(maxPayload: frameSize).isEmpty)
+
+        let routeID = Data(repeating: 0x44, count: 32)
+        let endpointRecord = try signedDataRecord(response(relayedBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize)
+        let relayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: endpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(relayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+
+        let oversizedEndpointRecord = try signedDataRecord(response(relayedBudget + 1), keyByte: 1)
+            .serialize(maxPayload: frameSize)
+        let oversizedRelayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: oversizedEndpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(oversizedRelayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).isEmpty)
+    }
+
+    @Test("content response serialization preflights its exact aggregate size")
+    func contentResponsePreflight() {
+        let exact = Message.contentResponse(
+            requestID: 1,
+            entries: [ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: 11))])
+        let oversized = Message.contentResponse(
+            requestID: 1,
+            entries: [ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: 12))])
+
+        #expect(exact.serialize(maxFrameSize: 32).count == 32)
+        #expect(oversized.serialize(maxFrameSize: 32).isEmpty)
     }
 
     @Test("malformed messages and invalid identifiers are rejected")

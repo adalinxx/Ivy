@@ -65,6 +65,7 @@ public struct PeerMetadata: Sendable, Equatable {
 
 struct SessionHelloInitiator: Sendable, Equatable {
     static let version: UInt16 = 8
+    static let encodedOverhead = 2 + (4 * PeerKey.byteCount) + 4
 
     let routeBinding: Data
     let initiator: PeerKey
@@ -109,6 +110,8 @@ struct SessionHelloInitiator: Sendable, Equatable {
 }
 
 struct SessionHelloResponder: Sendable, Equatable {
+    static let encodedOverhead = 2 + (5 * PeerKey.byteCount) + 4
+
     let routeBinding: Data
     let responder: PeerKey
     let initiator: PeerKey
@@ -351,13 +354,14 @@ struct SessionSequenceState: Sendable, Equatable {
 
 enum SessionWireRecord: Sendable, Equatable {
     private static let magic = Data([0x49, 0x56, 0x59, 0x08])
+    static let dataRecordOverhead = magic.count + 1 + 32 + 8 + 4 + 64
 
     case helloInitiator(SignedSessionHelloInitiator)
     case helloResponder(SignedSessionHelloResponder)
     case finish(SessionFinish)
     case data(SessionDataRecord)
 
-    func serialize(maxPayload: UInt32 = IvyConfig.defaultMaxFrameSize) -> Data {
+    func serialize(maxPayload: UInt32 = IvyConfig.protocolMaxFrameSize) -> Data {
         var bytes = Self.magic
         switch self {
         case .helloInitiator(let signed):
@@ -388,21 +392,23 @@ enum SessionWireRecord: Sendable, Equatable {
         return bytes.count <= Int(maxPayload) ? bytes : Data()
     }
 
-    static func deserialize(_ data: Data, maxPayload: UInt32 = IvyConfig.defaultMaxFrameSize) throws -> Self {
+    static func deserialize(_ data: Data, maxPayload: UInt32 = IvyConfig.protocolMaxFrameSize) throws -> Self {
         var reader = SessionReader(data)
         guard reader.read(count: magic.count) == magic, let tag = reader.readUInt8() else {
             throw SessionProtocolError.malformed
         }
         switch tag {
         case 1:
-            guard let bytes = reader.readData(max: PeerMetadata.maxEncodedSize + 128),
+            guard let bytes = reader.readData(
+                    max: PeerMetadata.maxEncodedSize + SessionHelloInitiator.encodedOverhead),
                   let signature = reader.read(count: 64), reader.isAtEnd else {
                 throw SessionProtocolError.malformed
             }
             return .helloInitiator(SignedSessionHelloInitiator(
                 hello: try SessionHelloInitiator.decode(bytes), signature: signature))
         case 2:
-            guard let bytes = reader.readData(max: PeerMetadata.maxEncodedSize + 160),
+            guard let bytes = reader.readData(
+                    max: PeerMetadata.maxEncodedSize + SessionHelloResponder.encodedOverhead),
                   let signature = reader.read(count: 64), reader.isAtEnd else {
                 throw SessionProtocolError.malformed
             }

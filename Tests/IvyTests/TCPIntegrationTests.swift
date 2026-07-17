@@ -39,8 +39,8 @@ enum TransportTestHarness {
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay,
         relayEnabled: Bool = false,
-        maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize,
-        maxConnections: Int = IvyConfig.defaultMaxConnections
+        maxConnections: Int = IvyConfig.defaultMaxConnections,
+        maxContentCandidates: Int = 8
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
@@ -50,9 +50,9 @@ enum TransportTestHarness {
             relayTimeout: .seconds(1),
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
-            maxFrameSize: maxFrameSize,
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
+            maxContentCandidates: maxContentCandidates,
             externalAddress: ("127.0.0.1", port),
             relayEnabled: relayEnabled,
             carriers: carriers,
@@ -104,10 +104,22 @@ final class TransportTestContentSource: IvyContentSource, Sendable {
         self.entries = entries
     }
 
-    func content(rootCID: String, cids: [String]) async -> [ContentEntry] {
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
         cids.compactMap { cid in
             entries[cid].map { ContentEntry(cid: cid, data: $0) }
         }
+    }
+}
+
+final class TransportRawContentSource: IvyContentSource, Sendable {
+    private let selections: [String: [ContentEntry]]
+
+    init(_ selections: [String: [ContentEntry]]) {
+        self.selections = selections
+    }
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
+        selections[rootCID] ?? []
     }
 }
 
@@ -274,6 +286,77 @@ struct TCPIntegrationTests {
             child: Data("child bytes".utf8),
         ])
         #expect(response.servedBy == serverID)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("storage cannot exceed the aggregate content budget")
+    func oversizedContentSource() async throws {
+        let serverIdentity = TransportTestHarness.identity("tcp-oversized-content-server")
+        let clientIdentity = TransportTestHarness.identity("tcp-oversized-content-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let budget = try #require(Message.contentResponseDataBudget(
+            for: ["root"],
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: false))
+        let source = TransportTestContentSource([
+            "root": Data(repeating: 0xaa, count: budget + 1),
+        ])
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 1
+        })
+
+        let response = await client.fetchContent(
+            ContentRequestKey(rootCID: "root", cids: []),
+            from: [serverID])
+        #expect(response == .empty)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("remote source output must exactly match the requested selection")
+    func malformedContentSource() async throws {
+        let serverIdentity = TransportTestHarness.identity("tcp-malformed-content-server")
+        let clientIdentity = TransportTestHarness.identity("tcp-malformed-content-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let duplicateRoot = ContentEntry(cid: "duplicate", data: Data())
+        let extraRoot = ContentEntry(cid: "extra-root", data: Data())
+        let missingRoot = ContentEntry(cid: "missing-child", data: Data())
+        let source = TransportRawContentSource([
+            "duplicate": [duplicateRoot, duplicateRoot],
+            "extra-root": [extraRoot, ContentEntry(cid: "unrequested", data: Data())],
+            "missing-child": [missingRoot],
+        ])
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 1
+        })
+
+        for root in ["duplicate", "extra-root", "missing-child"] {
+            let response = await client.fetchContent(
+                ContentRequestKey(rootCID: root, cids: ["child"]),
+                from: [serverID])
+            #expect(response == .empty)
+        }
 
         await client.stop()
         await server.stop()
