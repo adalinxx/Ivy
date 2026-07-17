@@ -383,17 +383,32 @@ struct TCPIntegrationTests {
             port: leftPort))
         _ = try await (leftDial, rightDial)
 
+        let rightID = TransportTestHarness.key(rightIdentity).peerID
+        let leftID = TransportTestHarness.key(leftIdentity).peerID
         #expect(try await TransportTestHarness.eventually {
             let leftCount = await left.peerConnectionCount
             let rightCount = await right.peerConnectionCount
-            return leftCount == 1 && rightCount == 1
+            let leftSession = await left.selectedSessionIDForTesting(rightID)
+            let rightSession = await right.selectedSessionIDForTesting(leftID)
+            let leftPending = await left.pendingSessionCountForTesting
+            let rightPending = await right.pendingSessionCountForTesting
+            return leftCount == 1
+                && rightCount == 1
+                && leftSession != nil
+                && leftSession == rightSession
+                && leftPending == 0
+                && rightPending == 0
         })
-        let rightID = TransportTestHarness.key(rightIdentity).peerID
-        let leftID = TransportTestHarness.key(leftIdentity).peerID
-        #expect(await left.sendMessage(
+        let result = await left.sendMessage(
             to: rightID,
             topic: "cross-dial",
-            payload: Data("still live".utf8)) != .notConnected)
+            payload: Data("still live".utf8))
+        guard case .enqueued = result else {
+            Issue.record("converged session rejected the first application message: \(result)")
+            await right.stop()
+            await left.stop()
+            return
+        }
         #expect(try await TransportTestHarness.eventually {
             recorder.receivedMessage(
                 topic: "cross-dial",

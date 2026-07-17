@@ -10,15 +10,15 @@ Authentication proves a peer key, never application authority.
 | IVY-004 | Accepted records bind sender, receiver, session, sequence, and payload; sequences never replay or wrap. |
 | IVY-005 | Duplicate sessions for one peer and role converge on the smaller session ID. |
 | IVY-006 | Endpoint and carrier identities are disjoint; carriers never enter endpoint routing. |
-| IVY-007 | Work from an old run or replaced operation cannot mutate successor state. |
-| IVY-008 | Frames, fields, connections, pending work, routing, hints, and routes are bounded. |
+| IVY-007 | Work from an old run, operation, or authenticated session cannot mutate or reply through successor state. |
+| IVY-008 | Frames, fields, connections, pending work, routing, hints, routes, and all partial or queued inbound bytes are bounded. |
 | IVY-009 | One 4 MiB frame-body cap and one 64 KiB metadata cap apply on every route. |
 | IVY-010 | Exact route overhead is removed before a content source materializes bytes. |
 | IVY-011 | Content is request-correlated and exact, or unavailable; partial success is impossible. |
 | IVY-012 | Ivy treats identifiers and bytes as opaque and never traverses or stores a DAG. |
 | IVY-013 | Equal fetches coalesce across the whole bounded provider-search pipeline. |
 | IVY-014 | Provider records are expiring hints and grant no possession, validity, or authority. |
-| IVY-015 | Public discovery uses authenticated Kademlia responses and admitted addresses; there is no PEX. |
+| IVY-015 | Public discovery returns admitted candidates; only authenticated promotion installs routing state, and there is no PEX. |
 | IVY-016 | Relay uses configured carriers while preserving end-to-end endpoint identity. |
 | IVY-017 | Peer-global blame requires that peer's verified signature; carrier-controlled ambiguity remains unattributed. |
 | IVY-018 | Queue acceptance does not assert receipt, application acceptance, or durability. |

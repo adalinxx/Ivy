@@ -267,4 +267,53 @@ struct ContentExchangeTests {
         _ = await second.value
         #expect(await ivy.servingContentCount() == 0)
     }
+
+    @Test("a replaced session cannot deliver a stale content reply")
+    func staleSessionReply() async throws {
+        let ivy = node("stale-content-server")
+        let source = BlockingContentSource()
+        await ivy.setContentSource(source)
+        let peerKey = try PeerKey(deterministicTestPeerKey("stale-content-client"))
+        let oldConnection = try connection(peerKey: peerKey, marker: 1)
+        let newConnection = try connection(peerKey: peerKey, marker: 2)
+
+        let oldRequest = Task {
+            await ivy.handleContentRequestForTesting(
+                connection: oldConnection,
+                peerKey: peerKey,
+                sessionMarker: 1,
+                requestID: 7)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await source.startedCount() == 1
+        })
+
+        let newRequest = Task {
+            await ivy.handleContentRequestForTesting(
+                connection: newConnection,
+                peerKey: peerKey,
+                sessionMarker: 2,
+                requestID: 7)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await source.startedCount() == 2
+        })
+
+        await source.releaseAll()
+        _ = await oldRequest.value
+        _ = await newRequest.value
+
+        #expect(await ivy.sentContentRepliesForTesting == [newConnection.connectionID])
+        await ivy.stop()
+    }
+
+    private func connection(
+        peerKey: PeerKey,
+        marker: UInt8
+    ) throws -> PeerConnection {
+        PeerConnection(
+            endpoint: PeerEndpoint(publicKey: peerKey.hex, host: "relay", port: 0),
+            routeID: Data(repeating: marker, count: 32),
+            carrier: try PeerKey(deterministicTestPeerKey("stale-content-carrier")))
+    }
 }

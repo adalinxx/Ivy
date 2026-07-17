@@ -65,9 +65,53 @@ final class InboundAdmissionLease: @unchecked Sendable {
     deinit { release() }
 }
 
+final class InboundByteBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    let limit: Int
+    private var used = 0
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func acquire(_ byteCount: Int) -> InboundByteLease? {
+        guard byteCount >= 0 else { return nil }
+        return lock.withLock {
+            guard byteCount <= limit - used else { return nil }
+            used += byteCount
+            return InboundByteLease { [weak self] in self?.release(byteCount) }
+        }
+    }
+
+    var currentUsage: Int { lock.withLock { used } }
+
+    private func release(_ byteCount: Int) {
+        lock.withLock { used -= byteCount }
+    }
+}
+
+final class InboundByteLease: @unchecked Sendable {
+    private let releaseAction: () -> Void
+
+    init(release: @escaping () -> Void) {
+        releaseAction = release
+    }
+
+    deinit { releaseAction() }
+}
+
+struct InboundFrame: Sendable {
+    let bytes: Data
+    private let lease: InboundByteLease
+
+    init(bytes: Data, lease: InboundByteLease) {
+        self.bytes = bytes
+        self.lease = lease
+    }
+}
+
 final class PeerConnection: @unchecked Sendable {
-    static let maxInboundBufferedRecords = 256
-    static let inboundBufferByteBudget = 4 * Int(IvyConfig.protocolMaxFrameSize)
+    static let maxInboundBufferedRecords = 4
 
     let connectionID = UUID()
     var endpoint: PeerEndpoint
@@ -83,8 +127,9 @@ final class PeerConnection: @unchecked Sendable {
     private let stateLock = NSLock()
     private var closed = false
     private var inboundAdmission: InboundAdmissionLease?
-    private let inbound: AsyncStream<Data>
-    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private let inboundByteBudget: InboundByteBudget
+    private let inbound: AsyncStream<InboundFrame>
+    private let inboundContinuation: AsyncStream<InboundFrame>.Continuation
 
     var channel: Channel? {
         guard case .direct(let channel) = transport else { return nil }
@@ -103,46 +148,50 @@ final class PeerConnection: @unchecked Sendable {
     init(
         endpoint: PeerEndpoint,
         channel: Channel,
-        inboundAdmission: InboundAdmissionLease? = nil
+        inboundAdmission: InboundAdmissionLease? = nil,
+        inboundByteBudget: InboundByteBudget = InboundByteBudget(
+            limit: IvyConfig.defaultMaxInboundBufferedBytes)
     ) {
         self.endpoint = endpoint
         self.transport = .direct(channel)
         self.inboundAdmission = inboundAdmission
-        self.inboundBufferLimit = Self.bufferLimit
-        (self.inbound, self.inboundContinuation) = AsyncStream<Data>.makeStream(
+        self.inboundByteBudget = inboundByteBudget
+        self.inboundBufferLimit = Self.maxInboundBufferedRecords
+        (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
             bufferingPolicy: .bufferingOldest(inboundBufferLimit))
     }
 
     init(
         endpoint: PeerEndpoint,
         routeID: Data,
-        carrier: PeerKey
+        carrier: PeerKey,
+        inboundByteBudget: InboundByteBudget = InboundByteBudget(
+            limit: IvyConfig.defaultMaxInboundBufferedBytes)
     ) {
         self.endpoint = endpoint
         self.transport = .relayed(routeID: routeID, carrier: carrier)
-        self.inboundBufferLimit = Self.bufferLimit
-        (self.inbound, self.inboundContinuation) = AsyncStream<Data>.makeStream(
+        self.inboundByteBudget = inboundByteBudget
+        self.inboundBufferLimit = Self.maxInboundBufferedRecords
+        (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
             bufferingPolicy: .bufferingOldest(inboundBufferLimit))
-    }
-
-    private static var bufferLimit: Int {
-        max(1, min(
-            maxInboundBufferedRecords,
-            inboundBufferByteBudget / Int(IvyConfig.protocolMaxFrameSize)))
     }
 
     static func dial(
         endpoint: PeerEndpoint,
-        group: EventLoopGroup
+        group: EventLoopGroup,
+        inboundByteBudget: InboundByteBudget
     ) async throws -> PeerConnection {
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(5))
             .channelInitializer { channel in
-                channel.pipeline.addHandler(SessionFrameDecoder())
+                channel.pipeline.addHandler(SessionFrameDecoder(budget: inboundByteBudget))
             }
 
         let channel = try await bootstrap.connect(host: endpoint.host, port: Int(endpoint.port)).get()
-        let connection = PeerConnection(endpoint: endpoint, channel: channel)
+        let connection = PeerConnection(
+            endpoint: endpoint,
+            channel: channel,
+            inboundByteBudget: inboundByteBudget)
         connection.observedHost = channel.remoteAddress?.ipAddress
         try await channel.pipeline.addHandler(PeerChannelHandler(connection: connection)).get()
         return connection
@@ -171,7 +220,7 @@ final class PeerConnection: @unchecked Sendable {
         return true
     }
 
-    var records: AsyncStream<Data> { inbound }
+    var records: AsyncStream<InboundFrame> { inbound }
     var isDirect: Bool { if case .direct = transport { return true }; return false }
     var isLive: Bool { !isClosed && (channel?.isActive ?? true) }
 
@@ -197,8 +246,19 @@ final class PeerConnection: @unchecked Sendable {
 
     @discardableResult
     func feedRecord(_ data: Data) -> Bool {
+        guard !data.isEmpty,
+              data.count <= Int(IvyConfig.protocolMaxFrameSize),
+              let lease = inboundByteBudget.acquire(data.count) else {
+            cancel()
+            return false
+        }
+        return feedFrame(InboundFrame(bytes: data, lease: lease))
+    }
+
+    @discardableResult
+    func feedFrame(_ frame: InboundFrame) -> Bool {
         guard !isClosed else { return false }
-        switch inboundContinuation.yield(data) {
+        switch inboundContinuation.yield(frame) {
         case .enqueued:
             return true
         case .dropped, .terminated:
@@ -226,39 +286,102 @@ final class PeerConnection: @unchecked Sendable {
 
 final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
-    typealias InboundOut = Data
+    typealias InboundOut = InboundFrame
 
     private let maxFrameSize: UInt32
-    private var buffer = ByteBuffer()
+    private let budget: InboundByteBudget
+    private var header: [UInt8] = []
+    private var headerLease: InboundByteLease?
+    private var expectedBodyLength: Int?
+    private var body = Data()
+    private var bodyLease: InboundByteLease?
 
-    init(maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize) {
+    init(
+        maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize,
+        budget: InboundByteBudget = InboundByteBudget(
+            limit: IvyConfig.defaultMaxInboundBufferedBytes)
+    ) {
         self.maxFrameSize = maxFrameSize
+        self.budget = budget
+        header.reserveCapacity(4)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var incoming = unwrapInboundIn(data)
-        buffer.writeBuffer(&incoming)
 
-        while buffer.readableBytes >= 4 {
-            guard let length = buffer.getInteger(
-                at: buffer.readerIndex,
-                endianness: .big,
-                as: UInt32.self) else { break }
-            guard length > 0, length <= maxFrameSize else {
-                context.close(promise: nil)
+        while incoming.readableBytes > 0 {
+            if expectedBodyLength == nil {
+                if header.isEmpty {
+                    guard let lease = budget.acquire(4) else {
+                        close(context)
+                        return
+                    }
+                    headerLease = lease
+                }
+                let count = min(4 - header.count, incoming.readableBytes)
+                guard let bytes = incoming.readBytes(length: count) else { return }
+                header.append(contentsOf: bytes)
+                guard header.count == 4 else { return }
+
+                let length = UInt32(header[0]) << 24
+                    | UInt32(header[1]) << 16
+                    | UInt32(header[2]) << 8
+                    | UInt32(header[3])
+                guard length > 0, length <= maxFrameSize,
+                      let lease = budget.acquire(Int(length)) else {
+                    close(context)
+                    return
+                }
+                bodyLease = lease
+                expectedBodyLength = Int(length)
+                body.reserveCapacity(Int(length))
+                header.removeAll(keepingCapacity: true)
+                headerLease = nil
+            }
+
+            guard let expectedBodyLength else { continue }
+            let count = min(expectedBodyLength - body.count, incoming.readableBytes)
+            guard let bytes = incoming.readData(length: count) else { return }
+            body.append(bytes)
+            guard body.count == expectedBodyLength else { return }
+            guard let lease = bodyLease else {
+                close(context)
                 return
             }
-            guard buffer.readableBytes >= 4 + Int(length) else { break }
-            buffer.moveReaderIndex(forwardBy: 4)
-            guard let data = buffer.readData(length: Int(length)) else { break }
-            context.fireChannelRead(wrapInboundOut(data))
+
+            let frame = InboundFrame(bytes: body, lease: lease)
+            body = Data()
+            bodyLease = nil
+            self.expectedBodyLength = nil
+            context.fireChannelRead(wrapInboundOut(frame))
         }
-        buffer.discardReadBytes()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        reset()
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        reset()
+        context.fireChannelInactive()
+    }
+
+    private func close(_ context: ChannelHandlerContext) {
+        reset()
+        context.close(promise: nil)
+    }
+
+    private func reset() {
+        header.removeAll(keepingCapacity: true)
+        headerLease = nil
+        expectedBodyLength = nil
+        body = Data()
+        bodyLease = nil
     }
 }
 
 final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = Data
+    typealias InboundIn = InboundFrame
 
     let connection: PeerConnection
 
@@ -267,7 +390,7 @@ final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        if !connection.feedRecord(unwrapInboundIn(data)) {
+        if !connection.feedFrame(unwrapInboundIn(data)) {
             context.close(promise: nil)
         }
     }
@@ -282,21 +405,24 @@ final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
 }
 
 final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = Data
+    typealias InboundIn = InboundFrame
 
     let ivy: Ivy
     private let generation: UInt64
     private let admissionGate: InboundAdmissionGate
+    private let inboundByteBudget: InboundByteBudget
     private var connection: PeerConnection?
 
     init(
         ivy: Ivy,
         generation: UInt64,
-        admissionGate: InboundAdmissionGate
+        admissionGate: InboundAdmissionGate,
+        inboundByteBudget: InboundByteBudget
     ) {
         self.ivy = ivy
         self.generation = generation
         self.admissionGate = admissionGate
+        self.inboundByteBudget = inboundByteBudget
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -311,7 +437,8 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
         let connection = PeerConnection(
             endpoint: endpoint,
             channel: channel,
-            inboundAdmission: lease)
+            inboundAdmission: lease,
+            inboundByteBudget: inboundByteBudget)
         connection.observedHost = observedHost
         self.connection = connection
         Task {
@@ -327,7 +454,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        if connection?.feedRecord(unwrapInboundIn(data)) == false {
+        if connection?.feedFrame(unwrapInboundIn(data)) == false {
             context.close(promise: nil)
         }
     }

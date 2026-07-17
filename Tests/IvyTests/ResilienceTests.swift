@@ -43,25 +43,49 @@ struct ResilienceTests {
     @Test("inbound queue overflow preserves order and closes the connection")
     func inboundQueue() async {
         let channel = EmbeddedChannel()
+        let budget = InboundByteBudget(limit: PeerConnection.maxInboundBufferedRecords)
         let connection = PeerConnection(
             endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 1),
-            channel: channel)
+            channel: channel,
+            inboundByteBudget: budget)
 
         for value in 0..<connection.inboundBufferLimit {
             #expect(connection.feedRecord(Data([UInt8(value)])))
         }
+        #expect(budget.currentUsage == connection.inboundBufferLimit)
         #expect(!connection.feedRecord(Data([0xff])))
         #expect(!connection.isLive)
 
         var received: [UInt8] = []
         for await record in connection.records {
-            if let byte = record.first { received.append(byte) }
+            if let byte = record.bytes.first { received.append(byte) }
         }
 
         #expect(received.count == connection.inboundBufferLimit)
         #expect(received.first == 0)
         #expect(received.last == UInt8(connection.inboundBufferLimit - 1))
-        #expect(connection.inboundBufferLimit * Int(IvyConfig.protocolMaxFrameSize)
-            <= PeerConnection.inboundBufferByteBudget)
+        #expect(budget.currentUsage == 0)
+    }
+
+    @Test("relayed queues share one inbound byte budget")
+    func relayedQueueBudget() async throws {
+        let budget = InboundByteBudget(limit: 2)
+        let carrier = try PeerKey(deterministicTestPeerKey("shared-budget-carrier"))
+        let first = PeerConnection(
+            endpoint: PeerEndpoint(publicKey: "", host: "relay", port: 0),
+            routeID: Data(repeating: 1, count: 32),
+            carrier: carrier,
+            inboundByteBudget: budget)
+        let second = PeerConnection(
+            endpoint: PeerEndpoint(publicKey: "", host: "relay", port: 0),
+            routeID: Data(repeating: 2, count: 32),
+            carrier: carrier,
+            inboundByteBudget: budget)
+
+        #expect(first.feedRecord(Data([1, 2])))
+        #expect(!second.feedRecord(Data([3])))
+        #expect(budget.currentUsage == 2)
+        for await _ in first.records { break }
+        #expect(budget.currentUsage == 0)
     }
 }

@@ -187,6 +187,14 @@ struct IvyTopologyTests {
             try config.validate()
         }
 
+        let undersizedInboundBudget = IvyConfig(
+            signingKey: identity(1),
+            maxInboundBufferedBytes: Int(IvyConfig.protocolMaxFrameSize))
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "inbound byte budget must hold one maximum frame")) {
+            try undersizedInboundBudget.validate()
+        }
+
         let invalidHealth = IvyConfig(
             signingKey: identity(1),
             healthConfig: PeerHealthConfig(keepaliveInterval: .zero))

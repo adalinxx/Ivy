@@ -24,8 +24,8 @@ private extension Ivy {
 
 @Suite("Kademlia lookup", .serialized)
 struct KademliaConvergenceTests {
-    @Test("findNode authenticates newly discovered candidates along a sparse route")
-    func findNodeConvergesThroughSparseRoute() async throws {
+    @Test("findNode does not dial private third-party referrals")
+    func findNodeRejectsPrivateThirdPartyRoutes() async throws {
         let identities = (0..<4).map { TransportTestHarness.identity("kad-node-\($0)") }
         let ports = (0..<4).map { _ in TransportTestHarness.nextPort() }
         let nodes = zip(identities, ports).map { identity, port in
@@ -49,16 +49,8 @@ struct KademliaConvergenceTests {
 
         let target = TransportTestHarness.key(identities[3]).hex
         let result = await nodes[0].findNode(target: target)
-        let targetHash = Router.hash(target)
-
-        #expect(result.first?.publicKey == target)
-        #expect(await nodes[0].peerConnectionCount > 1)
-        for (left, right) in zip(result, result.dropFirst()) {
-            #expect(!Router.isCloser(
-                Router.hash(right.publicKey),
-                than: Router.hash(left.publicKey),
-                to: targetHash))
-        }
+        #expect(!result.map(\.publicKey).contains(target))
+        #expect(await nodes[0].peerConnectionCount == 1)
 
         for node in nodes.reversed() { await node.stop() }
     }

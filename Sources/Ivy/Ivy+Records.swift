@@ -42,13 +42,15 @@ extension Ivy {
         for record in records.prefix(Int(MessageLimits.maxNeighborCount)) {
             let endpoint = record.endpoint
             guard providerExpiryIsValid(record.expiresAt),
-                  isAcceptableDiscoveredEndpoint(endpoint, source: "provider", from: peer),
+                  isAcceptableDiscoveredEndpoint(
+                    endpoint,
+                    provenance: .referral("provider"),
+                    from: peer),
                   let key = try? PeerKey(endpoint.publicKey) else { continue }
             let canonical = PeerEndpoint(
                 publicKey: key.hex,
                 host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: endpoint.port)
-            _ = addDiscoveredPeer(canonical, source: "provider", from: peer)
             pending.endpoints.insert(canonical)
             storeProviderHint(
                 rootCID: rootCID,

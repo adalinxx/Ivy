@@ -124,7 +124,7 @@ struct PendingRequestCapsTests {
             PeerID(publicKey: deterministicTestPeerKey("provider-query-\($0)"))
         }
         let endpoints = peers.enumerated().map { index, peer in
-            PeerEndpoint(publicKey: peer.publicKey, host: "10.0.0.\(index + 1)", port: UInt16(4100 + index))
+            PeerEndpoint(publicKey: peer.publicKey, host: "1.1.1.\(index + 1)", port: UInt16(4100 + index))
         }
         let targets = zip(peers, endpoints).map { peer, endpoint in
             Router.BucketEntry(
