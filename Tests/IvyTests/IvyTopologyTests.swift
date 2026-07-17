@@ -116,17 +116,75 @@ struct IvyTopologyTests {
         #expect(await node.connectedPeers.isEmpty)
     }
 
+    @Test("the protocol frame fits maximum canonical metadata through relay")
+    func protocolFrameFitsMaximumMetadata() throws {
+        let initiatorIdentity = identity(2)
+        let responderIdentity = identity(3)
+        let carrierIdentity = identity(4)
+        let initiator = try PeerKey(rawRepresentation: initiatorIdentity.publicKey.rawRepresentation)
+        let responder = try PeerKey(rawRepresentation: responderIdentity.publicKey.rawRepresentation)
+        let carrier = try PeerKey(rawRepresentation: carrierIdentity.publicKey.rawRepresentation)
+        let addresses = (0..<8).map { index in
+            let length = index < 6 ? 8_186 : 8_185
+            let suffix = "\(index)"
+            return ListenAddress(
+                host: String(repeating: "a", count: length - suffix.count) + suffix,
+                port: UInt16(index + 1))
+        }
+        let metadata = try #require(PeerMetadata(listenAddresses: addresses).encode())
+        #expect(metadata.count == PeerMetadata.maxEncodedSize)
+        let initiatorHello = SessionHelloInitiator(
+            routeBinding: Data(repeating: 0x11, count: 32),
+            initiator: initiator,
+            responder: responder,
+            nonce: Data(repeating: 0x22, count: 32),
+            metadata: metadata)
+        let signedInitiator = try SignedSessionHelloInitiator.sign(
+            initiatorHello,
+            with: initiatorIdentity)
+        let initiatorRecord = SessionWireRecord.helloInitiator(signedInitiator).serialize()
+        #expect(try SessionWireRecord.deserialize(initiatorRecord) == .helloInitiator(signedInitiator))
+
+        let hello = SessionHelloResponder(
+            routeBinding: Data(repeating: 0x11, count: 32),
+            responder: responder,
+            initiator: initiator,
+            initiatorNonce: Data(repeating: 0x22, count: 32),
+            responderNonce: Data(repeating: 0x33, count: 32),
+            metadata: metadata)
+        let signedHello = try SignedSessionHelloResponder.sign(hello, with: responderIdentity)
+        let endpointRecord = SessionWireRecord.helloResponder(signedHello).serialize()
+        #expect(try SessionWireRecord.deserialize(endpointRecord) == .helloResponder(signedHello))
+        let relayPacket = Message.relayPacket(
+            routeID: Data(repeating: 0x44, count: 32),
+            opaqueEndpointRecord: endpointRecord
+        ).serialize()
+        let carrierRecord = try SessionDataRecord.sign(
+            sessionID: SessionID(bytes: Data(repeating: 0x55, count: 32)),
+            sender: carrier,
+            receiver: responder,
+            sequence: 1,
+            payload: relayPacket,
+            with: carrierIdentity)
+        let wireRecord = SessionWireRecord.data(carrierRecord)
+
+        let serialized = wireRecord.serialize()
+        #expect(!serialized.isEmpty)
+        #expect(serialized.count <= Int(IvyConfig.protocolMaxFrameSize))
+        guard case .data(let decodedCarrier) = try SessionWireRecord.deserialize(serialized),
+              case .relayPacket(_, let opaqueRecord) = Message.deserialize(decodedCarrier.payload) else {
+            Issue.record("Expected a nested responder record")
+            return
+        }
+        #expect(try SessionWireRecord.deserialize(opaqueRecord) == .helloResponder(signedHello))
+    }
+
     @Test("invalid transport capacities fail before the listener starts")
     func invalidCapacityRejected() {
         let config = IvyConfig(signingKey: identity(1), maxConnections: 0)
 
         #expect(throws: IvyModeError.invalidConfiguration("capacity limits must be positive")) {
             try config.validate()
-        }
-
-        let oversizedFrames = IvyConfig(signingKey: identity(1), maxFrameSize: .max)
-        #expect(throws: IvyModeError.invalidConfiguration("maxFrameSize is outside the supported range")) {
-            try oversizedFrames.validate()
         }
 
         let invalidHealth = IvyConfig(

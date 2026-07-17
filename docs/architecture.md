@@ -61,7 +61,8 @@ all requested entries in one bounded response or reports unavailable. The first
 complete response from an expected peer wins and is returned with `servedBy`.
 Ivy checks response shape and request correlation, but treats every identifier
 and byte string as opaque. A selection that cannot fit one frame must be split by
-the caller; Ivy does not paginate or stream a response.
+the caller; Ivy does not paginate or stream a response. The protocol frame body
+is fixed at 4 MiB so every conforming peer and relay enforces the same bound.
 
 The caller must validate each identifier against its bytes, interpret links,
 and store accepted data through its own CAS or `Volume` contract. Reporting a

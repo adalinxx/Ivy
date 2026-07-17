@@ -65,7 +65,22 @@ enum Message: Sendable {
         }
     }
 
-    func serialize(maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize) -> Data {
+    static func contentResponseDataBudget(
+        for cids: [String],
+        maxFrameSize: UInt32,
+        relayed: Bool
+    ) -> Int? {
+        var remaining = Int(maxFrameSize)
+        guard consume(SessionWireRecord.dataRecordOverhead, from: &remaining) else { return nil }
+        if relayed {
+            // relayPacket tag, route ID, and endpoint-record length, then the carrier record.
+            guard consume(1 + 32 + 4, from: &remaining),
+                  consume(SessionWireRecord.dataRecordOverhead, from: &remaining) else { return nil }
+        }
+        return contentResponsePayloadBudget(for: cids, within: remaining)
+    }
+
+    func serialize(maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize) -> Data {
         var bytes = Data()
         guard encode(into: &bytes, maxDataPayload: maxFrameSize),
               bytes.count <= Int(maxFrameSize) else { return Data() }
@@ -100,7 +115,8 @@ enum Message: Sendable {
                 guard bytes.appendLengthPrefixedString(cid) else { return false }
             }
         case .contentResponse(let requestID, let entries):
-            guard requestID != 0, entries.allSatisfy({ !$0.cid.isEmpty }) else { return false }
+            guard requestID != 0,
+                  Self.contentResponseFits(entries, maxFrameSize: maxDataPayload) else { return false }
             bytes.append(Tag.contentResponse.rawValue)
             bytes.appendUInt64(requestID)
             guard bytes.appendCount(entries.count, max: MessageLimits.maxContentEntryCount) else { return false }
@@ -166,9 +182,46 @@ enum Message: Sendable {
         return true
     }
 
+    private static func contentResponseFits(
+        _ entries: [ContentEntry],
+        maxFrameSize: UInt32
+    ) -> Bool {
+        guard var remaining = contentResponsePayloadBudget(
+            for: entries.map(\.cid),
+            within: Int(maxFrameSize)
+        ) else { return false }
+        for entry in entries {
+            guard consume(entry.data.count, from: &remaining) else { return false }
+        }
+        return true
+    }
+
+    private static func contentResponsePayloadBudget(
+        for cids: [String],
+        within byteLimit: Int
+    ) -> Int? {
+        guard cids.count <= Int(MessageLimits.maxContentEntryCount) else { return nil }
+        var remaining = byteLimit
+        guard consume(1 + 8 + 2, from: &remaining) else { return nil }
+        for cid in cids {
+            let cidSize = cid.utf8.count
+            guard MessageLimits.accepts(cid),
+                  consume(2, from: &remaining),
+                  consume(cidSize, from: &remaining),
+                  consume(4, from: &remaining) else { return nil }
+        }
+        return remaining
+    }
+
+    private static func consume(_ count: Int, from remaining: inout Int) -> Bool {
+        guard count >= 0, count <= remaining else { return false }
+        remaining -= count
+        return true
+    }
+
     static func deserialize(
         _ data: Data,
-        maxDataPayload: UInt32 = IvyConfig.defaultMaxFrameSize
+        maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize
     ) -> Message? {
         guard let message = decode(data, maxDataPayload: maxDataPayload),
               message.serialize(maxFrameSize: maxDataPayload) == data else { return nil }
@@ -383,7 +436,7 @@ extension Data {
     @inline(__always)
     mutating func appendLengthPrefixedData(
         _ data: Data,
-        maxDataPayload: UInt32 = IvyConfig.defaultMaxFrameSize
+        maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize
     ) -> Bool {
         guard data.count <= Int(maxDataPayload) else { return false }
         appendUInt32(UInt32(data.count))
@@ -397,7 +450,7 @@ struct DataReader {
     private let maxDataPayload: UInt32
     private var offset = 0
 
-    init(_ data: Data, maxDataPayload: UInt32 = IvyConfig.defaultMaxFrameSize) {
+    init(_ data: Data, maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize) {
         self.data = data
         self.maxDataPayload = maxDataPayload
     }

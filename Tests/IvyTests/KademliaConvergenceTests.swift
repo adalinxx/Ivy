@@ -100,6 +100,55 @@ struct KademliaConvergenceTests {
         #expect(!(await node.knownPeerEndpoints).contains(dead))
         await node.stop()
     }
+
+    @Test("local dial deferral preserves routing evidence")
+    func locallyDeferredEndpointIsRetained() async throws {
+        let identity = TransportTestHarness.identity("kad-deferred-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 1))
+        let deferred = testEndpoint("kad-deferred", port: TransportTestHarness.nextPort())
+
+        try await node.start()
+        await node.seedKademliaTestEndpoint(deferred)
+        #expect(await node.reserveOutgoingDial(to: deferred))
+
+        _ = await node.findNode(target: deferred.publicKey)
+
+        #expect((await node.knownPeerEndpoints).contains(deferred))
+        await node.stop()
+    }
+
+    @Test("stale dial completion cannot mutate a newer run")
+    func staleDialCompletionIsRunScoped() async throws {
+        let identity = TransportTestHarness.identity("kad-stale-dial-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 1))
+        let endpoint = testEndpoint("kad-stale-dial", port: TransportTestHarness.nextPort())
+        let peer = PeerID(publicKey: endpoint.publicKey)
+
+        try await node.start()
+        let oldGeneration = await node.runGeneration
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.stop()
+
+        try await node.start()
+        let currentGeneration = await node.runGeneration
+        await node.seedKademliaTestEndpoint(endpoint)
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        #expect(!(await node.reserveOutgoingDial(to: endpoint)))
+        await node.removeFailedRoutingPeer(peer, generation: oldGeneration)
+        #expect((await node.knownPeerEndpoints).contains(endpoint))
+
+        await node.finishOutgoingDial(to: peer, generation: currentGeneration, connected: false)
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.stop()
+    }
 }
 
 private func testEndpoint(_ label: String, port: UInt16) -> PeerEndpoint {

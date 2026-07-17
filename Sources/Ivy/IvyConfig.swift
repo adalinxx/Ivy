@@ -3,8 +3,7 @@ import Foundation
 import Tally
 
 public struct IvyConfig: Sendable {
-    public static let defaultMaxFrameSize: UInt32 = 4 * 1024 * 1024
-    public static let maximumFrameSize: UInt32 = 16 * 1024 * 1024
+    public static let protocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
     public static let defaultMaxConnections = 256
     public static let defaultSTUNServers: [(String, Int)] = [
         ("stun.l.google.com", 19302),
@@ -27,7 +26,6 @@ public struct IvyConfig: Sendable {
     public let healthConfig: PeerHealthConfig
     public let routingRefreshInterval: Duration
     public let logger: any IvyLogger
-    public let maxFrameSize: UInt32
     public let maxConnections: Int
     public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
@@ -50,7 +48,6 @@ public struct IvyConfig: Sendable {
         healthConfig: PeerHealthConfig = .default,
         routingRefreshInterval: Duration = .seconds(120),
         logger: any IvyLogger = NullLogger(),
-        maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize,
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxConnectionsPerNetgroup: Int = 2,
         maxPendingRequests: Int = 4_096,
@@ -78,7 +75,6 @@ public struct IvyConfig: Sendable {
         self.healthConfig = healthConfig
         self.routingRefreshInterval = routingRefreshInterval
         self.logger = logger
-        self.maxFrameSize = maxFrameSize
         self.maxConnections = maxConnections
         self.maxConnectionsPerNetgroup = maxConnectionsPerNetgroup
         self.maxPendingRequests = maxPendingRequests
@@ -90,9 +86,6 @@ public struct IvyConfig: Sendable {
     }
 
     public func validate() throws {
-        guard (256...Self.maximumFrameSize).contains(maxFrameSize) else {
-            throw IvyModeError.invalidConfiguration("maxFrameSize is outside the supported range")
-        }
         guard maxConnections > 0,
               maxConnectionsPerNetgroup > 0,
               maxPendingRequests > 0,

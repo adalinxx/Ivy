@@ -3,8 +3,8 @@ import Tally
 
 public protocol IvyContentSource: Sendable {
     /// Returns exactly the requested content entries it can serve. Ivy treats
-    /// CIDs and bytes as opaque; validation belongs to the caller.
-    func content(rootCID: String, cids: [String]) async -> [ContentEntry]
+    /// CIDs and bytes as opaque; the aggregate data must not exceed `maxDataBytes`.
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry]
 }
 
 public struct AttributedContentResponse: Sendable, Equatable {
@@ -38,6 +38,11 @@ struct PendingContentRequest {
     var candidates: Set<PeerID>
 }
 
+struct PendingNetworkFetch {
+    let token: UInt64
+    var waiters: [CheckedContinuation<AttributedContentResponse, Never>]
+}
+
 struct InboundContentRequest: Hashable {
     let peer: PeerID
     let requestID: UInt64
@@ -53,6 +58,15 @@ extension Ivy {
         guard MessageLimits.accepts(rootCID),
               cids.count <= Int(MessageLimits.maxContentCIDCount),
               cids.allSatisfy(MessageLimits.accepts) else { return }
+        let key = ContentRequestKey(rootCID: rootCID, cids: cids)
+        guard let maxDataBytes = Message.contentResponseDataBudget(
+            for: key.requestedCIDs,
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: connections[peer]?.isDirect == false
+        ) else {
+            fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
+            return
+        }
         let inbound = InboundContentRequest(peer: peer, requestID: requestID)
         guard beginServingContent(inbound) else {
             fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
@@ -60,17 +74,17 @@ extension Ivy {
         }
         defer { endServingContent(inbound) }
 
-        let key = ContentRequestKey(rootCID: rootCID, cids: cids)
         let available = await contentSource?.content(
             rootCID: rootCID,
-            cids: key.requestedCIDs
+            cids: key.requestedCIDs,
+            maxDataBytes: maxDataBytes
         ) ?? []
 
-        var byCID: [String: Data] = [:]
-        for entry in available where key.requestedSet.contains(entry.cid) {
-            byCID[entry.cid] = entry.data
-        }
-        guard key.requestedCIDs.allSatisfy({ byCID[$0] != nil }) else {
+        guard let byCID = validatedContent(
+            available,
+            for: key,
+            maxDataBytes: maxDataBytes
+        ) else {
             fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
             return
         }
@@ -146,36 +160,83 @@ extension Ivy {
     }
 
     private func localContent(for key: ContentRequestKey) async -> [String: Data]? {
+        guard let maxDataBytes = Message.contentResponseDataBudget(
+            for: key.requestedCIDs,
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: false
+        ) else { return nil }
         guard let entries = await contentSource?.content(
             rootCID: key.rootCID,
-            cids: key.requestedCIDs
+            cids: key.requestedCIDs,
+            maxDataBytes: maxDataBytes
         ) else { return nil }
+        return validatedContent(entries, for: key, maxDataBytes: maxDataBytes)
+    }
+
+    private func validatedContent(
+        _ entries: [ContentEntry],
+        for key: ContentRequestKey,
+        maxDataBytes: Int
+    ) -> [String: Data]? {
+        guard entries.count == key.requestedCIDs.count else { return nil }
+        var missing = key.requestedSet
+        var remaining = maxDataBytes
         var result: [String: Data] = [:]
-        for entry in entries where key.requestedSet.contains(entry.cid) {
+        for entry in entries {
+            guard missing.remove(entry.cid) != nil,
+                  entry.data.count <= remaining else { return nil }
+            remaining -= entry.data.count
             result[entry.cid] = entry.data
         }
-        return key.requestedCIDs.allSatisfy { result[$0] != nil } ? result : nil
+        return missing.isEmpty ? result : nil
     }
 
     private func fetchContentFromNetwork(_ key: ContentRequestKey) async -> AttributedContentResponse {
-        if let requestID = contentRequestIDs[key],
-           let pending = pendingContentRequests[requestID] {
-            guard pending.continuations.count < config.maxWaitersPerRequest else { return .empty }
+        if var pending = pendingNetworkFetches[key] {
+            guard pending.waiters.count + 1 < config.maxWaitersPerRequest else { return .empty }
             return await withCheckedContinuation { continuation in
-                pendingContentRequests[requestID]?.continuations.append(continuation)
+                pending.waiters.append(continuation)
+                pendingNetworkFetches[key] = pending
             }
         }
+        nextNetworkFetchToken &+= 1
+        let token = nextNetworkFetchToken
+        pendingNetworkFetches[key] = PendingNetworkFetch(token: token, waiters: [])
+        let response = await performNetworkFetch(key)
+        guard pendingNetworkFetches[key]?.token == token,
+              let pending = pendingNetworkFetches.removeValue(forKey: key) else { return response }
+        for waiter in pending.waiters { waiter.resume(returning: response) }
+        return response
+    }
 
-        var candidates = connectedProviderIDs(for: key.rootCID)
-        if candidates.isEmpty {
-            let endpoints = await discoverProviders(rootCID: key.rootCID)
-            await connectToProviderEndpoints(endpoints)
-            candidates = connectedProviderIDs(for: key.rootCID)
+    private func performNetworkFetch(_ key: ContentRequestKey) async -> AttributedContentResponse {
+        var attemptedPeers: Set<PeerID> = []
+        let cached = cachedProviderEndpoints(rootCID: key.rootCID)
+        let attemptedEndpoints = await connectToProviderEndpoints(cached)
+
+        var candidates = Array(connectedProviderIDs(for: key.rootCID)
+            .prefix(config.maxContentCandidates))
+        if !candidates.isEmpty {
+            attemptedPeers.formUnion(candidates)
+            let response = await fetchContent(key, from: candidates)
+            if !response.entries.isEmpty { return response }
         }
-        if candidates.isEmpty {
-            candidates = connectedEndpointIDs()
+
+        let fresh = await queryFreshProviderEndpoints(rootCID: key.rootCID)
+            .filter { !attemptedEndpoints.contains($0) }
+        _ = await connectToProviderEndpoints(fresh)
+        candidates = Array(connectedProviderIDs(for: key.rootCID)
+            .filter { !attemptedPeers.contains($0) }
+            .prefix(config.maxContentCandidates))
+        if !candidates.isEmpty {
+            attemptedPeers.formUnion(candidates)
+            let response = await fetchContent(key, from: candidates)
+            if !response.entries.isEmpty { return response }
         }
-        candidates = Array(candidates.prefix(config.maxContentCandidates))
+
+        candidates = Array(connectedEndpointIDs()
+            .filter { !attemptedPeers.contains($0) }
+            .prefix(config.maxContentCandidates))
         guard !candidates.isEmpty else { return .empty }
         return await fetchContent(key, from: candidates)
     }

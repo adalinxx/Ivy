@@ -11,7 +11,7 @@ struct PendingProviderQuery {
     let requestID: UInt64
     var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
     var expectedPeers: Set<String>
-    var endpoints: [String: PeerEndpoint]
+    var endpoints: Set<PeerEndpoint>
 }
 
 extension Ivy {
@@ -49,7 +49,7 @@ extension Ivy {
                 host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: endpoint.port)
             _ = addDiscoveredPeer(canonical, source: "provider", from: peer)
-            pending.endpoints[key.hex] = canonical
+            pending.endpoints.insert(canonical)
             storeProviderHint(
                 rootCID: rootCID,
                 peer: key.peerID,
@@ -91,16 +91,28 @@ extension Ivy {
 
     public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
         guard MessageLimits.accepts(rootCID) else { return [] }
+        let cached = cachedProviderEndpoints(rootCID: rootCID)
+        return cached.isEmpty
+            ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(rootCID: rootCID))
+            : cached
+    }
+
+    func cachedProviderEndpoints(rootCID: String) -> [PeerEndpoint] {
         evictExpiredProviders(rootCID: rootCID)
-        var endpoints = (providerHints[rootCID] ?? []).compactMap(\.endpoint)
-        if endpoints.isEmpty {
-            var targets = providerLookupTargets(rootCID: rootCID)
-            if targets.isEmpty {
-                _ = await findNode(target: rootCID)
-                targets = providerLookupTargets(rootCID: rootCID)
-            }
-            endpoints = await queryProviders(rootCID: rootCID, targets: targets)
+        return uniqueProviderEndpoints((providerHints[rootCID] ?? []).compactMap(\.endpoint))
+    }
+
+    func queryFreshProviderEndpoints(rootCID: String) async -> [PeerEndpoint] {
+        guard MessageLimits.accepts(rootCID) else { return [] }
+        var targets = providerLookupTargets(rootCID: rootCID)
+        if targets.isEmpty {
+            _ = await findNode(target: rootCID)
+            targets = providerLookupTargets(rootCID: rootCID)
         }
+        return await queryProviders(rootCID: rootCID, targets: targets)
+    }
+
+    private func uniqueProviderEndpoints(_ endpoints: [PeerEndpoint]) -> [PeerEndpoint] {
         var seen: Set<String> = []
         return endpoints.filter { seen.insert($0.publicKey).inserted }
     }
@@ -138,7 +150,7 @@ extension Ivy {
                 requestID: requestID,
                 continuations: [continuation],
                 expectedPeers: Set(targets.map { $0.id.publicKey }),
-                endpoints: [:])
+                endpoints: [])
             for target in targets {
                 fireToPeer(
                     target.id,
@@ -167,7 +179,9 @@ extension Ivy {
         guard let pending = pendingProviderQueries[rootCID],
               pending.requestID == requestID else { return }
         pendingProviderQueries.removeValue(forKey: rootCID)
-        let endpoints = pending.endpoints.values.sorted { $0.publicKey < $1.publicKey }
+        let endpoints = pending.endpoints.sorted {
+            ($0.publicKey, $0.host, $0.port) < ($1.publicKey, $1.host, $1.port)
+        }
         for continuation in pending.continuations {
             continuation.resume(returning: endpoints)
         }
@@ -180,10 +194,10 @@ extension Ivy {
         }
     }
 
-    func connectToProviderEndpoints(_ endpoints: [PeerEndpoint]) async {
-        let candidates = endpoints.prefix(config.maxContentCandidates).filter {
+    func connectToProviderEndpoints(_ endpoints: [PeerEndpoint]) async -> Set<PeerEndpoint> {
+        let candidates = uniqueProviderEndpoints(endpoints).filter {
             !hasEndpointSession(PeerID(publicKey: $0.publicKey))
-        }
+        }.prefix(config.maxContentCandidates)
         await withTaskGroup(of: Void.self) { group in
             for endpoint in candidates {
                 group.addTask { [weak self] in
@@ -191,6 +205,7 @@ extension Ivy {
                 }
             }
         }
+        return Set(candidates)
     }
 
     public func rememberProvider(rootCID: String, peer: PeerID) {

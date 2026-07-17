@@ -6,7 +6,7 @@ import Tally
 
 @Suite("Live transport bounds")
 struct ResilienceTests {
-    @Test("application records obey the negotiated frame cap")
+    @Test("application records obey the protocol frame cap")
     func frameCap() {
         let message = Message.peerMessage(
             topic: "state",
@@ -61,7 +61,7 @@ struct ResilienceTests {
         #expect(received.count == connection.inboundBufferLimit)
         #expect(received.first == 0)
         #expect(received.last == UInt8(connection.inboundBufferLimit - 1))
-        #expect(connection.inboundBufferLimit * Int(IvyConfig.defaultMaxFrameSize)
+        #expect(connection.inboundBufferLimit * Int(IvyConfig.protocolMaxFrameSize)
             <= PeerConnection.inboundBufferByteBudget)
     }
 }

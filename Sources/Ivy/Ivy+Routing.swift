@@ -5,6 +5,7 @@ extension Ivy {
     // MARK: - DHT
 
     public func findNode(target: String) async -> [PeerEndpoint] {
+        let generation = runGeneration
         let targetHash = Router.hash(target)
         let lookupParallelism = min(Self.kademliaLookupParallelism, max(1, config.kBucketSize))
         let maxLookupRounds = max(1, config.kBucketSize)
@@ -31,9 +32,11 @@ extension Ivy {
                     group.addTask { [weak self] in
                         guard let self else { return }
                         do {
-                            try await self.connect(to: entry.endpoint)
+                            _ = try await self.connectEndpointIfAdmitted(
+                                to: entry.endpoint,
+                                allowRelayFallback: true)
                         } catch {
-                            await self.removeFailedRoutingPeer(entry.id)
+                            await self.removeFailedRoutingPeer(entry.id, generation: generation)
                         }
                     }
                 }
@@ -82,7 +85,7 @@ extension Ivy {
         return closestCandidateEntries(candidatesByKey.values, to: targetHash).map { $0.endpoint }
     }
 
-    func startRoutingRefresh() {
+    func startRoutingRefresh(generation: UInt64) {
         routingRefreshTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(30))
@@ -92,7 +95,8 @@ extension Ivy {
             while !Task.isCancelled {
                 let interval: Duration
                 if let self {
-                    await self.refreshRoutingTable()
+                    guard await self.isCurrentRun(generation) else { return }
+                    await self.refreshRoutingTable(generation: generation)
                     interval = self.config.routingRefreshInterval
                 } else {
                     return
@@ -106,14 +110,14 @@ extension Ivy {
         }
     }
 
-    func refreshRoutingTable() async {
-        guard case .overlay = config.mode else { return }
+    func refreshRoutingTable(generation: UInt64) async {
+        guard isCurrentRun(generation), case .overlay = config.mode else { return }
         let target = secureRandom32().map { String(format: "%02x", $0) }.joined()
         _ = await findNode(target: target)
     }
 
-    private func removeFailedRoutingPeer(_ peer: PeerID) {
-        guard running, !hasEndpointSession(peer) else { return }
+    func removeFailedRoutingPeer(_ peer: PeerID, generation: UInt64) {
+        guard isCurrentRun(generation), !hasEndpointSession(peer) else { return }
         router.removePeer(peer)
     }
 
@@ -155,13 +159,7 @@ extension Ivy {
             return false
         }
 
-        // Unknown/public reachability must not let discovered records steer the
-        // node into internal addresses. An explicit private IP opts into LAN use.
-        let allowsPrivateDiscovery = config.externalAddress.map { address in
-            isIPAddressLiteral(address.host) && isNonRoutableDiscoveredHost(address.host)
-        } ?? false
-        if !allowsPrivateDiscovery,
-           isNonRoutableDiscoveredHost(host) {
+        if !allowsDiscoveredHost(host, fromObservedHost: connections[peer]?.observedHost) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false
         }
@@ -170,7 +168,7 @@ extension Ivy {
         // so a key ground to the threshold passes regardless of which
         // spelling the endpoint record carries.
         if config.minPeerKeyBits > 0 {
-            let bits = KeyDifficulty.keyWorkBits(endpoint.publicKey)
+            let bits = KeyDifficulty.keyWorkBits(key.hex)
             guard bits >= config.minPeerKeyBits else {
                 config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: \(bits) key PoW bits, need \(config.minPeerKeyBits)")
                 return false
@@ -178,6 +176,19 @@ extension Ivy {
         }
 
         return true
+    }
+
+    func allowsDiscoveredHost(_ host: String, fromObservedHost sourceHost: String?) -> Bool {
+        if !isNonRoutableDiscoveredHost(host) { return true }
+        guard let externalHost = config.externalAddress?.host else { return false }
+        if isPrivateUnicastHost(host) {
+            return isPrivateUnicastHost(externalHost)
+        }
+        if isLoopbackHost(host) {
+            return isLoopbackHost(externalHost)
+                && sourceHost.map(isLoopbackHost) == true
+        }
+        return false
     }
 
     /// True if `host` is NOT a globally-routable IP literal: a non-IP string, or
@@ -188,13 +199,7 @@ extension Ivy {
     /// over-rejecting the real-public space surrounding it.
     func isNonRoutableDiscoveredHost(_ host: String) -> Bool {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let octets = NetGroup.ipv4Octets(trimmed) {
-            return Self.isNonRoutableIPv4(octets)
-        }
-        // IPv4-mapped ("::ffff:a.b.c.d") / -compatible ("::a.b.c.d") IPv6: the
-        // meaningful network is the embedded IPv4, so classify by that.
-        if trimmed.contains(":"), let mapped = NetGroup.embeddedMappedIPv4(trimmed),
-           let octets = NetGroup.ipv4Octets(mapped) {
+        if let octets = discoveredIPv4Octets(trimmed) {
             return Self.isNonRoutableIPv4(octets)
         }
         if trimmed.contains(":"), let hextets = NetGroup.ipv6Hextets(trimmed) {
@@ -203,9 +208,29 @@ extension Ivy {
         return true   // not an IP literal
     }
 
-    private func isIPAddressLiteral(_ host: String) -> Bool {
+    private func isPrivateUnicastHost(_ host: String) -> Bool {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        return NetGroup.ipv4Octets(trimmed) != nil || NetGroup.ipv6Hextets(trimmed) != nil
+        if let o = discoveredIPv4Octets(trimmed) {
+            return o[0] == 10
+                || (o[0] == 172 && (16...31).contains(o[1]))
+                || (o[0] == 192 && o[1] == 168)
+        }
+        if let h = NetGroup.ipv6Hextets(trimmed) {
+            return (0xfc00...0xfdff).contains(h[0])
+        }
+        return false
+    }
+
+    private func isLoopbackHost(_ host: String) -> Bool {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let o = discoveredIPv4Octets(trimmed) { return o[0] == 127 }
+        guard let h = NetGroup.ipv6Hextets(trimmed) else { return false }
+        return h.dropLast().allSatisfy { $0 == 0 } && h.last == 1
+    }
+
+    private func discoveredIPv4Octets(_ host: String) -> [Int]? {
+        if let octets = NetGroup.ipv4Octets(host) { return octets }
+        return host.contains(":") ? NetGroup.embeddedIPv4Octets(host) : nil
     }
 
     /// Precise IPv4 special-use classification over the full dotted-quad.

@@ -41,6 +41,8 @@ struct NetGroupTests {
         #expect(NetGroup.group("::ffff:1.2.99.4") == "v4:1.2")      // same /16 collapses
         #expect(NetGroup.group("::FFFF:1.2.3.4") == "v4:1.2")        // case-insensitive
         #expect(NetGroup.group("[::ffff:1.2.3.4]") == "v4:1.2")      // bracketed
+        #expect(NetGroup.group("::ffff:0102:0304") == "v4:1.2")
+        #expect(NetGroup.group("::ffff:0102:0304") == NetGroup.group("1.2.3.4"))
         // A genuine IPv6 with a trailing embedded IPv4 still groups by its /32.
         #expect(NetGroup.group("2001:db8::1.2.3.4") == "v6:2001.0db8")
     }
