@@ -1,97 +1,135 @@
-import XCTest
+import Crypto
+import Foundation
+import Testing
 @testable import Ivy
 
-final class IvyTopologyTests: XCTestCase {
-    private let rawKey = String(repeating: "ab", count: 32)
-    private let otherKey = String(repeating: "cd", count: 32)
-
-    func testPinnedPeerCanonicalizesEquivalentKeySpellings() {
-        let topology = IvyTopology.pinnedPeer(publicKey: "ed01" + rawKey.uppercased())
-
-        XCTAssertTrue(topology.allowsPeer(publicKey: rawKey))
-        XCTAssertTrue(topology.allowsPeer(publicKey: "ed01" + rawKey))
-        XCTAssertFalse(topology.allowsPeer(publicKey: otherKey))
-        XCTAssertFalse(topology.participatesInPublicDiscovery)
-        XCTAssertFalse(topology.acceptsInboundConnections)
-        XCTAssertFalse(topology.allowsRelayFallback)
+@Suite("Ivy mode and carrier isolation")
+struct IvyTopologyTests {
+    private func identity(_ byte: UInt8) -> Curve25519.Signing.PrivateKey {
+        try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: byte, count: 32))
     }
 
-    func testPublicOverlayAllowsPeersAndDiscovery() {
-        let topology = IvyTopology.publicOverlay
-
-        XCTAssertTrue(topology.allowsPeer(publicKey: rawKey))
-        XCTAssertTrue(topology.allowsPeer(publicKey: otherKey))
-        XCTAssertTrue(topology.participatesInPublicDiscovery)
-        XCTAssertTrue(topology.acceptsInboundConnections)
-        XCTAssertTrue(topology.allowsRelayFallback)
+    private func key(_ identity: Curve25519.Signing.PrivateKey) -> String {
+        try! PeerKey(rawRepresentation: identity.publicKey.rawRepresentation).hex
     }
 
-    func testPinnedConfigCannotBeWidenedByOverlaySettings() {
-        let expected = PeerEndpoint(publicKey: rawKey, host: "127.0.0.1", port: 4001)
-        let substitute = PeerEndpoint(publicKey: otherKey, host: "127.0.0.1", port: 4002)
-        let relay = PeerEndpoint(publicKey: otherKey, host: "127.0.0.1", port: 5001)
+    @Test("pinned identity canonicalizes raw and ed01 spellings")
+    func pinnedCanonicalization() throws {
+        let remote = key(identity(2))
+        let mode = IvyMode.pinned(peer: "ed01" + remote.uppercased())
+        #expect(mode.allowsEndpoint(try PeerKey(remote)))
+        #expect(!mode.allowsEndpoint(try PeerKey(key(identity(3)))))
+        #expect(!mode.participatesInPublicDiscovery)
+    }
 
+    @Test("pinned mode keeps public discovery off and listener configuration intact")
+    func pinnedConfiguration() throws {
+        let local = identity(1)
+        let remote = key(identity(2))
+        let endpoint = PeerEndpoint(publicKey: remote, host: "127.0.0.1", port: 4001)
         let config = IvyConfig(
-            publicKey: rawKey,
-            bootstrapPeers: [substitute, expected],
-            enableLocalDiscovery: true,
+            signingKey: local,
+            listenPort: 4100,
+            bootstrapPeers: [endpoint],
             stunServers: [("stun.example", 3478)],
-            enablePEX: true,
-            relayEnabled: true,
-            knownRelays: [relay],
-            topology: .pinnedPeer(publicKey: rawKey)
-        )
+            mode: .pinned(peer: remote))
 
-        XCTAssertEqual(config.bootstrapPeers.map(\.publicKey), [rawKey])
-        XCTAssertFalse(config.enableLocalDiscovery)
-        XCTAssertTrue(config.stunServers.isEmpty)
-        XCTAssertFalse(config.enablePEX)
-        XCTAssertFalse(config.relayEnabled)
-        XCTAssertTrue(config.knownRelays.isEmpty)
-        XCTAssertFalse(config.shouldRunPEX)
-        XCTAssertFalse(config.shouldRunLocalDiscovery)
+        try config.validate()
+        #expect(config.listenPort == 4100)
+        #expect(config.stunServers.isEmpty)
     }
 
-    func testPublicConfigPreservesOverlaySettings() {
-        let peer = PeerEndpoint(publicKey: otherKey, host: "127.0.0.1", port: 4002)
-        let relay = PeerEndpoint(publicKey: rawKey, host: "127.0.0.1", port: 5001)
-
+    @Test("pinned endpoint and configured carrier identities are disjoint")
+    func carrierIdentityDisjointness() {
+        let local = identity(1)
+        let remote = key(identity(2))
+        let carrier = PeerEndpoint(publicKey: remote, host: "127.0.0.1", port: 5001)
         let config = IvyConfig(
-            publicKey: rawKey,
-            bootstrapPeers: [peer],
-            enableLocalDiscovery: true,
-            stunServers: [("stun.example", 3478)],
-            enablePEX: true,
-            relayEnabled: true,
-            knownRelays: [relay]
-        )
+            signingKey: local,
+            carriers: [carrier],
+            mode: .pinned(peer: remote))
 
-        XCTAssertEqual(config.bootstrapPeers.map(\.publicKey), [otherKey])
-        XCTAssertTrue(config.enableLocalDiscovery)
-        XCTAssertEqual(config.stunServers.count, 1)
-        XCTAssertTrue(config.enablePEX)
-        XCTAssertTrue(config.relayEnabled)
-        XCTAssertEqual(config.knownRelays.map(\.publicKey), [rawKey])
-        XCTAssertTrue(config.shouldRunPEX)
-        XCTAssertTrue(config.shouldRunLocalDiscovery)
-    }
-
-    func testPinnedConnectionRejectsSubstituteBeforeNetworkIO() async throws {
-        let config = IvyConfig(
-            publicKey: rawKey,
-            topology: .pinnedPeer(publicKey: rawKey)
-        )
-        let ivy = Ivy(config: config)
-        let substitute = PeerEndpoint(publicKey: otherKey, host: "127.0.0.1", port: 4002)
-
-        do {
-            try await ivy.connectInConfiguredTopology(to: substitute)
-            XCTFail("a pinned session must reject a substitute identity")
-        } catch {
-            XCTAssertEqual(
-                error as? IvyTopologyError,
-                .peerOutsidePinnedTopology(expected: rawKey, actual: otherKey)
-            )
+        #expect(throws: IvyModeError.identityRoleCollision(remote)) {
+            try config.validate()
         }
     }
+
+    @Test("pinned mode rejects substitute bootstrap identities")
+    func substituteBootstrapRejected() {
+        let local = identity(1)
+        let expected = key(identity(2))
+        let substitute = key(identity(3))
+        let config = IvyConfig(
+            signingKey: local,
+            bootstrapPeers: [PeerEndpoint(publicKey: substitute, host: "127.0.0.1", port: 4002)],
+            mode: .pinned(peer: expected))
+
+        #expect(throws: IvyModeError.peerOutsidePinnedMode(expected: expected, actual: substitute)) {
+            try config.validate()
+        }
+    }
+
+    @Test("pinned mode rejects malformed identities")
+    func malformedPinnedIdentityRejected() {
+        let config = IvyConfig(
+            signingKey: identity(1),
+            mode: .pinned(peer: "not-a-peer-key"))
+
+        #expect(throws: IvyModeError.invalidPinnedIdentity("not-a-peer-key")) {
+            try config.validate()
+        }
+    }
+
+    @Test("ordinary connect cannot bypass pinned identity")
+    func ordinaryConnectHonorsPinnedIdentity() async {
+        let local = identity(1)
+        let expected = key(identity(2))
+        let substitute = key(identity(3))
+        let node = Ivy(config: IvyConfig(
+            signingKey: local,
+            mode: .pinned(peer: expected)))
+
+        await #expect(throws: IvyError.peerOutsideMode) {
+            try await node.connect(to: PeerEndpoint(
+                publicKey: substitute,
+                host: "127.0.0.1",
+                port: 4001))
+        }
+        await #expect(throws: IvyError.peerOutsideMode) {
+            try await node.connect(to: PeerEndpoint(
+                publicKey: key(local),
+                host: "127.0.0.1",
+                port: 4001))
+        }
+    }
+
+    @Test("configured carrier cannot be used as an application endpoint")
+    func carrierCannotBecomeEndpoint() async {
+        let local = identity(1)
+        let carrierKey = key(identity(4))
+        let carrier = PeerEndpoint(publicKey: carrierKey, host: "127.0.0.1", port: 5001)
+        let node = Ivy(config: IvyConfig(signingKey: local, carriers: [carrier]))
+
+        await #expect(throws: IvyError.peerOutsideMode) {
+            try await node.connect(to: carrier)
+        }
+        #expect(await node.connectedPeers.isEmpty)
+    }
+
+    @Test("invalid transport capacities fail before the listener starts")
+    func invalidCapacityRejected() {
+        let config = IvyConfig(signingKey: identity(1), maxConnections: 0)
+
+        #expect(throws: IvyModeError.invalidConfiguration("capacity limits must be positive")) {
+            try config.validate()
+        }
+
+        let invalidHealth = IvyConfig(
+            signingKey: identity(1),
+            healthConfig: PeerHealthConfig(keepaliveInterval: .zero))
+        #expect(throws: IvyModeError.invalidConfiguration("peer health limits are invalid")) {
+            try invalidHealth.validate()
+        }
+    }
+
 }

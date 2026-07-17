@@ -1,166 +1,296 @@
 import Foundation
-import NIOCore
 import Tally
-import Crypto
+
+struct ProviderHint: Sendable, Equatable {
+    let peer: PeerID
+    let endpoint: PeerEndpoint?
+    let expiresAt: UInt64
+}
+
+struct PendingProviderQuery {
+    let requestID: UInt64
+    var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
+    var expectedPeers: Set<String>
+    var endpoints: [String: PeerEndpoint]
+}
 
 extension Ivy {
-    // MARK: - Pin Announcements
+    static let providerObservationTTL: UInt64 = 20 * 60
+    static let maxProviderTTL: UInt64 = 24 * 60 * 60
 
-    func handleFindPins(cid: String, from peer: PeerID) async {
-        guard tally.shouldAllow(peer: peer) else { return }
-
-        let stored = pinAnnouncements[cid] ?? []
-        let providers = stored.map(\.publicKey)
-        fireToPeer(peer, .pins(cid: cid, providers: providers))
+    func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
+        evictExpiredProviders(rootCID: rootCID)
+        let records = (providerHints[rootCID] ?? []).compactMap { hint -> ProviderRecord? in
+            guard let endpoint = hint.endpoint else { return nil }
+            return ProviderRecord(endpoint: endpoint, expiresAt: hint.expiresAt)
+        }
+        fireToPeer(
+            peer,
+            .providers(rootCID: rootCID, requestID: requestID, records: records))
     }
 
-    func handlePinAnnounce(rootCID: String, publicKey: String, expiry: UInt64, signature: Data, fee: UInt64, from peer: PeerID) {
-        guard tally.shouldAllow(peer: peer) else { return }
-        guard publicKey == peer.publicKey else { return }
-        guard PinAnnouncementSignature.isExpiryValid(expiry) else { return }
-        guard PinAnnouncementSignature.verify(
+    func handleProvidersResponse(
+        rootCID: String,
+        requestID: UInt64,
+        records: [ProviderRecord],
+        from peer: PeerID
+    ) {
+        guard var pending = pendingProviderQueries[rootCID],
+              pending.requestID == requestID,
+              pending.expectedPeers.remove(peer.publicKey) != nil else { return }
+
+        for record in records.prefix(Int(MessageLimits.maxNeighborCount)) {
+            let endpoint = record.endpoint
+            guard providerExpiryIsValid(record.expiresAt),
+                  isAcceptableDiscoveredEndpoint(endpoint, source: "provider", from: peer),
+                  let key = try? PeerKey(endpoint.publicKey) else { continue }
+            let canonical = PeerEndpoint(
+                publicKey: key.hex,
+                host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
+                port: endpoint.port)
+            _ = addDiscoveredPeer(canonical, source: "provider", from: peer)
+            pending.endpoints[key.hex] = canonical
+            storeProviderHint(
+                rootCID: rootCID,
+                peer: key.peerID,
+                endpoint: canonical,
+                expiresAt: record.expiresAt)
+        }
+
+        pendingProviderQueries[rootCID] = pending
+        if pending.expectedPeers.isEmpty {
+            resolveProviderQuery(rootCID: rootCID, requestID: requestID)
+        }
+    }
+
+    func handleAnnounceProvider(rootCID: String, expiresAt: UInt64, from peer: PeerID) {
+        guard providerExpiryIsValid(expiresAt),
+              shouldStoreProviderHint(rootCID: rootCID) else { return }
+        storeProviderHint(
             rootCID: rootCID,
-            publicKey: publicKey,
-            expiry: expiry,
-            fee: fee,
-            signature: signature
-        ) else { return }
-        guard shouldStorePinAnnouncement(rootCID: rootCID) else { return }
-
-        var existing = pinAnnouncements[rootCID] ?? []
-        existing.removeAll { $0.publicKey == publicKey }
-        existing.append((publicKey: publicKey, expiry: expiry))
-
-        if existing.count > Int(MessageLimits.maxNeighborCount) {
-            existing = Array(existing.suffix(Int(MessageLimits.maxNeighborCount)))
-        }
-        pinAnnouncements[rootCID] = existing
-
-        fireToPeer(peer, .pinStored(rootCID: rootCID))
+            peer: peer,
+            endpoint: providerEndpoint(for: peer),
+            expiresAt: expiresAt)
     }
 
-    func shouldStorePinAnnouncement(rootCID: String) -> Bool {
-        let keyHash = Router.hash(rootCID)
-        let peers = router.allPeers()
-        guard !peers.isEmpty else { return true }
-
-        let keyBucket = min(Router.commonPrefixLength(router.localHash, keyHash), 255)
-        if let deepestPopulatedBucket = peers.map({ min(Router.commonPrefixLength(router.localHash, $0.hash), 255) }).max(),
-           keyBucket >= deepestPopulatedBucket {
-            return true
+    public func announceProvider(rootCID: String, expiresAt: UInt64) {
+        guard MessageLimits.accepts(rootCID), providerExpiryIsValid(expiresAt) else { return }
+        if let endpoint = localProviderEndpoint() {
+            storeProviderHint(
+                rootCID: rootCID,
+                peer: localID,
+                endpoint: endpoint,
+                expiresAt: expiresAt)
         }
-
-        let closest = peers.sorted { Router.isCloser($0.hash, than: $1.hash, to: keyHash) }
-        guard closest.count >= config.kBucketSize,
-              let kth = closest.prefix(config.kBucketSize).last else {
-            return true
-        }
-        return Router.isCloser(router.localHash, than: kth.hash, to: keyHash)
-    }
-
-    /// Resolve any in-flight findPins waiters with the providers that just
-    /// arrived, and seed them as candidates for future fetches. Provider
-    /// peers may not be in our routing table yet; we just stash the keys
-    /// and let fetchVolume gate on connection-reachability.
-    func handlePinsResponse(cid: String, providers: [String], from peer: PeerID) {
-        guard let pending = pendingFindPins[cid],
-              pending.expectedPeers.contains(peer.publicKey) else { return }
-        guard !providers.isEmpty else { return }
-
-        let peerIDs = providers.map { PeerID(publicKey: $0) }
-        if let waiters = pendingFindPins.removeValue(forKey: cid)?.continuations {
-            for cont in waiters { cont.resume(returning: peerIDs) }
-        }
-        for pk in providers {
-            let pid = PeerID(publicKey: pk)
-            recordVolumeProvider(rootCID: cid, peer: pid)
+        let message = Message.announceProvider(rootCID: rootCID, expiresAt: expiresAt)
+        for entry in router.closestPeers(to: Router.hash(rootCID), count: config.kBucketSize)
+            where hasEndpointSession(entry.id) {
+            fireToPeer(entry.id, message)
         }
     }
 
-    public func publishPinAnnounce(rootCID: String, expiry: UInt64, fee: UInt64) {
-        guard let signature = PinAnnouncementSignature.sign(
-            rootCID: rootCID,
-            publicKey: config.publicKey,
-            expiry: expiry,
-            fee: fee,
-            signingKey: config.signingKey
-        ) else {
-            return
+    public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
+        guard MessageLimits.accepts(rootCID) else { return [] }
+        evictExpiredProviders(rootCID: rootCID)
+        var endpoints = (providerHints[rootCID] ?? []).compactMap(\.endpoint)
+        if endpoints.isEmpty {
+            var targets = providerLookupTargets(rootCID: rootCID)
+            if targets.isEmpty {
+                _ = await findNode(target: rootCID)
+                targets = providerLookupTargets(rootCID: rootCID)
+            }
+            endpoints = await queryProviders(rootCID: rootCID, targets: targets)
         }
-        publishPinAnnounce(rootCID: rootCID, expiry: expiry, signature: signature, fee: fee)
+        var seen: Set<String> = []
+        return endpoints.filter { seen.insert($0.publicKey).inserted }
     }
 
-    public func publishPinAnnounce(rootCID: String, expiry: UInt64, signature: Data, fee: UInt64) {
-        guard PinAnnouncementSignature.isExpiryValid(expiry) else { return }
-        guard PinAnnouncementSignature.verify(
-            rootCID: rootCID,
-            publicKey: config.publicKey,
-            expiry: expiry,
-            fee: fee,
-            signature: signature
-        ) else { return }
-
-        // Self-record: when we publish that we pin a CID, we are also a
-        // valid answer to findPins for that CID. Without this, a node that
-        // is itself in the closest-K to the CID hash never appears in its
-        // own responses — IPFS provider records are bidirectional.
-        var existing = pinAnnouncements[rootCID] ?? []
-        existing.removeAll { $0.publicKey == config.publicKey }
-        existing.append((publicKey: config.publicKey, expiry: expiry))
-        pinAnnouncements[rootCID] = existing
-
-        let msg = Message.pinAnnounce(rootCID: rootCID, publicKey: config.publicKey, expiry: expiry, signature: signature, fee: fee)
-        let cidHash = Router.hash(rootCID)
-        let closest = router.closestPeers(to: cidHash, count: config.kBucketSize)
-        for entry in closest {
-            let reachable = hasAnyConnection(entry.id) || localPeers[entry.id] != nil
-            guard reachable else { continue }
-            fireToPeer(entry.id, msg)
+    func queryProviders(
+        rootCID: String,
+        targets: [Router.BucketEntry]
+    ) async -> [PeerEndpoint] {
+        guard !targets.isEmpty,
+              pendingProviderQueries[rootCID] != nil
+                || pendingProviderQueries.count < config.maxPendingRequests else { return [] }
+        if let pending = pendingProviderQueries[rootCID],
+           pending.continuations.count >= config.maxWaitersPerRequest {
+            return []
         }
-    }
 
-    func storedPinAnnouncements(for cid: String) -> [String] {
-        (pinAnnouncements[cid] ?? []).map(\.publicKey)
-    }
+        return await withCheckedContinuation { continuation in
+            if var pending = pendingProviderQueries[rootCID] {
+                let newTargets = targets.filter {
+                    !pending.expectedPeers.contains($0.id.publicKey)
+                }
+                pending.continuations.append(continuation)
+                pending.expectedPeers.formUnion(newTargets.map { $0.id.publicKey })
+                pendingProviderQueries[rootCID] = pending
+                for target in newTargets {
+                    fireToPeer(
+                        target.id,
+                        .findProviders(rootCID: rootCID, requestID: pending.requestID))
+                }
+                return
+            }
 
-    // MARK: - Expiry
-
-    public func evict() {
-        evictExpiredPins()
-        evictExpiredProviders()
-    }
-
-    func evictExpiredPins() {
-        let now = UInt64(Date().timeIntervalSince1970)
-        let rootCIDs = Array(pinAnnouncements.keys)
-        for rootCID in rootCIDs {
-            guard var announcements = pinAnnouncements[rootCID] else { continue }
-            announcements.removeAll { $0.expiry <= now }
-            if announcements.isEmpty {
-                pinAnnouncements.removeValue(forKey: rootCID)
-            } else {
-                pinAnnouncements[rootCID] = announcements
+            let requestID = makeProviderRequestID()
+            pendingProviderQueries[rootCID] = PendingProviderQuery(
+                requestID: requestID,
+                continuations: [continuation],
+                expectedPeers: Set(targets.map { $0.id.publicKey }),
+                endpoints: [:])
+            for target in targets {
+                fireToPeer(
+                    target.id,
+                    .findProviders(rootCID: rootCID, requestID: requestID))
+            }
+            Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(500))
+                } catch {
+                    return
+                }
+                await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
             }
         }
     }
 
-    func evictExpiredProviders() {
-        let rootCIDs = Array(providerRecords.keys)
-        for rootCID in rootCIDs {
-            let liveKeys: Set<String>
-            if let announcements = pinAnnouncements[rootCID] {
-                liveKeys = Set(announcements.map(\.publicKey))
-            } else {
-                liveKeys = []
-            }
-            if var providers = providerRecords[rootCID] {
-                providers.removeAll { !liveKeys.contains($0.publicKey) }
-                if providers.isEmpty {
-                    providerRecords.removeValue(forKey: rootCID)
-                } else {
-                    providerRecords[rootCID] = providers
+    private func makeProviderRequestID() -> UInt64 {
+        var requestID = UInt64.random(in: 1 ... .max)
+        while pendingProviderQueries.values.contains(where: { $0.requestID == requestID }) {
+            requestID = UInt64.random(in: 1 ... .max)
+        }
+        return requestID
+    }
+
+    func resolveProviderQuery(rootCID: String, requestID: UInt64) {
+        guard let pending = pendingProviderQueries[rootCID],
+              pending.requestID == requestID else { return }
+        pendingProviderQueries.removeValue(forKey: rootCID)
+        let endpoints = pending.endpoints.values.sorted { $0.publicKey < $1.publicKey }
+        for continuation in pending.continuations {
+            continuation.resume(returning: endpoints)
+        }
+    }
+
+    func providerLookupTargets(rootCID: String) -> [Router.BucketEntry] {
+        let count = min(6, max(1, config.kBucketSize))
+        return router.closestPeers(to: Router.hash(rootCID), count: count).filter {
+            hasEndpointSession($0.id)
+        }
+    }
+
+    func connectToProviderEndpoints(_ endpoints: [PeerEndpoint]) async {
+        let candidates = endpoints.prefix(config.maxContentCandidates).filter {
+            !hasEndpointSession(PeerID(publicKey: $0.publicKey))
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for endpoint in candidates {
+                group.addTask { [weak self] in
+                    try? await self?.connect(to: endpoint)
                 }
             }
         }
+    }
+
+    public func rememberProvider(rootCID: String, peer: PeerID) {
+        guard MessageLimits.accepts(rootCID), hasEndpointSession(peer) else { return }
+        storeProviderHint(
+            rootCID: rootCID,
+            peer: peer,
+            endpoint: providerEndpoint(for: peer),
+            expiresAt: nowUnix() + Self.providerObservationTTL)
+    }
+
+    func storeProviderHint(
+        rootCID: String,
+        peer: PeerID,
+        endpoint: PeerEndpoint?,
+        expiresAt: UInt64
+    ) {
+        if providerHints[rootCID] == nil,
+           providerHints.count >= Self.maxProviderRoots,
+           let evicted = providerHints.keys.first {
+            providerHints.removeValue(forKey: evicted)
+        }
+        var hints = providerHints[rootCID] ?? []
+        hints.removeAll { $0.peer == peer }
+        hints.append(ProviderHint(peer: peer, endpoint: endpoint, expiresAt: expiresAt))
+        if hints.count > config.kBucketSize {
+            hints = Array(hints.suffix(config.kBucketSize))
+        }
+        providerHints[rootCID] = hints
+    }
+
+    func forgetProvider(rootCID: String, peer: PeerID) {
+        guard var hints = providerHints[rootCID] else { return }
+        hints.removeAll { $0.peer == peer }
+        if hints.isEmpty {
+            providerHints.removeValue(forKey: rootCID)
+        } else {
+            providerHints[rootCID] = hints
+        }
+    }
+
+    func connectedProviderIDs(for rootCID: String) -> [PeerID] {
+        evictExpiredProviders(rootCID: rootCID)
+        return (providerHints[rootCID] ?? []).compactMap { hint in
+            guard hasEndpointSession(hint.peer),
+                  !isDeficiencySuppressed(rootCID: rootCID, peer: hint.peer) else { return nil }
+            return hint.peer
+        }
+    }
+
+    public func providers(for rootCID: String) -> [PeerID] {
+        evictExpiredProviders(rootCID: rootCID)
+        return (providerHints[rootCID] ?? []).map(\.peer)
+    }
+
+    func evictExpiredProviders(rootCID: String) {
+        guard var hints = providerHints[rootCID] else { return }
+        let now = nowUnix()
+        hints.removeAll { $0.expiresAt <= now }
+        if hints.isEmpty {
+            providerHints.removeValue(forKey: rootCID)
+        } else {
+            providerHints[rootCID] = hints
+        }
+    }
+
+    func shouldStoreProviderHint(rootCID: String) -> Bool {
+        let keyHash = Router.hash(rootCID)
+        let peers = router.allPeers()
+        guard peers.count >= config.kBucketSize,
+              let farthest = router.closestPeers(to: keyHash, count: config.kBucketSize).last else {
+            return true
+        }
+        return Router.isCloser(router.localHash, than: farthest.hash, to: keyHash)
+    }
+
+    func providerExpiryIsValid(_ expiresAt: UInt64) -> Bool {
+        let now = nowUnix()
+        return expiresAt > now && expiresAt <= now + Self.maxProviderTTL
+    }
+
+    func localProviderEndpoint() -> PeerEndpoint? {
+        if let external = config.externalAddress {
+            return PeerEndpoint(publicKey: localKey.hex, host: external.host, port: external.port)
+        }
+        if let publicAddress {
+            return PeerEndpoint(publicKey: localKey.hex, host: publicAddress.host, port: publicAddress.port)
+        }
+        return nil
+    }
+
+    func providerEndpoint(for peer: PeerID) -> PeerEndpoint? {
+        guard let endpoint = connections[peer]?.endpoint,
+              !endpoint.host.isEmpty,
+              endpoint.host != "unknown",
+              endpoint.port != 0 else { return nil }
+        return endpoint
+    }
+
+    func nowUnix() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970)
     }
 }

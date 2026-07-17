@@ -12,10 +12,10 @@ import Foundation
 ///
 /// Tag prefixes (`v4:` / `v6:` / `raw:`) guarantee groups from different
 /// address families can never collide.
-public enum NetGroup: Sendable {
+enum NetGroup: Sendable {
 
     /// Coarse network-group key for a host string.
-    public static func group(_ host: String) -> String {
+    static func group(_ host: String) -> String {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // NOTE: a static AS-number override map (host/prefix → ASN) could slot

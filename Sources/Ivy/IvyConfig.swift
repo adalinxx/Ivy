@@ -1,121 +1,175 @@
+import Crypto
 import Foundation
 import Tally
 
 public struct IvyConfig: Sendable {
     public static let defaultMaxFrameSize: UInt32 = 4 * 1024 * 1024
-    public static let defaultMaxInboundConnections: Int = 256
+    public static let defaultMaxConnections = 256
+    public static let defaultSTUNServers: [(String, Int)] = [
+        ("stun.l.google.com", 19302),
+        ("stun1.l.google.com", 19302),
+        ("stun.cloudflare.com", 3478),
+    ]
 
-    public let publicKey: String
-    /// Public-overlay participation versus a single identity-pinned operational
-    /// session. Defaults to the existing public overlay behavior.
-    public let topology: IvyTopology
+    public let signingKey: Curve25519.Signing.PrivateKey
+    public let peerKey: PeerKey
+    public var publicKey: String { peerKey.hex }
+    public let mode: IvyMode
     public let listenPort: UInt16
     public let bootstrapPeers: [PeerEndpoint]
-    public let enableLocalDiscovery: Bool
+    public let carriers: [PeerEndpoint]
     public let tallyConfig: TallyConfig
     public let kBucketSize: Int
-    public let maxConcurrentRequests: Int
     public let requestTimeout: Duration
     public let relayTimeout: Duration
-    public let serviceType: String
     public let stunServers: [(String, Int)]
-    public let defaultTTL: UInt8
     public let healthConfig: PeerHealthConfig
-    public let enablePEX: Bool
-    public let pexInterval: Duration
-    public let pexMaxPeers: Int
-    public let signingKey: Data
+    public let routingRefreshInterval: Duration
     public let logger: any IvyLogger
-    public let relayFee: UInt64
-    public let baseThresholdMultiplier: UInt64
     public let maxFrameSize: UInt32
+    public let maxConnections: Int
+    public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
-    public let maxWaitersPerPendingCID: Int
-    public let maxWantCandidates: Int
+    public let maxWaitersPerRequest: Int
+    public let maxConcurrentContentRequests: Int
+    public let maxContentCandidates: Int
     public let minPeerKeyBits: Int
-    public let findNodeBurst: Double
-    public let findNodeRefillPerSec: Double
-    public let pexMaxAcceptedPerRound: Int
-    public let pexMinResponderScore: Double
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
-    public let knownRelays: [PeerEndpoint]
 
     public init(
-        publicKey: String,
+        signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
         bootstrapPeers: [PeerEndpoint] = [],
-        enableLocalDiscovery: Bool = true,
         tallyConfig: TallyConfig = .default,
         kBucketSize: Int = 20,
-        maxConcurrentRequests: Int = 6,
         requestTimeout: Duration = .seconds(15),
         relayTimeout: Duration = .seconds(5),
-        serviceType: String = "_ivy._tcp",
-        stunServers: [(String, Int)] = STUNClient.defaultServers,
-        defaultTTL: UInt8 = 7,
+        stunServers: [(String, Int)] = IvyConfig.defaultSTUNServers,
         healthConfig: PeerHealthConfig = .default,
-        enablePEX: Bool = true,
-        pexInterval: Duration = .seconds(120),
-        pexMaxPeers: Int = 16,
-        signingKey: Data = Data(),
+        routingRefreshInterval: Duration = .seconds(120),
         logger: any IvyLogger = NullLogger(),
-        relayFee: UInt64 = 0,
-        baseThresholdMultiplier: UInt64 = 100,
         maxFrameSize: UInt32 = IvyConfig.defaultMaxFrameSize,
+        maxConnections: Int = IvyConfig.defaultMaxConnections,
+        maxConnectionsPerNetgroup: Int = 2,
         maxPendingRequests: Int = 4_096,
-        maxWaitersPerPendingCID: Int = 64,
+        maxWaitersPerRequest: Int = 64,
+        maxConcurrentContentRequests: Int = 64,
         minPeerKeyBits: Int = 0,
-        maxWantCandidates: Int = 8,
-        findNodeBurst: Double = 40,
-        findNodeRefillPerSec: Double = 10,
-        pexMaxAcceptedPerRound: Int? = nil,
-        pexMinResponderScore: Double = 0,
+        maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
-        knownRelays: [PeerEndpoint] = [],
-        topology: IvyTopology = .publicOverlay
+        carriers: [PeerEndpoint] = [],
+        mode: IvyMode = .overlay
     ) {
-        self.publicKey = publicKey
-        self.topology = topology
+        self.signingKey = signingKey
+        self.peerKey = try! PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation)
+        self.mode = mode
         self.listenPort = listenPort
-
-        // A pinned session cannot be widened by caller-provided discovery or relay
-        // settings. Keep only the expected bootstrap identity and neutralize every
-        // public-overlay discovery mechanism at construction time.
-        self.bootstrapPeers = bootstrapPeers.filter { topology.allowsPeer(publicKey: $0.publicKey) }
-        self.enableLocalDiscovery = topology.participatesInPublicDiscovery && enableLocalDiscovery
-        self.stunServers = topology.participatesInPublicDiscovery ? stunServers : []
-        self.enablePEX = topology.participatesInPublicDiscovery && enablePEX
-        self.relayEnabled = topology.participatesInPublicDiscovery && relayEnabled
-        self.knownRelays = topology.participatesInPublicDiscovery ? knownRelays : []
-
+        self.bootstrapPeers = bootstrapPeers
+        self.carriers = carriers
+        self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
+        self.relayEnabled = relayEnabled
         self.tallyConfig = tallyConfig
         self.kBucketSize = kBucketSize
-        self.maxConcurrentRequests = maxConcurrentRequests
         self.requestTimeout = requestTimeout
         self.relayTimeout = relayTimeout
-        self.serviceType = serviceType
-        self.defaultTTL = defaultTTL
         self.healthConfig = healthConfig
-        self.pexInterval = pexInterval
-        self.pexMaxPeers = pexMaxPeers
-        self.signingKey = signingKey
+        self.routingRefreshInterval = routingRefreshInterval
         self.logger = logger
-        self.relayFee = relayFee
-        self.baseThresholdMultiplier = baseThresholdMultiplier
         self.maxFrameSize = maxFrameSize
+        self.maxConnections = maxConnections
+        self.maxConnectionsPerNetgroup = maxConnectionsPerNetgroup
         self.maxPendingRequests = maxPendingRequests
-        self.maxWaitersPerPendingCID = maxWaitersPerPendingCID
+        self.maxWaitersPerRequest = maxWaitersPerRequest
+        self.maxConcurrentContentRequests = maxConcurrentContentRequests
         self.minPeerKeyBits = minPeerKeyBits
-        self.maxWantCandidates = maxWantCandidates
-        self.findNodeBurst = findNodeBurst
-        self.findNodeRefillPerSec = findNodeRefillPerSec
-        self.pexMaxAcceptedPerRound = pexMaxAcceptedPerRound ?? pexMaxPeers
-        self.pexMinResponderScore = pexMinResponderScore
+        self.maxContentCandidates = maxContentCandidates
         self.externalAddress = externalAddress
     }
 
-    public var shouldRunPEX: Bool { enablePEX }
-    public var shouldRunLocalDiscovery: Bool { enableLocalDiscovery }
+    public func validate() throws {
+        guard maxFrameSize >= 256 else {
+            throw IvyModeError.invalidConfiguration("maxFrameSize must be at least 256")
+        }
+        guard maxConnections > 0,
+              maxConnectionsPerNetgroup > 0,
+              maxPendingRequests > 0,
+              maxWaitersPerRequest > 0,
+              maxConcurrentContentRequests > 0,
+              maxContentCandidates > 0 else {
+            throw IvyModeError.invalidConfiguration("capacity limits must be positive")
+        }
+        guard (1...Int(MessageLimits.maxNeighborCount)).contains(kBucketSize),
+              (0...256).contains(minPeerKeyBits),
+              requestTimeout > .zero,
+              relayTimeout > .zero,
+              routingRefreshInterval > .zero else {
+            throw IvyModeError.invalidConfiguration("routing and timeout limits are invalid")
+        }
+        if healthConfig.enabled {
+            guard healthConfig.keepaliveInterval > .zero,
+                  healthConfig.staleTimeout > healthConfig.keepaliveInterval,
+                  healthConfig.maxMissedPongs > 0 else {
+                throw IvyModeError.invalidConfiguration("peer health limits are invalid")
+            }
+        }
+        if let externalAddress {
+            guard !externalAddress.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  externalAddress.port != 0 else {
+                throw IvyModeError.invalidConfiguration("externalAddress must be dialable")
+            }
+        }
+
+        let pinned = try mode.pinnedKey()
+        if pinned == peerKey {
+            throw IvyModeError.identityRoleCollision(peerKey.hex)
+        }
+        var carrierKeys = Set<PeerKey>()
+        for carrier in carriers {
+            guard endpointIsDialable(carrier) else {
+                throw IvyModeError.invalidConfiguration("carrier endpoint must be dialable")
+            }
+            guard let key = try? PeerKey(carrier.publicKey) else {
+                throw IvyModeError.invalidCarrierIdentity(carrier.publicKey)
+            }
+            guard carrierKeys.insert(key).inserted else {
+                throw IvyModeError.duplicateCarrierIdentity(carrier.publicKey)
+            }
+            guard key != peerKey, key != pinned else {
+                throw IvyModeError.identityRoleCollision(carrier.publicKey)
+            }
+        }
+
+        for endpoint in bootstrapPeers {
+            guard endpointIsDialable(endpoint) else {
+                throw IvyModeError.invalidConfiguration("bootstrap endpoint must be dialable")
+            }
+            guard let key = try? PeerKey(endpoint.publicKey) else {
+                throw IvyModeError.invalidEndpointIdentity(endpoint.publicKey)
+            }
+            guard !carrierKeys.contains(key) else {
+                throw IvyModeError.identityRoleCollision(endpoint.publicKey)
+            }
+            guard key != peerKey else {
+                throw IvyModeError.identityRoleCollision(endpoint.publicKey)
+            }
+            if let pinned, key != pinned {
+                throw IvyModeError.peerOutsidePinnedMode(expected: pinned.hex, actual: endpoint.publicKey)
+            }
+        }
+    }
+
+    private func endpointIsDialable(_ endpoint: PeerEndpoint) -> Bool {
+        !endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && endpoint.port != 0
+    }
+
+    func isConfiguredCarrier(_ key: PeerKey) -> Bool {
+        carriers.contains { (try? PeerKey($0.publicKey)) == key }
+    }
+
+    func allowsEndpoint(_ key: PeerKey) -> Bool {
+        key != peerKey && mode.allowsEndpoint(key) && !isConfiguredCarrier(key)
+    }
 }
