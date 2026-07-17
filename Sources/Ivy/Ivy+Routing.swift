@@ -1,6 +1,18 @@
 import Foundation
 import Tally
 
+enum EndpointProvenance {
+    case selfAdvertisement
+    case referral(String)
+
+    var label: String {
+        switch self {
+        case .selfAdvertisement: "session metadata"
+        case .referral(let source): source
+        }
+    }
+}
+
 extension Ivy {
     // MARK: - DHT
 
@@ -121,26 +133,15 @@ extension Ivy {
         router.removePeer(peer)
     }
 
-    @discardableResult
-    func addDiscoveredPeer(_ endpoint: PeerEndpoint, source: String, from peer: PeerID) -> PeerID? {
-        guard isAcceptableDiscoveredEndpoint(endpoint, source: source, from: peer) else {
-            return nil
-        }
-
-        guard let key = try? PeerKey(endpoint.publicKey) else { return nil }
-        let discovered = key.peerID
-        guard !hasEndpointSession(discovered) else { return nil }
-        router.addPeer(
-            discovered,
-            endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port)
-        )
-        return discovered
-    }
-
-    func isAcceptableDiscoveredEndpoint(_ endpoint: PeerEndpoint, source: String, from peer: PeerID) -> Bool {
-        if source != "session metadata", !config.mode.participatesInPublicDiscovery {
+    func isAcceptableDiscoveredEndpoint(
+        _ endpoint: PeerEndpoint,
+        provenance: EndpointProvenance,
+        from peer: PeerID
+    ) -> Bool {
+        if case .referral = provenance, !config.mode.participatesInPublicDiscovery {
             return false
         }
+        let source = provenance.label
         guard let key = try? PeerKey(endpoint.publicKey), config.allowsEndpoint(key) else {
             config.logger.warning("Rejecting \(source) endpoint from \(peer.publicKey.prefix(16))…: empty public key")
             return false
@@ -159,7 +160,11 @@ extension Ivy {
             return false
         }
 
-        if !allowsDiscoveredHost(host, fromObservedHost: connections[peer]?.observedHost) {
+        if !allowsDiscoveredHost(
+            host,
+            provenance: provenance,
+            fromObservedHost: connections[peer]?.observedHost
+        ) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false
         }
@@ -178,15 +183,28 @@ extension Ivy {
         return true
     }
 
-    func allowsDiscoveredHost(_ host: String, fromObservedHost sourceHost: String?) -> Bool {
+    func allowsDiscoveredHost(
+        _ host: String,
+        provenance: EndpointProvenance,
+        fromObservedHost sourceHost: String?
+    ) -> Bool {
         if !isNonRoutableDiscoveredHost(host) { return true }
-        guard let externalHost = config.externalAddress?.host else { return false }
-        if isPrivateUnicastHost(host) {
-            return isPrivateUnicastHost(externalHost)
+        guard case .selfAdvertisement = provenance,
+              isPrivateUnicastHost(host) || isLoopbackHost(host),
+              let sourceHost else { return false }
+        return sameIPAddress(host, sourceHost)
+    }
+
+    private func sameIPAddress(_ lhs: String, _ rhs: String) -> Bool {
+        let left = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let left = discoveredIPv4Octets(left),
+           let right = discoveredIPv4Octets(right) {
+            return left == right
         }
-        if isLoopbackHost(host) {
-            return isLoopbackHost(externalHost)
-                && sourceHost.map(isLoopbackHost) == true
+        if let left = NetGroup.ipv6Hextets(left),
+           let right = NetGroup.ipv6Hextets(right) {
+            return left == right
         }
         return false
     }

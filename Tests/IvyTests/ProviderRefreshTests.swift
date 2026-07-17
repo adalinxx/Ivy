@@ -85,6 +85,17 @@ struct ProviderRefreshTests {
         #expect(try await TransportTestHarness.eventually {
             await router.providers(for: root).contains(providerID)
         })
+        await router.storeProviderHint(
+            rootCID: root,
+            peer: providerID,
+            endpoint: PeerEndpoint(
+                publicKey: providerID.publicKey,
+                host: "8.8.8.8",
+                port: providerPort),
+            expiresAt: expiry)
+        try await requester.connect(to: TransportTestHarness.endpoint(
+            providerIdentity,
+            port: providerPort))
 
         let staleIdentity = TransportTestHarness.identity("provider-refresh-stale-0")
         let staleID = TransportTestHarness.key(staleIdentity).peerID
@@ -151,6 +162,17 @@ struct ProviderRefreshTests {
         #expect(try await TransportTestHarness.eventually {
             await router.providers(for: root).contains(providerID)
         })
+        await router.storeProviderHint(
+            rootCID: root,
+            peer: providerID,
+            endpoint: PeerEndpoint(
+                publicKey: providerID.publicKey,
+                host: "8.8.8.8",
+                port: providerPort),
+            expiresAt: expiry)
+        try await requester.connect(to: TransportTestHarness.endpoint(
+            providerIdentity,
+            port: providerPort))
         await requester.storeProviderHint(
             rootCID: root,
             peer: TransportTestHarness.key(staleIdentity).peerID,

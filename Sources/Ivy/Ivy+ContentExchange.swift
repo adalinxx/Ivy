@@ -47,6 +47,7 @@ struct PendingNetworkFetch {
 
 struct InboundContentRequest: Hashable {
     let peer: PeerID
+    let connectionID: UUID?
     let requestID: UInt64
 }
 
@@ -55,7 +56,8 @@ extension Ivy {
         requestID: UInt64,
         rootCID: String,
         cids: [String],
-        from peer: PeerID
+        from peer: PeerID,
+        session: AuthenticatedSession? = nil
     ) async {
         guard MessageLimits.accepts(rootCID),
               cids.count <= Int(MessageLimits.maxContentCIDCount),
@@ -64,14 +66,26 @@ extension Ivy {
         guard let maxDataBytes = Message.contentResponseDataBudget(
             for: key.requestedCIDs,
             maxFrameSize: IvyConfig.protocolMaxFrameSize,
-            relayed: connections[peer]?.isDirect == false
+            relayed: session.map { !$0.connection.isDirect }
+                ?? (connections[peer]?.isDirect == false)
         ) else {
-            fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
             return
         }
-        let inbound = InboundContentRequest(peer: peer, requestID: requestID)
+        let inbound = InboundContentRequest(
+            peer: peer,
+            connectionID: session?.connection.connectionID,
+            requestID: requestID)
         guard beginServingContent(inbound) else {
-            fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
             return
         }
         defer { endServingContent(inbound) }
@@ -81,13 +95,18 @@ extension Ivy {
             cids: key.requestedCIDs,
             maxDataBytes: maxDataBytes
         ) ?? []
+        guard session.map(isCurrent) ?? true else { return }
 
         guard let byCID = validatedContent(
             available,
             for: key,
             maxDataBytes: maxDataBytes
         ) else {
-            fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
             return
         }
 
@@ -95,10 +114,30 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
-        guard case .enqueued = fireToPeer(peer, response) else {
-            fireToPeer(peer, .contentUnavailable(requestID: requestID), bypassAdmission: true)
+        guard case .enqueued = sendContentReply(response, to: peer, session: session) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
             return
         }
+    }
+
+    @discardableResult
+    private func sendContentReply(
+        _ message: Message,
+        to peer: PeerID,
+        session: AuthenticatedSession?,
+        bypassAdmission: Bool = false
+    ) -> SendMessageResult {
+        if let session {
+#if DEBUG
+            contentReplyConnectionsForTesting.append(session.connection.connectionID)
+#endif
+            return enqueueIfCurrent(message, on: session, bypassAdmission: bypassAdmission)
+        }
+        return fireToPeer(peer, message, bypassAdmission: bypassAdmission)
     }
 
     private func beginServingContent(_ request: InboundContentRequest) -> Bool {

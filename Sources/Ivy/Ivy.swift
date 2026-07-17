@@ -32,7 +32,7 @@ private struct PendingSession {
     var remoteMetadata: PeerMetadata?
 }
 
-private final class AuthenticatedSession {
+final class AuthenticatedSession {
     let connection: PeerConnection
     let peerKey: PeerKey
     let role: AuthenticatedPeerRole
@@ -98,6 +98,7 @@ public actor Ivy {
     public let localID: PeerID
     let localKey: PeerKey
     let group: EventLoopGroup
+    let inboundByteBudget: InboundByteBudget
 
     public weak var delegate: IvyDelegate?
     var contentSource: (any IvyContentSource)?
@@ -161,6 +162,7 @@ public actor Ivy {
         self.tally = tally ?? Tally(config: config.tallyConfig)
         self.router = Router(localID: PeerID(publicKey: config.publicKey), k: config.kBucketSize)
         self.group = group
+        self.inboundByteBudget = InboundByteBudget(limit: config.maxInboundBufferedBytes)
         self.stunClient = STUNClient(group: group, servers: config.stunServers)
     }
 
@@ -308,6 +310,10 @@ public actor Ivy {
         endpointSessions[key] ?? carrierSessions[key]
     }
 
+    func isCurrent(_ session: AuthenticatedSession) -> Bool {
+        running && sessionForAuthority((session.peerKey, session.role)) === session
+    }
+
     func hasEndpointSession(_ peer: PeerID) -> Bool {
         guard let key = try? PeerKey(peer.publicKey) else { return false }
         return endpointSessions[key] != nil
@@ -368,7 +374,8 @@ public actor Ivy {
         do {
             connection = try await PeerConnection.dial(
                 endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port),
-                group: group)
+                group: group,
+                inboundByteBudget: inboundByteBudget)
         } catch {
             finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
             guard isCurrentRun(generation) else { throw IvyError.notRunning }
@@ -418,7 +425,8 @@ public actor Ivy {
         do {
             connection = try await PeerConnection.dial(
                 endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port),
-                group: group)
+                group: group,
+                inboundByteBudget: inboundByteBudget)
         } catch {
             finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
             throw error
@@ -654,8 +662,9 @@ public actor Ivy {
     }
 
     private func handleInbound(_ connection: PeerConnection) async {
-        for await bytes in connection.records {
-            await handleSessionRecord(bytes, on: connection)
+        for await frame in connection.records {
+            await handleSessionRecord(frame.bytes, on: connection)
+            withExtendedLifetime(frame) {}
         }
         connectionEnded(connection)
     }
@@ -902,7 +911,7 @@ public actor Ivy {
         pending.connection.releaseInboundAdmission()
 
         await healthMonitor?.trackPeer(peerKey.peerID)
-        if sessionForAuthority((peerKey, role)) === session,
+        if isCurrent(session),
            session.connection.isLive,
            !session.didNotifyConnect {
             session.didNotifyConnect = true
@@ -922,7 +931,11 @@ public actor Ivy {
     ) -> PeerEndpoint? {
         for address in addresses {
             let endpoint = PeerEndpoint(publicKey: key.hex, host: address.host, port: address.port)
-            if isAcceptableDiscoveredEndpoint(endpoint, source: "session metadata", from: peer) {
+            if isAcceptableDiscoveredEndpoint(
+                endpoint,
+                provenance: .selfAdvertisement,
+                from: peer
+            ) {
                 return endpoint
             }
         }
@@ -983,7 +996,9 @@ public actor Ivy {
 
         authenticatedConnections.removeValue(forKey: session.connection.connectionID)
         removeRoutes(involving: key)
-        Task { await self.healthMonitor?.removePeer(key.peerID) }
+        if let monitor = healthMonitor {
+            Task { await monitor.removePeer(key.peerID) }
+        }
         if session.didNotifyConnect {
             delegate?.ivy(self, didDisconnect: key.peerID)
         }
@@ -1129,6 +1144,15 @@ public actor Ivy {
         return .enqueued(endpoint: session.peerKey.peerID, route: session.connection.route)
     }
 
+    func enqueueIfCurrent(
+        _ message: Message,
+        on session: AuthenticatedSession,
+        bypassAdmission: Bool = false
+    ) -> SendMessageResult {
+        guard isCurrent(session) else { return .notConnected }
+        return enqueue(message, on: session, bypassAdmission: bypassAdmission)
+    }
+
     private func sendRelayControl(_ message: Message, to key: PeerKey) -> Bool {
         let session: AuthenticatedSession?
         if let carrier = carrierSessions[key] {
@@ -1168,6 +1192,7 @@ public actor Ivy {
         _ record: SessionDataRecord,
         session: AuthenticatedSession
     ) async {
+        guard isCurrent(session) else { return }
         guard record.isValid(sender: session.peerKey, receiver: localKey) else {
             rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
                 session.peerKey,
@@ -1205,7 +1230,7 @@ public actor Ivy {
                 rejectAuthenticatedSession(session, attributedTo: session.peerKey)
                 return
             }
-            await handleRelayControl(message, from: session.peerKey)
+            handleRelayControl(message, from: session.peerKey)
             return
         }
 
@@ -1218,7 +1243,7 @@ public actor Ivy {
                 return
             }
         }
-        await handleMessage(message, from: session.peerKey.peerID)
+        await handleMessage(message, from: session.peerKey.peerID, session: session)
     }
 
     private func isRelayControl(_ message: Message) -> Bool {
@@ -1317,7 +1342,7 @@ public actor Ivy {
         pending.continuation.resume(returning: nil)
     }
 
-    private func handleRelayControl(_ message: Message, from sender: PeerKey) async {
+    private func handleRelayControl(_ message: Message, from sender: PeerKey) {
         switch message {
         case .relayOpen(let routeID, let target):
             guard routeID.count == 32,
@@ -1591,15 +1616,21 @@ public actor Ivy {
         PeerConnection(
             endpoint: endpoint,
             routeID: routeID,
-            carrier: carrier)
+            carrier: carrier,
+            inboundByteBudget: inboundByteBudget)
     }
 
     // MARK: - Message Handling
 
-    func handleMessage(_ message: Message, from peer: PeerID) async {
+    func handleMessage(
+        _ message: Message,
+        from peer: PeerID,
+        session: AuthenticatedSession? = nil
+    ) async {
         if let monitor = healthMonitor {
             await monitor.recordActivity(from: peer)
         }
+        if let session, !isCurrent(session) { return }
         guard message.isKeepalive || tally.shouldAllow(peer: peer) else { return }
         switch message {
         case .ping(let nonce):
@@ -1622,14 +1653,16 @@ public actor Ivy {
             guard isExpectedNeighborResponse(nonce: nonce, from: peer) else { return }
             var accepted: [PeerEndpoint] = []
             for ep in endpoints {
-                guard isAcceptableDiscoveredEndpoint(ep, source: "neighbors", from: peer),
+                guard isAcceptableDiscoveredEndpoint(
+                        ep,
+                        provenance: .referral("neighbors"),
+                        from: peer),
                       let key = try? PeerKey(ep.publicKey) else { continue }
                 let canonical = PeerEndpoint(
                     publicKey: key.hex,
                     host: ep.host.trimmingCharacters(in: .whitespacesAndNewlines),
                     port: ep.port)
                 accepted.append(canonical)
-                _ = addDiscoveredPeer(canonical, source: "neighbors", from: peer)
             }
             receiveNeighborResponse(nonce: nonce, endpoints: accepted, from: peer)
 
@@ -1638,7 +1671,8 @@ public actor Ivy {
                 requestID: requestID,
                 rootCID: rootCID,
                 cids: cids,
-                from: peer
+                from: peer,
+                session: session
             )
 
         case .contentResponse(let requestID, let entries):
@@ -1814,6 +1848,41 @@ public actor Ivy {
             .map { $0 }
     }
 
+#if DEBUG
+    var contentReplyConnectionsForTesting: [UUID] = []
+
+    func handleContentRequestForTesting(
+        connection: PeerConnection,
+        peerKey: PeerKey,
+        sessionMarker: UInt8,
+        requestID: UInt64
+    ) async {
+        let session = AuthenticatedSession(
+            connection: connection,
+            peerKey: peerKey,
+            role: .endpoint,
+            sessionID: try! SessionID(bytes: Data(repeating: sessionMarker, count: 32)),
+            metadata: PeerMetadata())
+        running = true
+        endpointSessions[session.peerKey] = session
+        await handleContentRequest(
+            requestID: requestID,
+            rootCID: "root",
+            cids: [],
+            from: peerKey.peerID,
+            session: session)
+    }
+
+    func selectedSessionIDForTesting(_ peer: PeerID) -> Data? {
+        guard let key = try? PeerKey(peer.publicKey) else { return nil }
+        return endpointSessions[key]?.sessionID.bytes
+    }
+
+    var pendingSessionCountForTesting: Int { pendingSessions.count }
+
+    var sentContentRepliesForTesting: [UUID] { contentReplyConnectionsForTesting }
+#endif
+
     func startListener(
         generation: UInt64
     ) async throws -> (channel: Channel, gate: InboundAdmissionGate) {
@@ -1825,11 +1894,12 @@ public actor Ivy {
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
             .childChannelInitializer { channel in
-                let decoder = SessionFrameDecoder()
+                let decoder = SessionFrameDecoder(budget: self.inboundByteBudget)
                 let acceptor = InboundConnectionAcceptor(
                     ivy: self,
                     generation: generation,
-                    admissionGate: gate
+                    admissionGate: gate,
+                    inboundByteBudget: self.inboundByteBudget
                 )
                 return channel.pipeline.addHandlers([decoder, acceptor])
             }

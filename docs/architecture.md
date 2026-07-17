@@ -29,6 +29,9 @@ role converge on the smaller session ID.
 ## Bounds
 
 - Every encoder, decoder, direct peer, and relay uses one 4 MiB frame-body cap.
+- One node-wide byte budget covers partial headers, declared frame bodies,
+  relayed records, and queued records. Its default is 64 MiB; exhaustion closes
+  the affected connection without peer blame.
 - Canonical session metadata is limited to 64 KiB.
 - Strings, collections, connections, netgroups, pending requests, waiters,
   candidates, routing entries, provider hints, and relay routes are bounded.
@@ -41,8 +44,12 @@ and pressure. Local rate denial is not a protocol violation.
 
 Overlay mode uses correlated `findNode` responses from authenticated Kademlia
 peers. Address scope, mode, identity work, connection capacity, and netgroup
-policy apply before admission. Pinned mode admits one endpoint identity. Ivy has
-no peer-exchange protocol.
+policy apply before admission. Referrals are lookup candidates, not routing
+entries; only a successful authenticated session promotes an endpoint into
+routing. A referral must use a globally routable IP. A private or loopback
+self-advertisement is usable only when it exactly matches the observed socket
+address. Pinned mode admits one endpoint identity. Ivy has no peer-exchange
+protocol.
 
 A content request is exactly:
 
@@ -80,7 +87,8 @@ route or service state, not protocol violations.
 Lifecycle calls execute in order. Each run has a generation; dials, reconnects,
 lookups, routes, provider queries, and content leaders also carry generations or
 tokens. `stop()` invalidates them and resumes waiters, so old completions cannot
-mutate a newer run.
+mutate a newer run. A callback retains its exact authenticated session and
+cannot send a reply through a replacement session for the same peer.
 
 See [correctness-invariants.md](correctness-invariants.md) for the normative
 review laws.

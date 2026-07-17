@@ -5,6 +5,7 @@ import Tally
 public struct IvyConfig: Sendable {
     public static let protocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
     public static let defaultMaxConnections = 256
+    public static let defaultMaxInboundBufferedBytes = 64 * 1024 * 1024
     public static let defaultSTUNServers: [(String, Int)] = [
         ("stun.l.google.com", 19302),
         ("stun1.l.google.com", 19302),
@@ -32,6 +33,7 @@ public struct IvyConfig: Sendable {
     public let maxWaitersPerRequest: Int
     public let maxConcurrentContentRequests: Int
     public let maxContentCandidates: Int
+    public let maxInboundBufferedBytes: Int
     public let minPeerKeyBits: Int
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
@@ -53,6 +55,7 @@ public struct IvyConfig: Sendable {
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
         maxConcurrentContentRequests: Int = 64,
+        maxInboundBufferedBytes: Int = IvyConfig.defaultMaxInboundBufferedBytes,
         minPeerKeyBits: Int = 0,
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
@@ -80,6 +83,7 @@ public struct IvyConfig: Sendable {
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
         self.maxConcurrentContentRequests = maxConcurrentContentRequests
+        self.maxInboundBufferedBytes = maxInboundBufferedBytes
         self.minPeerKeyBits = minPeerKeyBits
         self.maxContentCandidates = maxContentCandidates
         self.externalAddress = externalAddress
@@ -93,6 +97,10 @@ public struct IvyConfig: Sendable {
               maxConcurrentContentRequests > 0,
               maxContentCandidates > 0 else {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
+        }
+        guard maxInboundBufferedBytes >= Int(IvyConfig.protocolMaxFrameSize) + 4 else {
+            throw IvyModeError.invalidConfiguration(
+                "inbound byte budget must hold one maximum frame")
         }
         guard (1...Int(MessageLimits.maxNeighborCount)).contains(kBucketSize),
               (0...256).contains(minPeerKeyBits),

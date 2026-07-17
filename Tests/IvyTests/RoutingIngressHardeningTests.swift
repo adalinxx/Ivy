@@ -47,15 +47,16 @@ struct RoutingIngressHardeningTests {
         let valid = keyWithWork(atLeast: requiredBits)
         let unusable = keyWithWork(atLeast: requiredBits, seed: "unusable")
         await node.handleMessage(.neighbors([
-            PeerEndpoint(publicKey: "not-a-peer-key", host: "10.0.0.1", port: 4001),
-            PeerEndpoint(publicKey: lowWork, host: "10.0.0.2", port: 4001),
-            PeerEndpoint(publicKey: unusable, host: "10.0.0.3", port: 0),
-            PeerEndpoint(publicKey: valid, host: "10.0.0.4", port: 4001),
+            PeerEndpoint(publicKey: "not-a-peer-key", host: "1.1.1.1", port: 4001),
+            PeerEndpoint(publicKey: lowWork, host: "1.1.1.2", port: 4001),
+            PeerEndpoint(publicKey: unusable, host: "1.1.1.3", port: 0),
+            PeerEndpoint(publicKey: valid, host: "1.1.1.4", port: 4001),
         ], nonce: nonce), from: peerID)
-        _ = await waiter.value
+        let returned = await waiter.value
 
         let routed = Set(await node.knownPeerEndpoints.map(\.publicKey))
-        #expect(routed == Set([peerID.publicKey, valid]))
+        #expect(returned.map(\.publicKey) == [valid])
+        #expect(routed == Set([peerID.publicKey]))
     }
 
     @Test("Unsolicited and wrong-peer neighbors cannot mutate routing")
@@ -79,8 +80,8 @@ struct RoutingIngressHardeningTests {
         #expect(!(await node.knownPeerEndpoints.map(\.publicKey).contains(advertised.publicKey)))
 
         await node.handleMessage(.neighbors([advertised], nonce: nonce), from: queriedID)
-        _ = await waiter.value
-        #expect(await node.knownPeerEndpoints.map(\.publicKey).contains(advertised.publicKey))
+        #expect(await waiter.value == [advertised])
+        #expect(!(await node.knownPeerEndpoints.map(\.publicKey).contains(advertised.publicKey)))
     }
 
     @Test("Public discovery rejects SSRF destinations")
@@ -96,7 +97,10 @@ struct RoutingIngressHardeningTests {
             "::1", "fc00::1", "64:ff9b::0a00:0001", "example.com",
         ] {
             let endpoint = PeerEndpoint(publicKey: endpointKey, host: host, port: 4001)
-            #expect(!(await node.isAcceptableDiscoveredEndpoint(endpoint, source: "test", from: source)))
+            #expect(!(await node.isAcceptableDiscoveredEndpoint(
+                endpoint,
+                provenance: .referral("test"),
+                from: source)))
         }
 
         for host in [
@@ -104,7 +108,10 @@ struct RoutingIngressHardeningTests {
             "::ffff:0808:0808",
         ] {
             let endpoint = PeerEndpoint(publicKey: endpointKey, host: host, port: 4001)
-            #expect(await node.isAcceptableDiscoveredEndpoint(endpoint, source: "test", from: source))
+            #expect(await node.isAcceptableDiscoveredEndpoint(
+                endpoint,
+                provenance: .referral("test"),
+                from: source))
         }
 
         let localNode = routingNode(
@@ -113,13 +120,13 @@ struct RoutingIngressHardeningTests {
         let privateEndpoint = PeerEndpoint(publicKey: endpointKey, host: "10.0.0.1", port: 4001)
         #expect(await localNode.isAcceptableDiscoveredEndpoint(
             privateEndpoint,
-            source: "test",
-            from: source))
+            provenance: .referral("test"),
+            from: source) == false)
 
         let unknownNode = routingNode("routing-unknown")
         #expect(!(await unknownNode.isAcceptableDiscoveredEndpoint(
             privateEndpoint,
-            source: "test",
+            provenance: .referral("test"),
             from: source)))
 
         let domainNode = routingNode(
@@ -127,11 +134,14 @@ struct RoutingIngressHardeningTests {
             externalAddress: (host: "node.example", port: 4001))
         #expect(!(await domainNode.isAcceptableDiscoveredEndpoint(
             privateEndpoint,
-            source: "test",
+            provenance: .referral("test"),
             from: source)))
 
         for host in ["127.0.0.1", "169.254.169.254", "100.64.0.1", "192.0.2.1", "example.com"] {
-            #expect(!(await localNode.allowsDiscoveredHost(host, fromObservedHost: "10.0.0.2")))
+            #expect(!(await localNode.allowsDiscoveredHost(
+                host,
+                provenance: .referral("test"),
+                fromObservedHost: host)))
         }
 
         let loopbackNode = routingNode(
@@ -139,39 +149,56 @@ struct RoutingIngressHardeningTests {
             externalAddress: (host: "127.0.0.1", port: 4001))
         #expect(await loopbackNode.allowsDiscoveredHost(
             "127.0.0.2",
-            fromObservedHost: "127.0.0.3"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "127.0.0.2"))
         #expect(await loopbackNode.allowsDiscoveredHost(
             "::ffff:127.0.0.2",
-            fromObservedHost: "::ffff:127.0.0.3"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "127.0.0.2"))
         #expect(await loopbackNode.allowsDiscoveredHost(
             "::ffff:7f00:0002",
-            fromObservedHost: "::ffff:7f00:0003"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "127.0.0.2"))
         #expect(!(await loopbackNode.allowsDiscoveredHost(
             "127.0.0.2",
+            provenance: .selfAdvertisement,
             fromObservedHost: "8.8.8.8")))
         #expect(!(await loopbackNode.allowsDiscoveredHost(
             "10.0.0.1",
+            provenance: .selfAdvertisement,
             fromObservedHost: "127.0.0.3")))
 
         #expect(await localNode.allowsDiscoveredHost(
             "::ffff:10.0.0.1",
-            fromObservedHost: "10.0.0.2"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "10.0.0.1"))
         #expect(await localNode.allowsDiscoveredHost(
             "::ffff:0a00:0001",
-            fromObservedHost: "10.0.0.2"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "10.0.0.1"))
         let mappedPrivateNode = routingNode(
             "routing-mapped-private",
             externalAddress: (host: "::ffff:10.0.0.10", port: 4001))
         #expect(await mappedPrivateNode.allowsDiscoveredHost(
             "10.0.0.1",
-            fromObservedHost: "::ffff:10.0.0.2"))
+            provenance: .selfAdvertisement,
+            fromObservedHost: "::ffff:10.0.0.1"))
 
         let ulaNode = routingNode(
             "routing-ula",
             externalAddress: (host: "fd00::10", port: 4001))
-        #expect(await ulaNode.allowsDiscoveredHost("fc00::1", fromObservedHost: "fd00::2"))
-        #expect(!(await ulaNode.allowsDiscoveredHost("::1", fromObservedHost: "fd00::2")))
-        #expect(!(await ulaNode.allowsDiscoveredHost("fe80::1", fromObservedHost: "fd00::2")))
+        #expect(await ulaNode.allowsDiscoveredHost(
+            "fc00::1",
+            provenance: .selfAdvertisement,
+            fromObservedHost: "fc00::1"))
+        #expect(!(await ulaNode.allowsDiscoveredHost(
+            "::1",
+            provenance: .selfAdvertisement,
+            fromObservedHost: "fd00::2")))
+        #expect(!(await ulaNode.allowsDiscoveredHost(
+            "fe80::1",
+            provenance: .selfAdvertisement,
+            fromObservedHost: "fe80::1")))
     }
 
     @Test("routing key work uses the canonical validated identity")
@@ -184,10 +211,10 @@ struct RoutingIngressHardeningTests {
         let source = PeerID(publicKey: deterministicTestPeerKey("routing-canonical-source"))
 
         for spelling in [canonical, alternate] {
-            let endpoint = PeerEndpoint(publicKey: spelling, host: "10.0.0.2", port: 4001)
+            let endpoint = PeerEndpoint(publicKey: spelling, host: "8.8.8.8", port: 4001)
             #expect(!(await node.isAcceptableDiscoveredEndpoint(
                 endpoint,
-                source: "test",
+                provenance: .referral("test"),
                 from: source)))
         }
     }
@@ -207,7 +234,7 @@ private func routingNode(
 }
 
 private func testRoutingEndpoint(_ label: String, port: UInt16) -> PeerEndpoint {
-    PeerEndpoint(publicKey: deterministicTestPeerKey(label), host: "10.0.0.1", port: port)
+    PeerEndpoint(publicKey: deterministicTestPeerKey(label), host: "1.1.1.1", port: port)
 }
 
 private func keyWithWork(atLeast target: Int, seed: String = "valid") -> String {
