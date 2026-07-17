@@ -92,10 +92,13 @@ extension Ivy {
     }
 
     public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
+        let generation = runGeneration
         guard MessageLimits.accepts(rootCID) else { return [] }
         let cached = cachedProviderEndpoints(rootCID: rootCID)
         return cached.isEmpty
-            ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(rootCID: rootCID))
+            ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(
+                rootCID: rootCID,
+                generation: generation))
             : cached
     }
 
@@ -104,14 +107,21 @@ extension Ivy {
         return uniqueProviderEndpoints((providerHints[rootCID] ?? []).compactMap(\.endpoint))
     }
 
-    func queryFreshProviderEndpoints(rootCID: String) async -> [PeerEndpoint] {
-        guard MessageLimits.accepts(rootCID) else { return [] }
+    func queryFreshProviderEndpoints(
+        rootCID: String,
+        generation: UInt64
+    ) async -> [PeerEndpoint] {
+        guard isCurrentRun(generation), MessageLimits.accepts(rootCID) else { return [] }
         var targets = providerLookupTargets(rootCID: rootCID)
         if targets.isEmpty {
-            _ = await findNode(target: rootCID)
+            _ = await findNode(target: rootCID, generation: generation)
+            guard isCurrentRun(generation) else { return [] }
             targets = providerLookupTargets(rootCID: rootCID)
         }
-        return await queryProviders(rootCID: rootCID, targets: targets)
+        return await queryProviders(
+            rootCID: rootCID,
+            targets: targets,
+            generation: generation)
     }
 
     private func uniqueProviderEndpoints(_ endpoints: [PeerEndpoint]) -> [PeerEndpoint] {
@@ -121,8 +131,10 @@ extension Ivy {
 
     func queryProviders(
         rootCID: String,
-        targets: [Router.BucketEntry]
+        targets: [Router.BucketEntry],
+        generation: UInt64? = nil
     ) async -> [PeerEndpoint] {
+        if let generation, !isCurrentRun(generation) { return [] }
         guard !targets.isEmpty,
               pendingProviderQueries[rootCID] != nil
                 || pendingProviderQueries.count < config.maxPendingRequests else { return [] }
@@ -131,7 +143,7 @@ extension Ivy {
             return []
         }
 
-        return await withCheckedContinuation { continuation in
+        let endpoints = await withCheckedContinuation { continuation in
             if var pending = pendingProviderQueries[rootCID] {
                 let newTargets = targets.filter {
                     !pending.expectedPeers.contains($0.id.publicKey)
@@ -167,6 +179,8 @@ extension Ivy {
                 await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
             }
         }
+        if let generation, !isCurrentRun(generation) { return [] }
+        return endpoints
     }
 
     private func makeProviderRequestID() -> UInt64 {
@@ -196,18 +210,27 @@ extension Ivy {
         }
     }
 
-    func connectToProviderEndpoints(_ endpoints: [PeerEndpoint]) async -> Set<PeerEndpoint> {
+    func connectToProviderEndpoints(
+        _ endpoints: [PeerEndpoint],
+        generation: UInt64
+    ) async -> Set<PeerEndpoint> {
+        guard isCurrentRun(generation) else { return [] }
         let candidates = uniqueProviderEndpoints(endpoints).filter {
             !hasEndpointSession(PeerID(publicKey: $0.publicKey))
         }.prefix(config.maxContentCandidates)
         await withTaskGroup(of: Void.self) { group in
             for endpoint in candidates {
                 group.addTask { [weak self] in
-                    try? await self?.connect(to: endpoint)
+                    guard let self,
+                          await self.isCurrentRun(generation) else { return }
+                    _ = try? await self.connectEndpointIfAdmitted(
+                        to: endpoint,
+                        allowRelayFallback: true,
+                        requiredGeneration: generation)
                 }
             }
         }
-        return Set(candidates)
+        return isCurrentRun(generation) ? Set(candidates) : []
     }
 
     public func rememberProvider(rootCID: String, peer: PeerID) {

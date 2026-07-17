@@ -1,9 +1,72 @@
 import Foundation
+import NIOCore
+import NIOEmbedded
 import Testing
 @testable import Ivy
 
 @Suite("Configured carrier relay", .serialized)
 struct RelayIntegrationTests {
+    @Test("unconfigured overlay peers cannot inject unrelated relay state")
+    func unrelatedRelayControlIsRejected() async throws {
+        let senderIdentity = TransportTestHarness.identity("relay-unrelated-sender")
+        let targetIdentity = TransportTestHarness.identity("relay-unrelated-target")
+        let sender = Ivy(config: TransportTestHarness.config(
+            senderIdentity,
+            port: TransportTestHarness.nextPort()))
+        let targetPort = TransportTestHarness.nextPort()
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort))
+        let targetRecorder = TransportTestRecorder()
+        await target.setTestDelegate(targetRecorder)
+
+        try await sender.start()
+        try await target.start()
+        try await sender.connect(to: TransportTestHarness.endpoint(targetIdentity, port: targetPort))
+        let senderID = TransportTestHarness.key(senderIdentity).peerID
+        try await targetRecorder.waitForConnect(senderID)
+
+        #expect(await sender.sendAuthenticatedMessageForTesting(
+            .relayReady(routeID: Data(repeating: 1, count: 32), status: 0),
+            to: TransportTestHarness.key(targetIdentity).peerID))
+        try await targetRecorder.waitForDisconnect(senderID)
+        #expect(await target.peerConnectionCount == 0)
+
+        await sender.stop()
+        await target.stop()
+    }
+
+    @Test("inbound offers from one authenticated carrier remain bounded")
+    func inboundOfferCap() async throws {
+        let targetIdentity = TransportTestHarness.identity("relay-offer-cap-target")
+        let carrierIdentity = TransportTestHarness.identity("relay-offer-cap-carrier")
+        let sourceIdentity = TransportTestHarness.identity("relay-offer-cap-source")
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: TransportTestHarness.nextPort()))
+        let carrierEndpoint = TransportTestHarness.endpoint(carrierIdentity, port: 4001)
+        let carrierKey = TransportTestHarness.key(carrierIdentity)
+        let channel = EmbeddedChannel()
+        try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).get()
+        let connection = PeerConnection(endpoint: carrierEndpoint, channel: channel)
+        try await target.seedConnectedEndpointForTesting(
+            carrierEndpoint,
+            connection: connection,
+            marker: 1)
+
+        for marker in 1...(Ivy.maxRelayRoutesPerPeer + 1) {
+            await target.handleRelayControlForTesting(
+                .relayOffer(
+                    routeID: Data(repeating: UInt8(marker), count: 32),
+                    sourceKey: TransportTestHarness.key(sourceIdentity)),
+                from: carrierKey)
+        }
+
+        #expect(await target.installedRouteCountForTesting == Ivy.maxRelayRoutesPerPeer)
+        await target.disconnect(carrierKey.peerID)
+        _ = try? channel.finish()
+    }
+
     @Test("A configured carrier authenticates one route ID and forwards peer messages")
     func configuredCarrierRelay() async throws {
         let carrierIdentity = TransportTestHarness.identity("relay-carrier")

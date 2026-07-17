@@ -22,6 +22,63 @@ struct MessageTests {
         return .data(record)
     }
 
+    @Test("frozen v8 message vectors")
+    func frozenV8Vectors() throws {
+        let route = String(repeating: "11", count: 32)
+        let keyBytes = String(repeating: "44", count: 32)
+        let key = try PeerKey(rawRepresentation: Data(repeating: 0x44, count: 32))
+        let target = String(repeating: "ab", count: 32)
+        let endpoint = PeerEndpoint(publicKey: "pk", host: "h", port: 0x1234)
+        let vectors: [(Message, String)] = [
+            (.ping(nonce: 0x0102_0304_0506_0708), "000102030405060708"),
+            (.pong(nonce: 0x0102_0304_0506_0708), "010102030405060708"),
+            (.findNode(target: Data(repeating: 0xab, count: 32), nonce: 2),
+             "0500000020\(target)0000000000000002"),
+            (.neighbors([], nonce: 2), "0600000000000000000002"),
+            (.neighbors([endpoint], nonce: 2),
+             "0600010002706b00016812340000000000000002"),
+            (.contentRequest(requestID: 3, rootCID: "r", cids: []),
+             "1a00000000000000030001720000"),
+            (.contentRequest(requestID: 3, rootCID: "r", cids: ["a", "bc"]),
+             "1a0000000000000003000172000200016100026263"),
+            (.contentResponse(requestID: 3, entries: []), "3200000000000000030000"),
+            (.contentResponse(requestID: 3, entries: [
+                ContentEntry(cid: "r", data: Data([1, 2])),
+                ContentEntry(cid: "x", data: Data()),
+            ]), "320000000000000003000200017200000002010200017800000000"),
+            (.contentUnavailable(requestID: 3), "3a0000000000000003"),
+            (.findProviders(rootCID: "r", requestID: 4), "280001720000000000000004"),
+            (.providers(rootCID: "r", requestID: 4, records: []),
+             "2900017200000000000000000004"),
+            (.providers(
+                rootCID: "r",
+                requestID: 4,
+                records: [ProviderRecord(endpoint: endpoint, expiresAt: 0x0102_0304_0506_0708)]),
+             "2900017200010002706b000168123401020304050607080000000000000004"),
+            (.announceProvider(rootCID: "r", expiresAt: 5), "2a0001720000000000000005"),
+            (.relayOpen(routeID: Data(repeating: 0x11, count: 32), targetKey: key),
+             "3c\(route)\(keyBytes)"),
+            (.relayOffer(routeID: Data(repeating: 0x11, count: 32), sourceKey: key),
+             "3d\(route)\(keyBytes)"),
+            (.relayAccept(routeID: Data(repeating: 0x11, count: 32), status: 1),
+             "3e\(route)01"),
+            (.relayReady(routeID: Data(repeating: 0x11, count: 32), status: 0),
+             "3f\(route)00"),
+            (.relayPacket(
+                routeID: Data(repeating: 0x11, count: 32),
+                opaqueEndpointRecord: Data([4, 5, 6])),
+             "40\(route)00000003040506"),
+            (.relayClose(routeID: Data(repeating: 0x11, count: 32)), "41\(route)"),
+            (.peerMessage(topic: "t", payload: Data([0xaa])), "3100017400000001aa"),
+        ]
+
+        for (message, hex) in vectors {
+            let expected = try #require(Data(hexString: hex))
+            #expect(message.serialize() == expected)
+            #expect(Message.deserialize(expected)?.serialize() == expected)
+        }
+    }
+
     @Test("every v8 message roundtrips canonically")
     func roundtrip() throws {
         let endpoint = PeerEndpoint(publicKey: "peer", host: "192.0.2.1", port: 4001)

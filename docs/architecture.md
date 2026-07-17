@@ -71,8 +71,11 @@ that peer briefly for that root; it does not create peer-global blame.
 
 ## Relay and attribution
 
-Only configured carriers may relay. Endpoint records remain signed end to end,
-so a carrier cannot become the endpoint or enter endpoint routing.
+Outbound relay initiation uses configured carriers. A target may accept an
+inbound route offered by another authenticated direct peer without configuring
+that peer as its carrier. The route grants transport only: endpoint records
+remain signed end to end, so the offer cannot change either endpoint identity
+or place the carrier in endpoint routing.
 
 Ivy attributes a violation only after verifying the charged peer's signature.
 Signed malformed endpoint payloads remain attributable through relay. Unsigned

@@ -7,6 +7,26 @@ import NIOEmbedded
 @Suite("STUN Response Parsing")
 struct STUNParsingTests {
 
+    @Test("RFC 5769 IPv4 response vector referenced by RFC 8489")
+    func rfcIPv4ResponseVector() throws {
+        let vector = try #require(Data(hexString:
+            "0101003c2112a442b7e7a701bc34d686fa87dfae"
+                + "8022000b7465737420766563746f7220"
+                + "002000080001a147e112a643"
+                + "000800142b91f599fd9e90c38c7489f92af9ba53f06be7d7"
+                + "80280004c07d4c96"))
+        var buffer = ByteBuffer(bytes: vector)
+
+        let address = STUNResponseHandler.parseResponse(
+            &buffer,
+            expectedTransactionID: [
+                0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+                0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+            ])
+
+        #expect(address == ObservedAddress(host: "192.0.2.1", port: 32_853))
+    }
+
     @Test("Parse XOR-MAPPED-ADDRESS IPv4")
     func testXorMappedAddress() {
         let txnID = Array(UInt8(1)...UInt8(12))

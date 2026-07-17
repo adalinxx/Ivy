@@ -12,6 +12,10 @@ private extension Ivy {
     func servingContentCount() -> Int {
         servingContentRequests.count
     }
+
+    func networkFetchWaiterCount(for key: ContentRequestKey) -> Int {
+        pendingNetworkFetches[key]?.waiters.count ?? 0
+    }
 }
 
 private actor BlockingContentSource: IvyContentSource {
@@ -31,6 +35,44 @@ private actor BlockingContentSource: IvyContentSource {
         waiters.removeAll()
         for waiter in current { waiter.resume() }
     }
+}
+
+private actor ControlledNetworkFetch {
+    private var invocationCount = 0
+    private var completions: [Int: AttributedContentResponse] = [:]
+
+    func run() async -> AttributedContentResponse {
+        let invocation = invocationCount
+        invocationCount += 1
+        do {
+            try await TestSynchronization.wait(
+                for: "network fetch invocation \(invocation) completion"
+            ) {
+                await self.hasCompletion(invocation)
+            }
+        } catch TestSynchronizationError.cancelled {
+            completions.removeValue(forKey: invocation)
+            return .empty
+        } catch {
+            completions.removeValue(forKey: invocation)
+            Issue.record("\(error)")
+            return .empty
+        }
+        return completions.removeValue(forKey: invocation) ?? .empty
+    }
+
+    func waitForInvocations(_ count: Int) async throws {
+        try await TestSynchronization.wait(for: "\(count) network fetch invocation(s)") {
+            await self.hasInvocations(count)
+        }
+    }
+
+    func complete(_ invocation: Int, with response: AttributedContentResponse) {
+        completions[invocation] = response
+    }
+
+    private func hasCompletion(_ invocation: Int) -> Bool { completions[invocation] != nil }
+    private func hasInvocations(_ count: Int) -> Bool { invocationCount >= count }
 }
 
 private actor TestContentSource: IvyContentSource {
@@ -68,6 +110,73 @@ struct ContentExchangeTests {
             publicKey: key,
             listenPort: 0,
             requestTimeout: .seconds(1)))
+    }
+
+    @Test("coalesced public fetches are isolated across stop and restart")
+    func publicFetchIsRunScoped() async throws {
+        let identity = TransportTestHarness.identity("content-public-run")
+        let ivy = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let controlled = ControlledNetworkFetch()
+        let key = ContentRequestKey(rootCID: "root", cids: [])
+        let oldResponse = AttributedContentResponse(
+            entries: ["root": Data("old".utf8)],
+            servedBy: nil)
+        let newResponse = AttributedContentResponse(
+            entries: ["root": Data("new".utf8)],
+            servedBy: nil)
+        await ivy.setNetworkFetchHookForTesting { _, _, _ in
+            await controlled.run()
+        }
+
+        try await ivy.start()
+        let oldLeader = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        try await controlled.waitForInvocations(1)
+        let oldFollower = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        let oldJoined = try await TransportTestHarness.eventually {
+            await ivy.networkFetchWaiterCount(for: key) == 1
+        }
+        #expect(oldJoined)
+        guard oldJoined else {
+            await controlled.complete(0, with: .empty)
+            await ivy.stop()
+            _ = try? await oldLeader.value(waitingFor: "old content leader cleanup")
+            _ = try? await oldFollower.value(waitingFor: "old content follower cleanup")
+            return
+        }
+
+        await ivy.stop()
+        #expect(try await oldFollower.value(waitingFor: "old content follower drain") == .empty)
+
+        try await ivy.start()
+        let newLeader = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        try await controlled.waitForInvocations(2)
+        let newFollower = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        let newJoined = try await TransportTestHarness.eventually {
+            await ivy.networkFetchWaiterCount(for: key) == 1
+        }
+        #expect(newJoined)
+        guard newJoined else {
+            await controlled.complete(0, with: oldResponse)
+            await controlled.complete(1, with: .empty)
+            await ivy.stop()
+            _ = try? await oldLeader.value(waitingFor: "old content leader cleanup")
+            _ = try? await newLeader.value(waitingFor: "new content leader cleanup")
+            _ = try? await newFollower.value(waitingFor: "new content follower cleanup")
+            return
+        }
+
+        await controlled.complete(0, with: oldResponse)
+        #expect(try await oldLeader.value(waitingFor: "old content leader completion") == .empty)
+        #expect(await ivy.networkFetchWaiterCount(for: key) == 1)
+
+        await controlled.complete(1, with: newResponse)
+        #expect(try await newLeader.value(waitingFor: "new content leader completion") == newResponse)
+        #expect(try await newFollower.value(waitingFor: "new content follower completion") == newResponse)
+        #expect(await ivy.networkFetchWaiterCount(for: key) == 0)
+
+        await ivy.stop()
     }
 
     @Test("local fetch uses the same exact opaque selection contract")
