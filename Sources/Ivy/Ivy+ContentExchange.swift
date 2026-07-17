@@ -68,7 +68,7 @@ extension Ivy {
             for: key.requestedCIDs,
             maxFrameSize: IvyConfig.protocolMaxFrameSize,
             relayed: session.map { !$0.connection.isDirect }
-                ?? (connections[peer]?.isDirect == false)
+                ?? (endpointConnection(for: peer)?.isDirect == false)
         ) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
@@ -412,13 +412,22 @@ extension Ivy {
         forgetProvider(rootCID: rootCID, peer: peer)
         if deficientPeerSuppression[rootCID] == nil,
            deficientPeerSuppression.count >= Self.maxProviderRoots,
-           let evicted = deficientPeerSuppression.keys.first {
+           let evicted = deficientPeerSuppression.min(by: { left, right in
+               let leftExpiry = left.value.values.max()
+               let rightExpiry = right.value.values.max()
+               if leftExpiry == rightExpiry { return left.key < right.key }
+               return leftExpiry.map { expiry in
+                   rightExpiry.map { expiry < $0 } ?? false
+               } ?? true
+           })?.key {
             deficientPeerSuppression.removeValue(forKey: evicted)
         }
         var peers = deficientPeerSuppression[rootCID] ?? [:]
         if peers[peer.publicKey] == nil,
            peers.count >= config.kBucketSize,
-           let evicted = peers.keys.first {
+           let evicted = peers.min(by: { left, right in
+               left.value == right.value ? left.key < right.key : left.value < right.value
+           })?.key {
             peers.removeValue(forKey: evicted)
         }
         peers[peer.publicKey] = ContinuousClock.Instant.now + Self.deficiencySuppressionWindow
@@ -439,6 +448,6 @@ extension Ivy {
     }
 
     func connectedEndpointIDs() -> [PeerID] {
-        Array(connections.keys)
+        connectedEndpointPeers
     }
 }

@@ -346,9 +346,13 @@ struct SessionSequenceState: Sendable, Equatable {
     }
 
     mutating func acceptIncoming(_ sequence: UInt64) -> Bool {
-        guard sequence > lastReceived else { return false }
+        guard canAcceptIncoming(sequence) else { return false }
         lastReceived = sequence
         return true
+    }
+
+    func canAcceptIncoming(_ sequence: UInt64) -> Bool {
+        sequence > lastReceived
     }
 }
 

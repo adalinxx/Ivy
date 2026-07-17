@@ -250,7 +250,13 @@ extension Ivy {
     ) {
         if providerHints[rootCID] == nil,
            providerHints.count >= Self.maxProviderRoots,
-           let evicted = providerHints.keys.first {
+           let evicted = providerHints.min(by: { left, right in
+               let leftExpiry = left.value.map(\.expiresAt).max() ?? 0
+               let rightExpiry = right.value.map(\.expiresAt).max() ?? 0
+               return leftExpiry == rightExpiry
+                   ? left.key < right.key
+                   : leftExpiry < rightExpiry
+           })?.key {
             providerHints.removeValue(forKey: evicted)
         }
         var hints = providerHints[rootCID] ?? []
@@ -323,7 +329,7 @@ extension Ivy {
     }
 
     func providerEndpoint(for peer: PeerID) -> PeerEndpoint? {
-        guard let endpoint = connections[peer]?.endpoint,
+        guard let endpoint = endpointConnection(for: peer)?.endpoint,
               !endpoint.host.isEmpty,
               endpoint.host != "unknown",
               endpoint.port != 0 else { return nil }

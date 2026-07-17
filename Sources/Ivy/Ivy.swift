@@ -118,11 +118,12 @@ public actor Ivy {
     static let maxRelayRoutesPerPeer = 8
     static let relayIdleTimeout: Duration = .seconds(300)
 
-    /// Endpoint-only view used by the content/routing layer. Pending sessions
-    /// and configured carrier identities are deliberately absent.
-    var connections: [PeerID: PeerConnection] {
-        Dictionary(uniqueKeysWithValues: endpointSessions.map { ($0.key.peerID, $0.value.connection) })
+    func endpointConnection(for peer: PeerID) -> PeerConnection? {
+        guard let key = try? PeerKey(peer.publicKey) else { return nil }
+        return endpointSessions[key]?.connection
     }
+
+    var connectedEndpointPeers: [PeerID] { endpointSessions.keys.map(\.peerID) }
     var serverChannel: Channel?
     var running = false
     private var lifecycleTail: Task<Void, Never>?
@@ -634,7 +635,14 @@ public actor Ivy {
     // MARK: - Session Authentication
 
     private var connectionCapacityUsed: Int {
-        authenticatedConnections.count + pendingSessions.count + outgoingDials.count
+        var representedDials = Set(authenticatedConnections.values.map { $0.0.peerID })
+        for pending in pendingSessions.values {
+            if case .initiator(let expected, _) = pending.direction {
+                representedDials.insert(expected.peerID)
+            }
+        }
+        let reservedOnly = outgoingDials.keys.lazy.filter { !representedDials.contains($0) }.count
+        return authenticatedConnections.count + pendingSessions.count + reservedOnly
     }
 
     @discardableResult
@@ -851,7 +859,7 @@ public actor Ivy {
         }
     }
 
-    private func acceptsInboundHello(_ hello: SessionHelloInitiator, on connection: PeerConnection) -> Bool {
+    func acceptsInboundHello(_ hello: SessionHelloInitiator, on connection: PeerConnection) -> Bool {
         guard hello.responder == localKey, hello.initiator != localKey else { return false }
         switch connection.transport {
         case .direct:
@@ -912,7 +920,9 @@ public actor Ivy {
             metadata: metadata)
         let existing = role == .endpoint ? endpointSessions[peerKey] : carrierSessions[peerKey]
 
-        if let existing, existing.connection.isLive, existing.sessionID <= sessionID {
+        if let existing,
+           existing.connection.isLive,
+           existing.sessionID == Self.preferredSessionID(existing.sessionID, sessionID) {
             authenticationWaiters.removeValue(forKey: connectionID)?.resume(returning: true)
             removeRouteConnection(pending.connection)
             pending.connection.cancel()
@@ -1255,6 +1265,14 @@ public actor Ivy {
         session: AuthenticatedSession
     ) async {
         guard isCurrent(session) else { return }
+        guard record.sessionID == session.sessionID,
+              session.sequenceState.canAcceptIncoming(record.sequence) else {
+            rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
+                session.peerKey,
+                direct: session.connection.isDirect,
+                evidence: .unverified))
+            return
+        }
         guard record.isValid(sender: session.peerKey, receiver: localKey) else {
             rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
                 session.peerKey,
@@ -1266,8 +1284,7 @@ public actor Ivy {
             session.peerKey,
             direct: session.connection.isDirect,
             evidence: .signedTransport)
-        guard record.sessionID == session.sessionID,
-              session.sequenceState.acceptIncoming(record.sequence) else {
+        guard session.sequenceState.acceptIncoming(record.sequence) else {
             rejectAuthenticatedSession(session, attributedTo: transportAttribution)
             return
         }
@@ -1622,7 +1639,10 @@ public actor Ivy {
                 return
             }
             if let connection = routeConnections[routeID] {
-                connection.feedRecord(opaqueRecord)
+                guard connection.feedRecord(opaqueRecord) else {
+                    closeInstalledRoute(routeID, notifyCarrier: true)
+                    return
+                }
                 return
             }
 
@@ -1753,7 +1773,11 @@ public actor Ivy {
                 await monitor.recordActivity(from: peer, sessionID: session.sessionID)
             }
         }
-        guard message.isKeepalive || tally.shouldAllow(peer: peer) else { return }
+        if case .pong = message {
+            // Pongs discharge a ping already admitted by this node.
+        } else if !tally.shouldAllow(peer: peer) {
+            return
+        }
         switch message {
         case .ping(let nonce):
             fireToPeer(peer, .pong(nonce: nonce))
@@ -1980,6 +2004,10 @@ public actor Ivy {
             .sorted { Router.isCloser($0.hash, than: $1.hash, to: targetHash) }
             .prefix(config.kBucketSize)
             .map { $0 }
+    }
+
+    static func preferredSessionID(_ first: SessionID, _ second: SessionID) -> SessionID {
+        min(first, second)
     }
 
 #if DEBUG || IVY_TESTING

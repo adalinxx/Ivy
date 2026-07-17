@@ -173,7 +173,7 @@ extension Ivy {
         if !allowsDiscoveredHost(
             host,
             provenance: provenance,
-            fromObservedHost: connections[peer]?.observedHost
+            fromObservedHost: endpointConnection(for: peer)?.observedHost
         ) {
             config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: non-routable address \(host)")
             return false

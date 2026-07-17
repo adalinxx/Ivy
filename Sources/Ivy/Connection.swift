@@ -298,8 +298,7 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
 
     init(
         maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize,
-        budget: InboundByteBudget = InboundByteBudget(
-            limit: IvyConfig.defaultMaxInboundBufferedBytes)
+        budget: InboundByteBudget
     ) {
         self.maxFrameSize = maxFrameSize
         self.budget = budget
