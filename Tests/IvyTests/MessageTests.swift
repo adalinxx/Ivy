@@ -1,307 +1,265 @@
-import Testing
+import Crypto
 import Foundation
+import Testing
 @testable import Ivy
 
 @Suite("Message")
 struct MessageTests {
-
-    @Test("Ping roundtrip")
-    func testPingRoundtrip() {
-        let msg = Message.ping(nonce: 42)
-        let data = msg.serialize()
-        let decoded = Message.deserialize(data)
-        if case .ping(let nonce) = decoded {
-            #expect(nonce == 42)
-        } else {
-            Issue.record("Expected ping")
-        }
+    private func signedDataRecord(_ payload: Data, keyByte: UInt8) throws -> SessionWireRecord {
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: keyByte, count: 32))
+        let receiverKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: keyByte + 1, count: 32))
+        let sender = try PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation)
+        let receiver = try PeerKey(rawRepresentation: receiverKey.publicKey.rawRepresentation)
+        let record = try SessionDataRecord.sign(
+            sessionID: SessionID(bytes: Data(repeating: keyByte, count: 32)),
+            sender: sender,
+            receiver: receiver,
+            sequence: 1,
+            payload: payload,
+            with: signingKey)
+        return .data(record)
     }
 
-    @Test("Pong roundtrip")
-    func testPongRoundtrip() {
-        let msg = Message.pong(nonce: 99)
-        let data = msg.serialize()
-        let decoded = Message.deserialize(data)
-        if case .pong(let nonce) = decoded {
-            #expect(nonce == 99)
-        } else {
-            Issue.record("Expected pong")
-        }
-    }
-
-    @Test("Block roundtrip")
-    func testBlockRoundtrip() {
-        let cid = "deadbeef"
-        let payload = Data([1, 2, 3, 4, 5])
-        let msg = Message.block(cid: cid, data: payload)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .block(let c, let d) = decoded {
-            #expect(c == cid)
-            #expect(d == payload)
-        } else {
-            Issue.record("Expected block")
-        }
-    }
-
-    @Test("DontHave roundtrip")
-    func testDontHaveRoundtrip() {
-        let msg = Message.dontHave(cid: "missing")
-        let decoded = Message.deserialize(msg.serialize())
-        if case .dontHave(let c) = decoded {
-            #expect(c == "missing")
-        } else {
-            Issue.record("Expected dontHave")
-        }
-    }
-
-    @Test("FindNode roundtrip")
-    func testFindNodeRoundtrip() {
-        let target = Data(repeating: 0xAB, count: 32)
-        let msg = Message.findNode(target: target, nonce: 42)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .findNode(let t, _, let nonce) = decoded {
-            #expect(t == target)
-            #expect(nonce == 42)
-        } else {
-            Issue.record("Expected findNode")
-        }
-    }
-
-    @Test("Neighbors roundtrip")
-    func testNeighborsRoundtrip() {
-        let peers = [
-            PeerEndpoint(publicKey: "key1", host: "192.168.1.1", port: 4001),
-            PeerEndpoint(publicKey: "key2", host: "10.0.0.1", port: 4002),
+    @Test("frozen v8 message vectors")
+    func frozenV8Vectors() throws {
+        let route = String(repeating: "11", count: 32)
+        let keyBytes = String(repeating: "44", count: 32)
+        let key = try PeerKey(rawRepresentation: Data(repeating: 0x44, count: 32))
+        let target = String(repeating: "ab", count: 32)
+        let endpoint = PeerEndpoint(publicKey: "pk", host: "h", port: 0x1234)
+        let vectors: [(Message, String)] = [
+            (.ping(nonce: 0x0102_0304_0506_0708), "000102030405060708"),
+            (.pong(nonce: 0x0102_0304_0506_0708), "010102030405060708"),
+            (.findNode(target: Data(repeating: 0xab, count: 32), nonce: 2),
+             "0500000020\(target)0000000000000002"),
+            (.neighbors([], nonce: 2), "0600000000000000000002"),
+            (.neighbors([endpoint], nonce: 2),
+             "0600010002706b00016812340000000000000002"),
+            (.contentRequest(requestID: 3, rootCID: "r", cids: []),
+             "1a00000000000000030001720000"),
+            (.contentRequest(requestID: 3, rootCID: "r", cids: ["a", "bc"]),
+             "1a0000000000000003000172000200016100026263"),
+            (.contentResponse(requestID: 3, entries: []), "3200000000000000030000"),
+            (.contentResponse(requestID: 3, entries: [
+                ContentEntry(cid: "r", data: Data([1, 2])),
+                ContentEntry(cid: "x", data: Data()),
+            ]), "320000000000000003000200017200000002010200017800000000"),
+            (.contentUnavailable(requestID: 3), "3a0000000000000003"),
+            (.findProviders(rootCID: "r", requestID: 4), "280001720000000000000004"),
+            (.providers(rootCID: "r", requestID: 4, records: []),
+             "2900017200000000000000000004"),
+            (.providers(
+                rootCID: "r",
+                requestID: 4,
+                records: [ProviderRecord(endpoint: endpoint, expiresAt: 0x0102_0304_0506_0708)]),
+             "2900017200010002706b000168123401020304050607080000000000000004"),
+            (.announceProvider(rootCID: "r", expiresAt: 5), "2a0001720000000000000005"),
+            (.relayOpen(routeID: Data(repeating: 0x11, count: 32), targetKey: key),
+             "3c\(route)\(keyBytes)"),
+            (.relayOffer(routeID: Data(repeating: 0x11, count: 32), sourceKey: key),
+             "3d\(route)\(keyBytes)"),
+            (.relayAccept(routeID: Data(repeating: 0x11, count: 32), status: 1),
+             "3e\(route)01"),
+            (.relayReady(routeID: Data(repeating: 0x11, count: 32), status: 0),
+             "3f\(route)00"),
+            (.relayPacket(
+                routeID: Data(repeating: 0x11, count: 32),
+                opaqueEndpointRecord: Data([4, 5, 6])),
+             "40\(route)00000003040506"),
+            (.relayClose(routeID: Data(repeating: 0x11, count: 32)), "41\(route)"),
+            (.peerMessage(topic: "t", payload: Data([0xaa])), "3100017400000001aa"),
         ]
-        let msg = Message.neighbors(peers, nonce: 99)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .neighbors(let p, let nonce) = decoded {
-            #expect(p.count == 2)
-            #expect(p[0].publicKey == "key1")
-            #expect(p[0].host == "192.168.1.1")
-            #expect(p[0].port == 4001)
-            #expect(p[1].publicKey == "key2")
-            #expect(nonce == 99)
-        } else {
-            Issue.record("Expected neighbors")
+
+        for (message, hex) in vectors {
+            let expected = try #require(Data(hexString: hex))
+            #expect(message.serialize() == expected)
+            #expect(Message.deserialize(expected)?.serialize() == expected)
         }
     }
 
-    @Test("AnnounceBlock roundtrip")
-    func testAnnounceBlockRoundtrip() {
-        let msg = Message.announceBlock(cid: "newblock")
-        let decoded = Message.deserialize(msg.serialize())
-        if case .announceBlock(let c) = decoded {
-            #expect(c == "newblock")
-        } else {
-            Issue.record("Expected announceBlock")
+    @Test("every v8 message roundtrips canonically")
+    func roundtrip() throws {
+        let endpoint = PeerEndpoint(publicKey: "peer", host: "192.0.2.1", port: 4001)
+        let peerKey = try PeerKey(rawRepresentation: Data(repeating: 0x44, count: 32))
+        let routeID = Data(repeating: 0x22, count: 32)
+        let entries = [ContentEntry(cid: "root", data: Data([1, 2, 3]))]
+        let messages: [Message] = [
+            .ping(nonce: 1),
+            .pong(nonce: 1),
+            .findNode(target: Data(repeating: 0xab, count: 32), nonce: 2),
+            .neighbors([endpoint], nonce: 2),
+            .contentRequest(requestID: 3, rootCID: "root", cids: ["child"]),
+            .contentResponse(requestID: 3, entries: entries),
+            .contentUnavailable(requestID: 3),
+            .findProviders(rootCID: "root", requestID: 4),
+            .providers(
+                rootCID: "root",
+                requestID: 4,
+                records: [ProviderRecord(endpoint: endpoint, expiresAt: 123)]),
+            .announceProvider(rootCID: "root", expiresAt: 123),
+            .relayOpen(routeID: routeID, targetKey: peerKey),
+            .relayOffer(routeID: routeID, sourceKey: peerKey),
+            .relayAccept(routeID: routeID, status: 1),
+            .relayReady(routeID: routeID, status: 0),
+            .relayPacket(routeID: routeID, opaqueEndpointRecord: Data([4, 5, 6])),
+            .relayClose(routeID: routeID),
+            .peerMessage(topic: "topic", payload: Data("hello".utf8)),
+        ]
+
+        for message in messages {
+            let encoded = message.serialize()
+            #expect(!encoded.isEmpty)
+            #expect(Message.deserialize(encoded)?.serialize() == encoded)
         }
     }
 
-    @Test("Frame includes length prefix")
-    func testFrame() {
-        let msg = Message.ping(nonce: 1)
-        let framed = Message.frame(msg)
-        let length = framed.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
-        #expect(Int(length) == framed.count - 4)
+    @Test("targeted content preserves selection and bytes")
+    func targetedContent() {
+        let request = Message.contentRequest(
+            requestID: 11,
+            rootCID: "root",
+            cids: ["child-a", "child-b"])
+        guard case .contentRequest(let requestID, let root, let cids) = Message.deserialize(request.serialize()) else {
+            Issue.record("Expected content request")
+            return
+        }
+        #expect(requestID == 11)
+        #expect(root == "root")
+        #expect(cids == ["child-a", "child-b"])
+
+        let entries = [
+            ContentEntry(cid: "root", data: Data([1])),
+            ContentEntry(cid: "child-a", data: Data([2, 3])),
+        ]
+        guard case .contentResponse(let responseID, let decoded) = Message.deserialize(
+            Message.contentResponse(requestID: 11, entries: entries).serialize()
+        ) else {
+            Issue.record("Expected content response")
+            return
+        }
+        #expect(responseID == 11)
+        #expect(decoded == entries)
     }
 
-    @Test("Empty data returns nil")
-    func testEmptyData() {
+    @Test("content response budgets exactly include direct and relayed framing")
+    func contentResponseBudgets() throws {
+        let frameSize: UInt32 = 512
+        let cids = ["root", "child"]
+        let directBudget = try #require(Message.contentResponseDataBudget(
+            for: cids,
+            maxFrameSize: frameSize,
+            relayed: false))
+        let relayedBudget = try #require(Message.contentResponseDataBudget(
+            for: cids,
+            maxFrameSize: frameSize,
+            relayed: true))
+        #expect(directBudget == 367)
+        #expect(relayedBudget == 217)
+
+        func response(_ dataBytes: Int) -> Data {
+            Message.contentResponse(requestID: 1, entries: [
+                ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: dataBytes)),
+                ContentEntry(cid: "child", data: Data()),
+            ]).serialize(maxFrameSize: frameSize)
+        }
+
+        #expect(try signedDataRecord(response(directBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+        #expect(try signedDataRecord(response(directBudget + 1), keyByte: 1)
+            .serialize(maxPayload: frameSize).isEmpty)
+
+        let routeID = Data(repeating: 0x44, count: 32)
+        let endpointRecord = try signedDataRecord(response(relayedBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize)
+        let relayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: endpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(relayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+
+        let oversizedEndpointRecord = try signedDataRecord(response(relayedBudget + 1), keyByte: 1)
+            .serialize(maxPayload: frameSize)
+        let oversizedRelayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: oversizedEndpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(oversizedRelayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).isEmpty)
+    }
+
+    @Test("content response serialization preflights its exact aggregate size")
+    func contentResponsePreflight() {
+        let exact = Message.contentResponse(
+            requestID: 1,
+            entries: [ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: 11))])
+        let oversized = Message.contentResponse(
+            requestID: 1,
+            entries: [ContentEntry(cid: "root", data: Data(repeating: 0xaa, count: 12))])
+
+        #expect(exact.serialize(maxFrameSize: 32).count == 32)
+        #expect(oversized.serialize(maxFrameSize: 32).isEmpty)
+    }
+
+    @Test("malformed messages and invalid identifiers are rejected")
+    func malformed() {
         #expect(Message.deserialize(Data()) == nil)
-    }
-
-    @Test("Invalid tag returns nil")
-    func testInvalidTag() {
         #expect(Message.deserialize(Data([255])) == nil)
-    }
 
-    @Test("Large block roundtrip")
-    func testLargeBlock() {
-        let payload = Data(repeating: 0xFF, count: 1_000_000)
-        let msg = Message.block(cid: "large", data: payload)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .block(let c, let d) = decoded {
-            #expect(c == "large")
-            #expect(d.count == 1_000_000)
-        } else {
-            Issue.record("Expected block")
-        }
-    }
+        var trailing = Message.ping(nonce: 1).serialize()
+        trailing.append(0)
+        #expect(Message.deserialize(trailing) == nil)
 
-    @Test("DHTForward roundtrip")
-    func testDHTForwardRoundtrip() {
-        let msg = Message.dhtForward(cid: "QmTest123", ttl: 3)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .dhtForward(let cid, let ttl) = decoded {
-            #expect(cid == "QmTest123")
-            #expect(ttl == 3)
-        } else {
-            Issue.record("Expected dhtForward")
-        }
-    }
+        var zeroContentRequest = Message.contentRequest(
+            requestID: 1,
+            rootCID: "root",
+            cids: []).serialize()
+        zeroContentRequest.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroContentRequest) == nil)
 
-    @Test("DHTForward zero TTL roundtrip")
-    func testDHTForwardZeroTTL() {
-        let msg = Message.dhtForward(cid: "abc", ttl: 0)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .dhtForward(_, let ttl) = decoded {
-            #expect(ttl == 0)
-        } else {
-            Issue.record("Expected dhtForward")
-        }
-    }
+        var zeroContentResponse = Message.contentResponse(
+            requestID: 1,
+            entries: []).serialize()
+        zeroContentResponse.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroContentResponse) == nil)
 
-    @Test("RelayConnect roundtrip")
-    func testRelayConnectRoundtrip() {
-        let msg = Message.relayConnect(srcKey: "src", dstKey: "dst", nonce: 123)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .relayConnect(let src, let dst, let nonce) = decoded {
-            #expect(src == "src")
-            #expect(dst == "dst")
-            #expect(nonce == 123)
-        } else {
-            Issue.record("Expected relayConnect")
-        }
-    }
+        var zeroUnavailable = Message.contentUnavailable(requestID: 1).serialize()
+        zeroUnavailable.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroUnavailable) == nil)
 
-    @Test("RelayStatus roundtrip")
-    func testRelayStatusRoundtrip() {
-        let msg = Message.relayStatus(code: 2, nonce: 456)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .relayStatus(let code, let nonce) = decoded {
-            #expect(code == 2)
-            #expect(nonce == 456)
-        } else {
-            Issue.record("Expected relayStatus")
-        }
-    }
+        var zeroFindProviders = Message.findProviders(
+            rootCID: "root",
+            requestID: 1).serialize()
+        zeroFindProviders.replaceSubrange(
+            (zeroFindProviders.count - 8)..<zeroFindProviders.count,
+            with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroFindProviders) == nil)
 
-    @Test("PexRequest roundtrip")
-    func testPexRequestRoundtrip() {
-        let msg = Message.pexRequest(nonce: 12345)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .pexRequest(let nonce) = decoded {
-            #expect(nonce == 12345)
-        } else {
-            Issue.record("Expected pexRequest")
-        }
-    }
+        var zeroProviders = Message.providers(
+            rootCID: "root",
+            requestID: 1,
+            records: []).serialize()
+        zeroProviders.replaceSubrange(
+            (zeroProviders.count - 8)..<zeroProviders.count,
+            with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroProviders) == nil)
+        #expect(Message.relayReady(routeID: Data([1]), status: 0).serialize().isEmpty)
 
-    @Test("PexResponse roundtrip")
-    func testPexResponseRoundtrip() {
-        let peers = [
-            PeerEndpoint(publicKey: "pex-key1", host: "10.0.0.1", port: 4001),
-            PeerEndpoint(publicKey: "pex-key2", host: "10.0.0.2", port: 4002),
-            PeerEndpoint(publicKey: "pex-key3", host: "192.168.1.5", port: 4003),
-        ]
-        let msg = Message.pexResponse(nonce: 99999, peers: peers)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .pexResponse(let nonce, let p) = decoded {
-            #expect(nonce == 99999)
-            #expect(p.count == 3)
-            #expect(p[0].publicKey == "pex-key1")
-            #expect(p[0].host == "10.0.0.1")
-            #expect(p[0].port == 4001)
-            #expect(p[1].publicKey == "pex-key2")
-            #expect(p[2].host == "192.168.1.5")
-            #expect(p[2].port == 4003)
-        } else {
-            Issue.record("Expected pexResponse")
-        }
-    }
-
-    @Test("PexResponse with empty peers roundtrip")
-    func testPexResponseEmpty() {
-        let msg = Message.pexResponse(nonce: 1, peers: [])
-        let decoded = Message.deserialize(msg.serialize())
-        if case .pexResponse(let nonce, let p) = decoded {
-            #expect(nonce == 1)
-            #expect(p.isEmpty)
-        } else {
-            Issue.record("Expected pexResponse")
-        }
-    }
-
-    @Test("Want roundtrip")
-    func testWantRoundtrip() {
-        let rootCIDs = ["block-1", "block-2", "block-3"]
-        let msg = Message.want(rootCIDs: rootCIDs)
-        let decoded = Message.deserialize(msg.serialize())
-        if case .want(let cids) = decoded {
-            #expect(cids == rootCIDs)
-        } else {
-            Issue.record("Expected want")
-        }
-    }
-
-    @Test("Want single CID roundtrip")
-    func testWantSingleCID() {
-        let msg = Message.want(rootCIDs: ["bafy-single-cid"])
-        let decoded = Message.deserialize(msg.serialize())
-        if case .want(let cids) = decoded {
-            #expect(cids == ["bafy-single-cid"])
-        } else {
-            Issue.record("Expected want")
-        }
-    }
-
-    @Test("Want empty roundtrip")
-    func testWantEmpty() {
-        let msg = Message.want(rootCIDs: [])
-        let decoded = Message.deserialize(msg.serialize())
-        if case .want(let cids) = decoded {
-            #expect(cids.isEmpty)
-        } else {
-            Issue.record("Expected want")
-        }
-    }
-
-    @Test("WantVolume roundtrip")
-    func testWantVolumeRoundtrip() {
-        let msg = Message.wantVolume(rootCID: "root", cids: ["root", "child-a", "child-b"])
-        let decoded = Message.deserialize(msg.serialize())
-        if case .wantVolume(let root, let cids) = decoded {
-            #expect(root == "root")
-            #expect(cids == ["root", "child-a", "child-b"])
-        } else {
-            Issue.record("Expected wantVolume")
-        }
-    }
-
-    @Test("Identify with signature roundtrip")
-    func testIdentifyWithSignature() {
-        let sig = Data(repeating: 0xAB, count: 64)
-        let msg = Message.identify(
-            publicKey: "pk_test",
-            observedHost: "1.2.3.4",
-            observedPort: 4001,
-            listenAddrs: [("0.0.0.0", 4001)],
-            chainPorts: ["chain-a": 9001, "chain-b": 9002],
-            signature: sig
-        )
-        let decoded = Message.deserialize(msg.serialize())
-        if case .identify(let pk, let host, let port, let addrs, let cp, let s) = decoded {
-            #expect(pk == "pk_test")
-            #expect(host == "1.2.3.4")
-            #expect(port == 4001)
-            #expect(addrs.count == 1)
-            #expect(cp["chain-a"] == 9001)
-            #expect(cp["chain-b"] == 9002)
-            #expect(s == sig)
-        } else {
-            Issue.record("Expected identify")
-        }
-    }
-
-    @Test("Identify with empty signature roundtrip")
-    func testIdentifyEmptySignature() {
-        let msg = Message.identify(publicKey: "pk", observedHost: "h", observedPort: 80, listenAddrs: [], chainPorts: [:], signature: Data())
-        let decoded = Message.deserialize(msg.serialize())
-        if case .identify(_, _, _, _, _, let s) = decoded {
-            #expect(s.isEmpty)
-        } else {
-            Issue.record("Expected identify")
+        let unicodeEquivalent = ["\u{00e9}", "e\u{0301}"]
+        #expect(unicodeEquivalent[0] == unicodeEquivalent[1])
+        for identifier in unicodeEquivalent {
+            #expect(Message.contentRequest(
+                requestID: 1,
+                rootCID: identifier,
+                cids: []).serialize().isEmpty)
+            #expect(Message.findProviders(
+                rootCID: identifier,
+                requestID: 1).serialize().isEmpty)
+            #expect(Message.announceProvider(
+                rootCID: identifier,
+                expiresAt: 1).serialize().isEmpty)
         }
     }
 

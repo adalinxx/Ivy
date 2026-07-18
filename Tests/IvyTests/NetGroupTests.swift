@@ -41,6 +41,8 @@ struct NetGroupTests {
         #expect(NetGroup.group("::ffff:1.2.99.4") == "v4:1.2")      // same /16 collapses
         #expect(NetGroup.group("::FFFF:1.2.3.4") == "v4:1.2")        // case-insensitive
         #expect(NetGroup.group("[::ffff:1.2.3.4]") == "v4:1.2")      // bracketed
+        #expect(NetGroup.group("::ffff:0102:0304") == "v4:1.2")
+        #expect(NetGroup.group("::ffff:0102:0304") == NetGroup.group("1.2.3.4"))
         // A genuine IPv6 with a trailing embedded IPv4 still groups by its /32.
         #expect(NetGroup.group("2001:db8::1.2.3.4") == "v6:2001.0db8")
     }
@@ -61,6 +63,8 @@ struct NetGroupTests {
         #expect(NetGroup.group("999.1.1.1") == "raw:999.1.1.1")   // octet out of range
         #expect(NetGroup.group("1.2.3") == "raw:1.2.3")            // too few octets
         #expect(NetGroup.group("2001:db8::xyz") == "raw:2001:db8::xyz") // bad hex
+        #expect(NetGroup.group("2606::4700:1:2:3:4:5:6")
+            == "raw:2606::4700:1:2:3:4:5:6") // :: must compress at least one group
         // Two distinct malformed hosts get distinct groups (no merge).
         #expect(NetGroup.group("foo") != NetGroup.group("bar"))
     }
