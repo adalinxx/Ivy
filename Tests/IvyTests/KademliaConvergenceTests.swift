@@ -344,8 +344,7 @@ struct KademliaConvergenceTests {
         #expect(result.contains(deferred))
         await node.finishOutgoingDial(
             to: PeerID(publicKey: deferred.publicKey),
-            generation: await node.runGeneration,
-            connected: false)
+            generation: await node.runGeneration)
         await node.stop()
     }
 
@@ -369,14 +368,14 @@ struct KademliaConvergenceTests {
         await node.seedKademliaTestEndpoint(endpoint)
         #expect(!(await node.reserveOutgoingDial(to: endpoint)))
 
-        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration)
         #expect(await node.reserveOutgoingDial(to: endpoint))
-        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration)
         #expect(!(await node.reserveOutgoingDial(to: endpoint)))
         await node.removeFailedRoutingPeer(peer, generation: oldGeneration)
         #expect((await node.knownPeerEndpoints).contains(endpoint))
 
-        await node.finishOutgoingDial(to: peer, generation: currentGeneration, connected: false)
+        await node.finishOutgoingDial(to: peer, generation: currentGeneration)
         #expect(await node.reserveOutgoingDial(to: endpoint))
         await node.stop()
     }
@@ -621,7 +620,7 @@ struct KademliaConvergenceTests {
     func referralProvenanceSurvivesLookupRounds() async throws {
         let node = Ivy(config: TransportTestHarness.config(
             TransportTestHarness.identity("kad-round-source"),
-            port: TransportTestHarness.nextPort(),
+            port: 0,
             maxConnections: 3))
         let referrers = [
             testEndpoint("kad-round-referrer-a", port: 4001),
@@ -651,8 +650,7 @@ struct KademliaConvergenceTests {
         #expect(result.contains(live))
         await node.finishOutgoingDial(
             to: PeerID(publicKey: targetKey),
-            generation: await node.runGeneration,
-            connected: false)
+            generation: await node.runGeneration)
         await node.stop()
     }
 }

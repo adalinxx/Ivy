@@ -529,12 +529,13 @@ public actor Ivy {
                 group: group,
                 inboundByteBudget: inboundByteBudget)
         } catch {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            let connected = finishOutgoingDial(to: key.peerID, generation: generation)
             guard !Task.isCancelled,
                   isCurrentRun(generation),
                   !reconnectSuppressed.contains(key.peerID) else {
                 throw CancellationError()
             }
+            if connected { return true }
             throw error
         }
         guard bindOutgoingDial(
@@ -542,29 +543,28 @@ public actor Ivy {
             generation: generation,
             connection: connection
         ) else {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            let connected = finishOutgoingDial(to: key.peerID, generation: generation)
             connection.cancel()
-            return false
+            return connected
         }
         guard !Task.isCancelled,
               isCurrentRun(generation),
               outgoingDials[key.peerID]?.generation == generation,
               outgoingDials[key.peerID]?.cancelled == false,
               !reconnectSuppressed.contains(key.peerID) else {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            finishOutgoingDial(to: key.peerID, generation: generation)
             connection.cancel()
             throw CancellationError()
         }
 
         startInboundTask(connection)
-        let authenticated = await authenticateInitiator(
+        _ = await authenticateInitiator(
             connection,
             expected: key,
             routeBinding: Self.directRouteBinding)
         let connected = finishOutgoingDial(
             to: key.peerID,
-            generation: generation,
-            connected: authenticated)
+            generation: generation)
         guard isCurrentRun(generation) else {
             connection.cancel()
             throw IvyError.notRunning
@@ -616,14 +616,13 @@ public actor Ivy {
     }
 
     @discardableResult
-    func finishOutgoingDial(to peer: PeerID, generation: UInt64, connected: Bool) -> Bool {
+    func finishOutgoingDial(to peer: PeerID, generation: UInt64) -> Bool {
         guard outgoingDials[peer]?.generation == generation else { return false }
         outgoingDials.removeValue(forKey: peer)
         let key = try? PeerKey(peer.publicKey)
-        let ownsCurrentSession = connected
-            && isCurrentRun(generation)
+        let hasCurrentSession = isCurrentRun(generation)
             && key.flatMap({ sessions[$0] })?.connection.isLive == true
-        if ownsCurrentSession {
+        if hasCurrentSession {
             reconnectAttempts.removeValue(forKey: peer)
             reconnectTasks.removeValue(forKey: peer)?.task.cancel()
             return true
