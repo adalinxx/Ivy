@@ -620,7 +620,7 @@ struct KademliaConvergenceTests {
     func referralProvenanceSurvivesLookupRounds() async throws {
         let node = Ivy(config: TransportTestHarness.config(
             TransportTestHarness.identity("kad-round-source"),
-            port: TransportTestHarness.nextPort(),
+            port: 0,
             maxConnections: 3))
         let referrers = [
             testEndpoint("kad-round-referrer-a", port: 4001),
