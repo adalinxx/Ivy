@@ -143,6 +143,7 @@ final class PeerConnection: @unchecked Sendable {
     let inboundBufferLimit: Int
     private let stateLock = NSLock()
     private var closed = false
+    private var closeHandler: (@Sendable () -> Void)?
     private var inboundAdmission: InboundAdmissionLease?
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
@@ -256,12 +257,26 @@ final class PeerConnection: @unchecked Sendable {
         stateLock.withLock { closed }
     }
 
-    private func markClosed() -> Bool {
+    private func markClosed() -> (
+        didClose: Bool,
+        closeHandler: (@Sendable () -> Void)?
+    ) {
         stateLock.withLock {
-            guard !closed else { return false }
+            guard !closed else { return (false, nil) }
             closed = true
-            return true
+            defer { closeHandler = nil }
+            return (true, closeHandler)
         }
+    }
+
+    func installCloseHandler(_ handler: @escaping @Sendable () -> Void) {
+        let invokeNow = stateLock.withLock {
+            if closed { return true }
+            guard closeHandler == nil else { return false }
+            closeHandler = handler
+            return false
+        }
+        if invokeNow { handler() }
     }
 
     func releaseInboundAdmission() {
@@ -301,16 +316,20 @@ final class PeerConnection: @unchecked Sendable {
     }
 
     func connectionClosed() {
-        guard markClosed() else { return }
+        let state = markClosed()
+        guard state.didClose else { return }
         releaseInboundAdmission()
         inboundContinuation.finish()
+        state.closeHandler?()
     }
 
     func cancel() {
-        guard markClosed() else { return }
+        let state = markClosed()
+        guard state.didClose else { return }
         releaseInboundAdmission()
         channel?.close(promise: nil)
         inboundContinuation.finish()
+        state.closeHandler?()
     }
 }
 
@@ -441,7 +460,7 @@ final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
 final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = InboundFrame
 
-    let ivy: Ivy
+    weak var ivy: Ivy?
     private let generation: UInt64
     private let admissionGate: InboundAdmissionGate
     private let inboundByteBudget: InboundByteBudget
@@ -463,7 +482,10 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func channelActive(context: ChannelHandlerContext) {
-        guard connection == nil else { return }
+        guard connection == nil, let ivy else {
+            context.close(promise: nil)
+            return
+        }
         let channel = context.channel
         let observedHost = channel.remoteAddress?.ipAddress
         guard let lease = admissionGate.reserve(observedHost: observedHost) else {
@@ -479,7 +501,11 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
             connectionInboundByteBudget: connectionInboundByteBudget)
         connection.observedHost = observedHost
         self.connection = connection
-        Task {
+        Task { [weak ivy] in
+            guard let ivy else {
+                connection.cancel()
+                return
+            }
             guard await ivy.registerInboundConnection(connection, generation: generation) else {
                 connection.cancel()
                 return
@@ -499,6 +525,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
 
     func channelInactive(context: ChannelHandlerContext) {
         connection?.connectionClosed()
+        connection = nil
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

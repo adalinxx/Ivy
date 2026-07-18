@@ -201,6 +201,14 @@ struct IvyTopologyTests {
         #expect(throws: IvyModeError.invalidConfiguration("peer health limits are invalid")) {
             try invalidHealth.validate()
         }
+
+        let hostnameAdvertisement = IvyConfig(
+            signingKey: identity(1),
+            externalAddress: ("node.example.com", 4001))
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "externalAddress must be an IP literal with a nonzero port")) {
+            try hostnameAdvertisement.validate()
+        }
     }
 
 }

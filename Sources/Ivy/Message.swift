@@ -105,8 +105,9 @@ enum Message: Sendable {
             guard bytes.appendEndpoints(peers) else { return false }
             bytes.appendUInt64(nonce)
         case .contentRequest(let requestID, let rootCID, let cids):
-            guard requestID != 0, !rootCID.isEmpty,
-                  cids.allSatisfy({ !$0.isEmpty }) else { return false }
+            guard requestID != 0,
+                  MessageLimits.accepts(rootCID),
+                  cids.allSatisfy(MessageLimits.accepts) else { return false }
             bytes.append(Tag.contentRequest.rawValue)
             bytes.appendUInt64(requestID)
             guard bytes.appendLengthPrefixedString(rootCID),
@@ -129,18 +130,18 @@ enum Message: Sendable {
             bytes.append(Tag.contentUnavailable.rawValue)
             bytes.appendUInt64(requestID)
         case .findProviders(let rootCID, let requestID):
-            guard !rootCID.isEmpty, requestID != 0 else { return false }
+            guard MessageLimits.accepts(rootCID), requestID != 0 else { return false }
             bytes.append(Tag.findProviders.rawValue)
             guard bytes.appendLengthPrefixedString(rootCID) else { return false }
             bytes.appendUInt64(requestID)
         case .providers(let rootCID, let requestID, let records):
-            guard !rootCID.isEmpty, requestID != 0 else { return false }
+            guard MessageLimits.accepts(rootCID), requestID != 0 else { return false }
             bytes.append(Tag.providers.rawValue)
             guard bytes.appendLengthPrefixedString(rootCID),
                   bytes.appendProviderRecords(records) else { return false }
             bytes.appendUInt64(requestID)
         case .announceProvider(let rootCID, let expiresAt):
-            guard !rootCID.isEmpty else { return false }
+            guard MessageLimits.accepts(rootCID) else { return false }
             bytes.append(Tag.announceProvider.rawValue)
             guard bytes.appendLengthPrefixedString(rootCID) else { return false }
             bytes.appendUInt64(expiresAt)

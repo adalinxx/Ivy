@@ -135,7 +135,7 @@ enum NetGroup: Sendable {
         if runs.count == 2 {
             guard let head = hextets(runs[0]), let tail = hextets(runs[1]) else { return nil }
             let fillCount = 8 - head.count - tail.count
-            guard fillCount >= 0 else { return nil }
+            guard fillCount > 0 else { return nil }
             expanded = head + Array(repeating: "0", count: fillCount) + tail
         } else {
             guard let all = hextets(s), all.count == 8 else { return nil }

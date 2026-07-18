@@ -44,7 +44,7 @@ struct ResilienceTests {
     @Test("inbound queue overflow preserves order and closes the connection")
     func inboundQueue() async {
         let channel = EmbeddedChannel()
-        let budget = InboundByteBudget(limit: PeerConnection.maxInboundBufferedRecords)
+        let budget = InboundByteBudget(limit: PeerConnection.maxInboundBufferedRecords + 1)
         let connection = PeerConnection(
             endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 1),
             channel: channel,

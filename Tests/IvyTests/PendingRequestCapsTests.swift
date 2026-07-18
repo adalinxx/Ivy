@@ -7,7 +7,7 @@ private extension Ivy {
     func pendingContentSnapshot() -> (requests: Int, waiters: Int) {
         (
             pendingContentRequests.count,
-            pendingContentRequests.values.reduce(0) { $0 + $1.continuations.count }
+            pendingContentRequests.count
         )
     }
 
@@ -57,6 +57,7 @@ struct PendingRequestCapsTests {
     func globalCap() async {
         let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 8))
         let peer = PeerID(publicKey: deterministicTestPeerKey("silent-global-peer"))
+        await node.setContentRequestEnqueueHookForTesting { _ in true }
         let first = Task {
             await node.fetchContent(ContentRequestKey(rootCID: "root-a", cids: []), from: [peer])
         }
@@ -84,10 +85,11 @@ struct PendingRequestCapsTests {
         _ = await second.value
     }
 
-    @Test("equivalent exact selections coalesce and stop at the waiter cap")
-    func coalescingAndWaiterCap() async {
-        let node = Ivy(config: cappedConfig(maxPending: 8, maxWaiters: 2))
+    @Test("wire requests have one owner and stop at the global cap")
+    func wireRequestOwnership() async {
+        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 2))
         let peer = PeerID(publicKey: deterministicTestPeerKey("silent-coalescing-peer"))
+        await node.setContentRequestEnqueueHookForTesting { _ in true }
         let firstKey = ContentRequestKey(
             rootCID: "root",
             cids: ["child-b", "root", "child-a", "child-b"]
@@ -100,7 +102,7 @@ struct PendingRequestCapsTests {
         let first = Task { await node.fetchContent(firstKey, from: [peer]) }
         #expect(await waitForSnapshot((1, 1), on: node))
         let second = Task { await node.fetchContent(equivalentKey, from: [peer]) }
-        #expect(await waitForSnapshot((1, 2), on: node))
+        #expect(await waitForSnapshot((2, 2), on: node))
 
         let start = ContinuousClock.now
         let rejected = await node.fetchContent(equivalentKey, from: [peer])
@@ -109,7 +111,7 @@ struct PendingRequestCapsTests {
         #expect(rejected.entries.isEmpty)
         #expect(ContinuousClock.now - start < .milliseconds(200))
         let snapshot = await node.pendingContentSnapshot()
-        #expect(snapshot.requests == 1)
+        #expect(snapshot.requests == 2)
         #expect(snapshot.waiters == 2)
 
         await node.cleanupAllPending()
@@ -131,6 +133,17 @@ struct PendingRequestCapsTests {
                 id: peer,
                 hash: Router.hash(peer.publicKey),
                 endpoint: endpoint)
+        }
+        #expect(await node.queryProviders(rootCID: "unreachable", targets: targets).isEmpty)
+        #expect(await node.pendingProviderSnapshot(rootCID: "unreachable").requestID == nil)
+        var loopbacks: [TestLoopback] = []
+        for (index, endpoint) in endpoints.enumerated() {
+            let loopback = try await TestLoopback.open()
+            loopbacks.append(loopback)
+            try await node.seedConnectedEndpointForTesting(
+                endpoint,
+                connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+                marker: UInt8(index + 1))
         }
 
         let first = Task { await node.queryProviders(rootCID: "root", targets: targets) }
@@ -171,5 +184,8 @@ struct PendingRequestCapsTests {
         #expect(Set(await second.value) == Set(endpoints))
         #expect(await node.pendingProviderSnapshot(rootCID: "root").requestID == nil)
         #expect(await node.storedProviderExpiry(rootCID: "root", peer: peers[0]) == expiry)
+        await node.stop()
+        for loopback in loopbacks { await loopback.close() }
     }
+
 }

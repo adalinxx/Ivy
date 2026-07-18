@@ -15,7 +15,7 @@ Authentication proves a peer key, never application authority.
 | IVY-009 | One 4 MiB frame-body cap and one 64 KiB metadata cap apply on every route. |
 | IVY-010 | Exact route overhead is removed before a content source materializes bytes. |
 | IVY-011 | Content is request-correlated and exact, or unavailable; partial success is impossible. |
-| IVY-012 | Ivy treats identifiers and bytes as opaque and never traverses or stores a DAG. |
+| IVY-012 | Ivy treats non-empty ASCII wire identifiers and bytes as opaque and never traverses or stores a DAG. |
 | IVY-013 | Equal fetches coalesce across the whole bounded provider-search pipeline. |
 | IVY-014 | Provider records are expiring hints and grant no possession, validity, or authority. |
 | IVY-015 | Public discovery returns admitted candidates; only authenticated promotion installs routing state, and there is no PEX. |

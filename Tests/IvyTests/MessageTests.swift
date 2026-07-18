@@ -212,11 +212,55 @@ struct MessageTests {
         trailing.append(0)
         #expect(Message.deserialize(trailing) == nil)
 
-        #expect(Message.deserialize(
-            Message.contentRequest(requestID: 0, rootCID: "root", cids: []).serialize()) == nil)
-        #expect(Message.deserialize(Message.contentResponse(requestID: 0, entries: []).serialize()) == nil)
-        #expect(Message.deserialize(Message.contentUnavailable(requestID: 0).serialize()) == nil)
+        var zeroContentRequest = Message.contentRequest(
+            requestID: 1,
+            rootCID: "root",
+            cids: []).serialize()
+        zeroContentRequest.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroContentRequest) == nil)
+
+        var zeroContentResponse = Message.contentResponse(
+            requestID: 1,
+            entries: []).serialize()
+        zeroContentResponse.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroContentResponse) == nil)
+
+        var zeroUnavailable = Message.contentUnavailable(requestID: 1).serialize()
+        zeroUnavailable.replaceSubrange(1..<9, with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroUnavailable) == nil)
+
+        var zeroFindProviders = Message.findProviders(
+            rootCID: "root",
+            requestID: 1).serialize()
+        zeroFindProviders.replaceSubrange(
+            (zeroFindProviders.count - 8)..<zeroFindProviders.count,
+            with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroFindProviders) == nil)
+
+        var zeroProviders = Message.providers(
+            rootCID: "root",
+            requestID: 1,
+            records: []).serialize()
+        zeroProviders.replaceSubrange(
+            (zeroProviders.count - 8)..<zeroProviders.count,
+            with: repeatElement(0, count: 8))
+        #expect(Message.deserialize(zeroProviders) == nil)
         #expect(Message.relayReady(routeID: Data([1]), status: 0).serialize().isEmpty)
+
+        let unicodeEquivalent = ["\u{00e9}", "e\u{0301}"]
+        #expect(unicodeEquivalent[0] == unicodeEquivalent[1])
+        for identifier in unicodeEquivalent {
+            #expect(Message.contentRequest(
+                requestID: 1,
+                rootCID: identifier,
+                cids: []).serialize().isEmpty)
+            #expect(Message.findProviders(
+                rootCID: identifier,
+                requestID: 1).serialize().isEmpty)
+            #expect(Message.announceProvider(
+                rootCID: identifier,
+                expiresAt: 1).serialize().isEmpty)
+        }
     }
 
 }

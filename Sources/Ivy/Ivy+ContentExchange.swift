@@ -36,14 +36,17 @@ struct ContentRequestKey: Hashable, Sendable {
 
 struct PendingContentRequest {
     let key: ContentRequestKey
-    var continuations: [CheckedContinuation<AttributedContentResponse, Never>]
+    let continuation: CheckedContinuation<AttributedContentResponse, Never>
     var candidates: Set<PeerID>
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
-struct PendingNetworkFetch {
+struct PendingFetch {
     let token: UInt64
     let generation: UInt64
-    var waiters: [CheckedContinuation<AttributedContentResponse, Never>]
+    var continuations: [CheckedContinuation<AttributedContentResponse, Never>]
+    var operationTask: Task<Void, Never>? = nil
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
 struct InboundContentRequest: Hashable {
@@ -143,7 +146,8 @@ extension Ivy {
 
     private func beginServingContent(_ request: InboundContentRequest) -> Bool {
         let perPeerLimit = max(1, min(8, config.maxConcurrentContentRequests / 4))
-        guard servingContentRequests.count < config.maxConcurrentContentRequests,
+        guard servingContentRequests.count + activeLocalContentRequestCount
+                < config.maxConcurrentContentRequests,
               !servingContentRequests.contains(request),
               servingContentRequests.lazy.filter({ $0.peer == request.peer }).count
                 < perPeerLimit else { return false }
@@ -162,22 +166,23 @@ extension Ivy {
     ) {
         guard let pending = pendingContentRequests[requestID],
               pending.candidates.contains(peer) else { return }
+        let key = pending.key
 
         var result: [String: Data] = [:]
         for entry in entries {
-            guard pending.key.requestedSet.contains(entry.cid), result[entry.cid] == nil else {
+            guard key.requestedSet.contains(entry.cid), result[entry.cid] == nil else {
                 tally.recordProtocolViolation(peer: peer)
                 markContentCandidateDone(requestID: requestID, peer: peer)
                 return
             }
             result[entry.cid] = entry.data
         }
-        guard pending.key.requestedCIDs.allSatisfy({ result[$0] != nil }) else {
+        guard key.requestedCIDs.allSatisfy({ result[$0] != nil }) else {
             markContentCandidateDone(requestID: requestID, peer: peer)
             return
         }
 
-        rememberProvider(rootCID: pending.key.rootCID, peer: peer)
+        rememberProvider(rootCID: key.rootCID, peer: peer)
         resolveContentRequest(requestID: requestID, entries: result, servedBy: peer)
     }
 
@@ -196,25 +201,30 @@ extension Ivy {
               cids.count <= Int(MessageLimits.maxContentCIDCount),
               cids.allSatisfy(MessageLimits.accepts) else { return .empty }
         let key = ContentRequestKey(rootCID: rootCID, cids: cids)
-        if let local = await localContent(for: key) {
-            guard generation == runGeneration else { return .empty }
-            return AttributedContentResponse(entries: local, servedBy: nil)
-        }
-        guard isCurrentRun(generation) else { return .empty }
-        return await fetchContentFromNetwork(key, generation: generation)
+        guard Message.contentResponseDataBudget(
+            for: key.requestedCIDs,
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: false
+        ) != nil else { return .empty }
+        return await fetchContentCoalesced(key, generation: generation)
     }
 
     private func localContent(for key: ContentRequestKey) async -> [String: Data]? {
+        guard let source = contentSource else { return nil }
         guard let maxDataBytes = Message.contentResponseDataBudget(
             for: key.requestedCIDs,
             maxFrameSize: IvyConfig.protocolMaxFrameSize,
             relayed: false
         ) else { return nil }
-        guard let entries = await contentSource?.content(
+        guard servingContentRequests.count + activeLocalContentRequestCount
+                < config.maxConcurrentContentRequests else { return nil }
+        activeLocalContentRequestCount += 1
+        defer { activeLocalContentRequestCount -= 1 }
+        let entries = await source.content(
             rootCID: key.rootCID,
             cids: key.requestedCIDs,
             maxDataBytes: maxDataBytes
-        ) else { return nil }
+        )
         return validatedContent(entries, for: key, maxDataBytes: maxDataBytes)
     }
 
@@ -236,41 +246,78 @@ extension Ivy {
         return missing.isEmpty ? result : nil
     }
 
-    private func fetchContentFromNetwork(
+    private func fetchContentCoalesced(
         _ key: ContentRequestKey,
         generation: UInt64
     ) async -> AttributedContentResponse {
-        guard isCurrentRun(generation) else { return .empty }
-        if var pending = pendingNetworkFetches[key] {
-            guard pending.generation == generation,
-                  pending.waiters.count + 1 < config.maxWaitersPerRequest else { return .empty }
-            let response: AttributedContentResponse = await withCheckedContinuation { continuation in
-                pending.waiters.append(continuation)
-                pendingNetworkFetches[key] = pending
+        await withCheckedContinuation { continuation in
+            if var pending = pendingFetches[key] {
+                guard pending.generation == generation,
+                      pending.continuations.count < config.maxWaitersPerRequest else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+                pending.continuations.append(continuation)
+                pendingFetches[key] = pending
+                return
             }
-            return isCurrentRun(generation) ? response : .empty
+            guard activeFetchCount < config.maxPendingRequests else {
+                continuation.resume(returning: .empty)
+                return
+            }
+            nextFetchToken &+= 1
+            let token = nextFetchToken
+            var pending = PendingFetch(
+                token: token,
+                generation: generation,
+                continuations: [continuation])
+            activeFetchCount += 1
+            pendingFetches[key] = pending
+            pending.operationTask = Task { [weak self] in
+                await self?.runFetch(key, generation: generation, token: token)
+            }
+            let timeout = config.requestTimeout
+            pending.timeoutTask = delayedTask(after: timeout) { [weak self] in
+                await self?.timeoutFetch(key, token: token)
+            }
+            pendingFetches[key] = pending
         }
-        nextNetworkFetchToken &+= 1
-        let token = nextNetworkFetchToken
-        pendingNetworkFetches[key] = PendingNetworkFetch(
-            token: token,
-            generation: generation,
-            waiters: [])
-#if DEBUG || IVY_TESTING
+    }
+
+    private func runFetch(
+        _ key: ContentRequestKey,
+        generation: UInt64,
+        token: UInt64
+    ) async {
+        defer { activeFetchCount -= 1 }
         let response: AttributedContentResponse
-        if let hook = networkFetchHookForTesting {
-            response = await hook(key, generation, token)
-        } else {
-            response = await performNetworkFetch(key, generation: generation)
-        }
+        if !Task.isCancelled, let local = await localContent(for: key) {
+            response = AttributedContentResponse(entries: local, servedBy: nil)
+        } else if !Task.isCancelled, isCurrentRun(generation) {
+#if DEBUG || IVY_TESTING
+            if let hook = networkFetchHookForTesting {
+                response = await hook(key, generation, token)
+            } else {
+                response = await performNetworkFetch(key, generation: generation)
+            }
 #else
-        let response = await performNetworkFetch(key, generation: generation)
+            response = await performNetworkFetch(key, generation: generation)
 #endif
-        guard isCurrentRun(generation),
-              pendingNetworkFetches[key]?.token == token,
-              let pending = pendingNetworkFetches.removeValue(forKey: key) else { return .empty }
-        for waiter in pending.waiters { waiter.resume(returning: response) }
-        return response
+        } else {
+            response = .empty
+        }
+        guard pendingFetches[key]?.token == token,
+              let pending = pendingFetches.removeValue(forKey: key) else { return }
+        pending.timeoutTask?.cancel()
+        let result = generation == runGeneration ? response : .empty
+        for continuation in pending.continuations { continuation.resume(returning: result) }
+    }
+
+    private func timeoutFetch(_ key: ContentRequestKey, token: UInt64) {
+        guard pendingFetches[key]?.token == token,
+              let pending = pendingFetches.removeValue(forKey: key) else { return }
+        pending.operationTask?.cancel()
+        for continuation in pending.continuations { continuation.resume(returning: .empty) }
     }
 
     private func performNetworkFetch(
@@ -278,44 +325,55 @@ extension Ivy {
         generation: UInt64
     ) async -> AttributedContentResponse {
         guard isCurrentRun(generation) else { return .empty }
-        var attemptedPeers: Set<PeerID> = []
+        var attemptedSessions: [PeerID: UUID] = [:]
         let cached = cachedProviderEndpoints(rootCID: key.rootCID)
-        let attemptedEndpoints = await connectToProviderEndpoints(cached, generation: generation)
+        await connectToProviderEndpoints(cached, generation: generation)
         guard isCurrentRun(generation) else { return .empty }
 
         var candidates = Array(connectedProviderIDs(for: key.rootCID)
             .prefix(config.maxContentCandidates))
         if !candidates.isEmpty {
-            attemptedPeers.formUnion(candidates)
+            let sessions = liveConnectionIDs(for: candidates)
             let response = await fetchContent(key, from: candidates, generation: generation)
             guard isCurrentRun(generation) else { return .empty }
             if !response.entries.isEmpty { return response }
+            attemptedSessions.merge(sessions) { _, latest in latest }
         }
 
         let fresh = await queryFreshProviderEndpoints(
             rootCID: key.rootCID,
             generation: generation)
-            .filter { !attemptedEndpoints.contains($0) }
         guard isCurrentRun(generation) else { return .empty }
-        _ = await connectToProviderEndpoints(fresh, generation: generation)
+        await connectToProviderEndpoints(fresh + cached, generation: generation)
         guard isCurrentRun(generation) else { return .empty }
         candidates = Array(connectedProviderIDs(for: key.rootCID)
-            .filter { !attemptedPeers.contains($0) }
+            .filter {
+                attemptedSessions[$0] != endpointConnection(for: $0)?.connectionID
+            }
             .prefix(config.maxContentCandidates))
         if !candidates.isEmpty {
-            attemptedPeers.formUnion(candidates)
+            let sessions = liveConnectionIDs(for: candidates)
             let response = await fetchContent(key, from: candidates, generation: generation)
             guard isCurrentRun(generation) else { return .empty }
             if !response.entries.isEmpty { return response }
+            attemptedSessions.merge(sessions) { _, latest in latest }
         }
 
-        candidates = Array(connectedEndpointIDs()
-            .filter { !attemptedPeers.contains($0) }
-            .filter { !isDeficiencySuppressed(rootCID: key.rootCID, peer: $0) }
-            .prefix(config.maxContentCandidates))
+        candidates = connectedFallbackCandidates(
+            rootCID: key.rootCID,
+            excluding: attemptedSessions)
         guard !candidates.isEmpty else { return .empty }
         let response = await fetchContent(key, from: candidates, generation: generation)
         return isCurrentRun(generation) ? response : .empty
+    }
+
+    private func liveConnectionIDs(for peers: [PeerID]) -> [PeerID: UUID] {
+        Dictionary(uniqueKeysWithValues: peers.compactMap { peer in
+            guard let connection = endpointConnection(for: peer), connection.isLive else {
+                return nil
+            }
+            return (peer, connection.connectionID)
+        })
     }
 
     func fetchContent(
@@ -324,65 +382,53 @@ extension Ivy {
         generation: UInt64? = nil
     ) async -> AttributedContentResponse {
         if let generation, !isCurrentRun(generation) { return .empty }
-        if let requestID = contentRequestIDs[key],
-           let pending = pendingContentRequests[requestID] {
-            guard pending.continuations.count < config.maxWaitersPerRequest else { return .empty }
-            let response = await withCheckedContinuation { continuation in
-                pendingContentRequests[requestID]?.continuations.append(continuation)
-            }
-            if let generation, !isCurrentRun(generation) { return .empty }
-            return response
-        }
-        guard pendingContentRequests.count < config.maxPendingRequests else { return .empty }
-
         let response: AttributedContentResponse = await withCheckedContinuation { continuation in
-            if let requestID = contentRequestIDs[key] {
-                guard var pending = pendingContentRequests[requestID],
-                      pending.continuations.count < config.maxWaitersPerRequest else {
-                    continuation.resume(returning: .empty)
-                    return
-                }
-                pending.continuations.append(continuation)
-                pendingContentRequests[requestID] = pending
+            guard pendingContentRequests.count < config.maxPendingRequests else {
+                continuation.resume(returning: .empty)
                 return
             }
 
             let requestID = makeContentRequestID()
-            pendingContentRequests[requestID] = PendingContentRequest(
-                key: key,
-                continuations: [continuation],
-                candidates: Set(candidates)
-            )
-            contentRequestIDs[key] = requestID
-
             let message = Message.contentRequest(
                 requestID: requestID,
                 rootCID: key.rootCID,
                 cids: key.cids
             )
+            var enqueued: Set<PeerID> = []
             for peer in candidates {
-                fireToPeer(peer, message)
-            }
-            let timeout = config.requestTimeout
-            Task { [weak self] in
-                do {
-                    try await Task.sleep(for: timeout)
-                } catch {
-                    return
+                if enqueueContentRequest(message, to: peer) {
+                    enqueued.insert(peer)
                 }
+            }
+            guard !enqueued.isEmpty else {
+                continuation.resume(returning: .empty)
+                return
+            }
+            pendingContentRequests[requestID] = PendingContentRequest(
+                key: key,
+                continuation: continuation,
+                candidates: enqueued)
+
+            let timeout = config.requestTimeout
+            let timeoutTask = delayedTask(after: timeout) { [weak self] in
                 await self?.resolveContentRequest(requestID: requestID)
             }
+            pendingContentRequests[requestID]?.timeoutTask = timeoutTask
         }
         if let generation, !isCurrentRun(generation) { return .empty }
         return response
     }
 
     private func makeContentRequestID() -> UInt64 {
-        var requestID = UInt64.random(in: 1 ... .max)
-        while pendingContentRequests[requestID] != nil {
-            requestID = UInt64.random(in: 1 ... .max)
-        }
-        return requestID
+        makeWireOperationID { pendingContentRequests[$0] != nil }
+    }
+
+    private func enqueueContentRequest(_ message: Message, to peer: PeerID) -> Bool {
+#if DEBUG || IVY_TESTING
+        if let hook = contentRequestEnqueueHookForTesting { return hook(peer) }
+#endif
+        if case .enqueued = fireToPeer(peer, message) { return true }
+        return false
     }
 
     func markContentCandidateDone(requestID: UInt64, peer: PeerID) {
@@ -401,11 +447,9 @@ extension Ivy {
         servedBy: PeerID? = nil
     ) {
         guard let pending = pendingContentRequests.removeValue(forKey: requestID) else { return }
-        contentRequestIDs.removeValue(forKey: pending.key)
+        pending.timeoutTask?.cancel()
         let response = AttributedContentResponse(entries: entries, servedBy: servedBy)
-        for continuation in pending.continuations {
-            continuation.resume(returning: response)
-        }
+        pending.continuation.resume(returning: response)
     }
 
     public func reportDeficientContent(rootCID: String, servedBy peer: PeerID) {
@@ -448,7 +492,20 @@ extension Ivy {
         return false
     }
 
-    func connectedEndpointIDs() -> [PeerID] {
-        connectedEndpointPeers
+    func connectedFallbackCandidates(
+        rootCID: String,
+        excluding attempted: [PeerID: UUID]
+    ) -> [PeerID] {
+        let eligible = connectedEndpointPeers
+            .filter { attempted[$0] != endpointConnection(for: $0)?.connectionID }
+            .filter { !isDeficiencySuppressed(rootCID: rootCID, peer: $0) }
+            .sorted { $0.publicKey < $1.publicKey }
+        guard !eligible.isEmpty else { return [] }
+
+        let start = nextConnectedFallbackOffset % eligible.count
+        let rotated = Array(eligible[start...] + eligible[..<start])
+        let selected = Array(rotated.prefix(config.maxContentCandidates))
+        nextConnectedFallbackOffset = (start + selected.count) % eligible.count
+        return selected
     }
 }
