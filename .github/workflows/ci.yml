@@ -19,6 +19,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26.6
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
       - run: swift --version
       - run: swift build
       - run: swift build -c release
@@ -42,6 +45,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
       - run: swift --version
       - run: swift test --scratch-path .build-${{ matrix.sanitizer }} --sanitize ${{ matrix.sanitizer }}
 
