@@ -60,7 +60,7 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
-            externalAddress: (advertisedHost, port),
+            externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
             carriers: carriers,
             mode: mode)
