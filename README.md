@@ -1,239 +1,134 @@
-<p align="center">
-  <a href="https://github.com/adalinxx/Ivy/actions/workflows/ci.yml"><img src="https://github.com/adalinxx/Ivy/actions/workflows/ci.yml/badge.svg" alt="CI/CD"></a>
-  <img src="https://img.shields.io/badge/swift-6.0+-F05138?style=flat&logo=swift" alt="Swift 6.0+">
-  <img src="https://img.shields.io/badge/platforms-macOS%20|%20iOS%20|%20tvOS%20|%20watchOS%20|%20visionOS-lightgrey" alt="Platforms">
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
-  <img src="https://img.shields.io/badge/SPM-compatible-brightgreen" alt="SPM Compatible">
-</p>
-
 # Ivy
 
-**Reputation-routed P2P storage and retrieval for content-addressed data.**
+Authenticated, bounded peer transport and routing for Swift.
 
-Ivy is a cooperative peer-to-peer network that replaces blind peer selection with
-evidence-based trust. Every routing decision — which peer to query, which connection to
-keep, who gets served under load — is informed by measured behavior: bytes relayed, latency
-observed, success delivered. The result is a self-healing network where honest nodes
-naturally route through honest nodes.
+Ivy proves which peer sent an accepted record and bounds the work needed to
+receive it. The caller decides what the record means.
 
-Ivy is standalone and host-agnostic — reputation accounting comes from its dependency
-[Tally](https://github.com/adalinxx/Tally), and nothing in Ivy is chain-specific. It is
-used in production by [Lattice](https://github.com/adalinxx/lattice-node) as **one
-example consumer**.
+Ivy does not validate CIDs, traverse DAGs, store content, authorize processes,
+run consensus, or implement settlement.
 
----
+## Start
 
-## Why Ivy
+```swift
+import Crypto
+import Ivy
 
-Most P2P networks treat all peers equally: connect to anyone, serve anyone, hope for the
-best. This works until it doesn't — Sybil floods poison routing tables, freeloaders consume
-bandwidth without contributing, and eclipse attacks isolate honest nodes.
+let ivy = Ivy(config: IvyConfig(
+    signingKey: Curve25519.Signing.PrivateKey(),
+    listenPort: 4001,
+    bootstrapPeers: bootstrapPeers
+))
 
-Ivy takes a different approach: **your routing table is a trust graph.**
+try await ivy.start()
+// ...
+await ivy.stop()
+```
 
-- **Honest peers route through honest peers.** Queries travel through nodes that earned
-  their position through direct experience, scored by [Tally](https://github.com/adalinxx/Tally).
-- **Freeloaders are progressively excluded.** Under load, serving is gated on reputation
-  (`tally.shouldAllow`), so the network degrades gracefully instead of collapsing.
-- **Caching is incentivized.** Serving data far from your DHT zone earns more reputation
-  (distance-scaled credit), naturally forming a distributed cache along well-traveled paths.
-- **New peers can bootstrap.** An optional proof-of-work key floor (`minPeerKeyBits`) raises
-  the cost of Sybil identity creation without requiring an existing social graph.
+A socket remains private until its signed session handshake completes.
+`start()` and `stop()` are ordered and restart-safe.
+Sessions authenticate and replay-protect cleartext records; Ivy does not provide
+encryption or forward secrecy.
 
-All data is content-addressed: a CID is the hash of its bytes, and every received
-`(CID, bytes)` pair is verified (`hash(bytes) == CID`) before use.
+`IvyMode.overlay` uses authenticated Kademlia discovery. `.pinned(peer:)`
+accepts one endpoint identity and disables public discovery. Configured carriers
+govern outbound relay initiation; inbound offers grant transport only and never
+turn a carrier into an endpoint peer.
 
----
+## Network roles
+
+Ivy supplies three small primitives that applications compose:
+
+- `broadcastMessage` announces gossip to the currently connected peers.
+- `sendMessage` carries directed sync requests and responses.
+- `fetchContent` retrieves one exact content selection from available providers.
+
+The caller defines gossip IDs, deduplication, forwarding, sync order, and CID
+validation. Ivy authenticates the sender, bounds each operation, and keeps these
+application protocols independent.
+
+## Exact content
+
+Register a source:
+
+```swift
+public protocol IvyContentSource: Sendable {
+    func content(
+        rootCID: String,
+        cids: [String],
+        maxDataBytes: Int
+    ) async -> [ContentEntry]
+}
+
+await ivy.setContentSource(store)
+```
+
+`cids` is the complete canonical selection and includes `rootCID`. Return every
+entry exactly once within `maxDataBytes`, or return `[]`. Wire identifiers are
+non-empty ASCII strings, which keeps equality byte-exact; Ivy does not parse
+their meaning.
+
+Fetch the same explicit selection:
+
+```swift
+let response = await ivy.fetchContent(
+    rootCID: rootCID,
+    cids: selectedCIDs
+)
+```
+
+Ivy returns the whole selection or `.empty`; it never follows links or returns a
+partial success. `servedBy` identifies the authenticated remote endpoint and is
+`nil` for a local result. The caller validates identifiers and bytes before
+storage.
+
+Selections must fit one fixed 4 MiB frame body. Larger application objects must
+be split by caller-defined boundaries.
+
+Provider records are expiring routing hints, not proof of possession, validity,
+pinning, or authority.
+
+## Application messages
+
+```swift
+let result = await ivy.sendMessage(
+    to: peer,
+    topic: "sync",
+    payload: encodedMessage
+)
+```
+
+Ivy delivers incoming messages through `IvyDelegate` with an authenticated
+sender. `.enqueued` means local queue acceptance, not remote delivery.
+
+Each authenticated peer is an independent availability zone. Unavailable or
+caller-reported deficient content changes provider selection for that root; it
+does not disconnect the peer or prevent messages and other roots from using the
+same session. Tally reduces admission for weak evidence or verified transport
+violations under pressure, without turning local service history into a ban.
+
+## Boundary
+
+| Ivy owns | The caller owns |
+| --- | --- |
+| Session authentication and replay protection | Process authorization and protocol meaning |
+| Connection, frame, request, route, and lookup limits | Application batching and policy |
+| Endpoint routing and configured carriers | Service or chain topology |
+| Exact opaque content transfer | CID validation, DAG interpretation, and storage |
+| Signed sender attribution | Consensus, retention, fees, and settlement |
 
 ## Documentation
 
-- **[Whitepaper](docs/whitepaper.md)** — the conceptual model: identity and Sybil
-  resistance, work-denominated economics, the trust/credit-line system, pinning, and
-  security analysis.
-- **[Architecture](docs/architecture.md)** — how it's built: the actor decomposition,
-  transports, STUN-based NAT discovery, content routing (DHT forwarding, volume fetching),
-  gossip, peer health, the full wire-protocol message catalog, and every config field.
+- [Architecture](docs/architecture.md)
+- [Correctness invariants](docs/correctness-invariants.md)
 
----
+## Requirements
 
-## Quick Start
+- Swift 6
+- macOS 14+, iOS 17+, tvOS 17+, watchOS 10+, visionOS 1+, or Linux
+- One Ed25519 signing key per process identity
 
-### Starting a node
-
-```swift
-import Ivy
-
-let config = IvyConfig(
-    publicKey: myPublicKey,
-    listenPort: 4001,
-    bootstrapPeers: [
-        PeerEndpoint(publicKey: "abc...", host: "seed1.example.com", port: 4001),
-    ],
-    enableLocalDiscovery: true,
-    signingKey: mySigningKey   // 32-byte Curve25519 key; required to sign identify/records
-)
-
-let node = Ivy(config: config)
-try await node.start()
-```
-
-### Serving local content
-
-Implement `IvyDataSource` so the node can answer requests from its local store:
-
-```swift
-final class MyStore: IvyDataSource {
-    func data(for cid: String) async -> Data? { /* local lookup */ }
-    func volumeData(for rootCID: String, cids: [String]) async -> [(cid: String, data: Data)] { /* … */ }
-    func hasVolume(rootCID: String) async -> Bool { /* … */ }
-}
-
-await node.setDataSource(MyStore())
-```
-
-### Publishing and fetching
-
-```swift
-// Announce a CID you hold; peers pull it via DHT forwarding.
-await node.announceBlock(cid: blockCID)
-
-// Announce that you pin a volume root to the peers nearest its hash.
-await node.publishPinAnnounce(rootCID: rootCID, expiry: expiry, fee: 0)
-
-// Fetch a volume by root CID (local data source first, then the network).
-let volume = await node.fetchVolume(rootCID: rootCID)        // [String: Data]
-
-// Fetch specific child CIDs under a root.
-let blocks = await node.fetchVolume(rootCID: rootCID, childCIDs: childCIDs)
-```
-
-### Event handling
-
-```swift
-final class MyHandler: IvyDelegate {
-    func ivy(_ ivy: Ivy, didConnect peer: PeerID) {
-        print("Connected to \(peer.publicKey.prefix(16))…")
-    }
-    func ivy(_ ivy: Ivy, didReceiveBlockAnnouncement cid: String, from peer: PeerID) {
-        Task { _ = await ivy.get(cid: cid) }
-    }
-}
-
-await node.delegate = MyHandler()
-```
-
-> `delegate` and `dataSource` are actor-isolated `weak` properties: assign the delegate with
-> `await node.delegate = …`, and set the data source via `await node.setDataSource(_:)`.
-
-### Inspecting network state
-
-```swift
-let peers   = await node.connectedPeers
-let count   = await node.directPeerCount
-let rep     = node.tally.reputation(for: somePeer)
-let closest = node.router.closestPeers(to: targetHash, count: 10)
-```
-
----
-
-## Wire Protocol
-
-Binary, length-prefixed messages over TCP (SwiftNIO):
-
-```
-┌──────────────────────┬──────────────┬────────────────────┐
-│ 4 bytes: length      │ 1 byte: tag  │ variable: payload   │
-│ (big-endian uint32)  │              │                     │
-└──────────────────────┴──────────────┴────────────────────┘
-```
-
-Selected message types (full catalog in [docs/architecture.md](docs/architecture.md)):
-
-| Message | Tag | Payload |
-|---------|:---:|---------|
-| `ping` / `pong` | 0 / 1 | `uint64` nonce |
-| `block` | 3 | CID + data |
-| `dontHave` | 4 | CID |
-| `findNode` | 5 | target hash + fee + nonce |
-| `neighbors` | 6 | array of (key, host, port) + nonce |
-| `announceBlock` | 7 | CID |
-| `identify` | 8 | publicKey + observed addr + listen addrs + chain ports + signature |
-| `spawnCertPresentation` | 59 | chain of spawn certificates (presented after `identify`) |
-| `dhtForward` | 16 | CID + ttl |
-| `want` | 26 | array of root CIDs |
-| `pexRequest` / `pexResponse` | 37 / 38 | nonce (+ peers) |
-| `findPins` / `pins` | 40 / 41 | CID (+ providers) |
-| `pinAnnounce` / `pinStored` | 42 / 43 | rootCID + signature + fee |
-| `blocks` | 50 | rootCID + array of (CID, data) |
-| `wantVolume` | 53 | rootCID + child CIDs |
-| `announceVolume` / `pushVolume` | 54 / 55 | rootCID + items |
-| `notHave` | 58 | rootCID |
-
-Frames are bounded by `maxFrameSize` (default 4 MB); strings are capped at 8 KB and
-collection counts are bounded per message (`MessageLimits`).
-
----
-
-## Configuration
-
-Key parameters in `IvyConfig` (full table in [docs/architecture.md](docs/architecture.md)):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `listenPort` | 4001 | TCP listen port |
-| `kBucketSize` | 20 | Peers per DHT bucket |
-| `maxConcurrentRequests` | 6 | Parallel outbound queries |
-| `requestTimeout` | 15s | Per-request deadline |
-| `relayTimeout` | 5s | DHT-forward deadline |
-| `defaultTTL` | 7 | Hop limit for forwarded messages |
-| `enablePEX` | `true` | Peer exchange |
-| `pexInterval` | 120s | PEX round interval |
-| `enableLocalDiscovery` | `true` | Bonjour/mDNS on LAN (Apple platforms) |
-| `minPeerKeyBits` | 0 | Required key-PoW trailing-zero bits (0 = off) |
-| `maxFrameSize` | 4 MB | Max wire-frame payload |
-
----
-
-## Installation
-
-Add Ivy to your `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/adalinxx/Ivy.git", branch: "main"),
-]
-```
-
-Then add `"Ivy"` to your target's dependencies.
-
-### Requirements
-
-- Swift 6.0+
-- macOS 14+ / iOS 17+ / tvOS 17+ / watchOS 10+ / visionOS 1+
-
-### Dependencies
-
-| Package | Role |
-|---------|------|
-| [Tally](https://github.com/adalinxx/Tally) | Reputation accounting, rate limiting, distance-scaled credit, `PeerID` |
-| [swift-cid](https://github.com/swift-libp2p/swift-cid) / [swift-multihash](https://github.com/swift-libp2p/swift-multihash) | CID parsing and content-address verification |
-| [SwiftNIO](https://github.com/apple/swift-nio) | Non-blocking TCP/UDP I/O |
-
----
-
-## Testing
-
-```bash
+```sh
 swift build
 swift test
 ```
-
-The GitHub Actions pipeline runs release builds, the benchmarks executable build, and the
-full Swift test suite on macOS and Linux for pull requests and `main` pushes. Pushing a
-`v*` tag runs the same checks and publishes a GitHub Release after both platforms pass.
-
----
-
-<p align="center">
-  <sub>Built by <a href="https://github.com/adalinxx">The Lattice Authors</a></sub>
-</p>

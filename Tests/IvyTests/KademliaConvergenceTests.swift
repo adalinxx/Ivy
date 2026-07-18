@@ -1,499 +1,665 @@
-import Testing
 import Foundation
+import NIOPosix
+import Testing
 @testable import Ivy
 import Tally
-import Crypto
 
-@Suite("Kademlia convergence", .serialized)
+private extension Ivy {
+    func awaitKademliaTestResponse(nonce: UInt64, from peer: PeerID) async -> [PeerEndpoint] {
+        await withCheckedContinuation { continuation in
+            pendingNeighborResponses[nonce] = PendingNeighborResponse(
+                peer: peer,
+                continuation: continuation)
+        }
+    }
+
+    func pendingKademliaTestResponseCount() -> Int {
+        pendingNeighborResponses.count
+    }
+
+    func seedKademliaTestEndpoint(_ endpoint: PeerEndpoint) {
+        let peer = PeerID(publicKey: endpoint.publicKey)
+        router.addPeer(peer, endpoint: endpoint)
+    }
+}
+
+private actor SimulatedNeighborNetwork {
+    private let responses: [String: [PeerEndpoint]]
+    private let partitioned: Set<String>
+    private var requestCount = 0
+    private var released = false
+    private var releaseOrder: [String] = []
+    private var nextReleaseIndex = 0
+
+    init(responses: [String: [PeerEndpoint]], partitioned: Set<String>) {
+        self.responses = responses
+        self.partitioned = partitioned
+    }
+
+    func request(from peer: PeerID) async -> [PeerEndpoint] {
+        requestCount += 1
+        guard !released else { return response(for: peer.publicKey) }
+        do {
+            try await TestSynchronization.wait(
+                for: "simulated neighbor response from \(peer.publicKey)"
+            ) {
+                await self.canRelease(peer.publicKey)
+            }
+        } catch TestSynchronizationError.cancelled {
+            return []
+        } catch {
+            Issue.record("\(error)")
+            return []
+        }
+        nextReleaseIndex += 1
+        return response(for: peer.publicKey)
+    }
+
+    func waitForRequests(_ count: Int) async throws {
+        try await TestSynchronization.wait(for: "\(count) simulated neighbor request(s)") {
+            await self.hasRequests(count)
+        }
+    }
+
+    func release(in order: [String]) {
+        released = true
+        releaseOrder = order
+    }
+
+    private func canRelease(_ key: String) -> Bool {
+        nextReleaseIndex < releaseOrder.count && releaseOrder[nextReleaseIndex] == key
+    }
+
+    private func hasRequests(_ count: Int) -> Bool { requestCount >= count }
+
+    private func response(for key: String) -> [PeerEndpoint] {
+        partitioned.contains(key) ? [] : responses[key] ?? []
+    }
+}
+
+@Suite("Kademlia lookup", .serialized)
 struct KademliaConvergenceTests {
+    @Test("seeded reply ordering and one partition still converge")
+    func seededAdversarialSchedule() async throws {
+        let identity = TransportTestHarness.identity("kad-seeded-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let initial = (0..<3).map { testEndpoint("kad-seeded-\($0)", port: UInt16(4100 + $0)) }
+        let target = testEndpoint("kad-seeded-target", port: 4200)
+        var generator = TestSeededGenerator(seed: 0x1A17)
+        let partitioned = initial[Int(generator.next() % UInt64(initial.count))].publicKey
+        let responseOrder = generator.shuffled(initial.map(\.publicKey))
+        let network = SimulatedNeighborNetwork(
+            responses: Dictionary(uniqueKeysWithValues: initial.map { ($0.publicKey, [target]) }),
+            partitioned: [partitioned])
 
-    @Test("findNode converges across sparse routing tables")
-    func findNodeConvergesAcrossSparseRoutingTables() async throws {
-        let nodes = makeKademliaNodes(count: 8)
-        try await connectTransportMesh(nodes)
+        try await node.start()
+        for (index, endpoint) in (initial + [target]).enumerated() {
+            try await node.seedConnectedEndpointForTesting(endpoint, marker: UInt8(index + 1))
+        }
+        for endpoint in initial { await node.seedKademliaTestEndpoint(endpoint) }
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            await network.request(from: peer)
+        }
 
-        let targetKey = "kad-node-7"
-        await seedRouter(nodes[0], with: [1], nodes: nodes)
-        await seedRouter(nodes[1], with: [2, 3], nodes: nodes)
-        await seedRouter(nodes[2], with: [4, 5], nodes: nodes)
-        await seedRouter(nodes[3], with: [6], nodes: nodes)
-        await seedRouter(nodes[4], with: [7], nodes: nodes)
-        await seedRouter(nodes[5], with: [7], nodes: nodes)
-        await seedRouter(nodes[6], with: [7], nodes: nodes)
+        let lookup = BoundedTestTask { await node.findNode(target: target.publicKey) }
+        try await network.waitForRequests(initial.count)
+        await network.release(in: responseOrder)
 
-        #expect(!(await routedKeys(nodes[0]).contains(targetKey)))
-
-        let discovered = await nodes[0].findNode(target: targetKey)
-        let discoveredKeys = Set(discovered.map(\.publicKey))
-        let node0Keys = await routedKeys(nodes[0])
-
-        #expect(discoveredKeys.contains(targetKey))
-        #expect(node0Keys.contains(targetKey))
+        let result = try await lookup.value(waitingFor: "seeded multi-hop lookup")
+        #expect(result.contains(target))
+        await node.stop()
     }
 
-    @Test("findNode preserves Kademlia distance ordering")
-    func findNodePreservesDistanceOrdering() async throws {
-        let nodes = makeKademliaNodes(count: 10)
-        try await connectTransportMesh(nodes)
+    @Test("findNode follows deterministic multi-hop referrals")
+    func successfulMultiHopLookup() async throws {
+        let identity = TransportTestHarness.identity("kad-multihop-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let first = testEndpoint("kad-multihop-first", port: 4001)
+        let second = testEndpoint("kad-multihop-second", port: 4002)
+        let target = testEndpoint("kad-multihop-target", port: 4003)
+        let responses = [
+            first.publicKey: [second],
+            second.publicKey: [target],
+            target.publicKey: [],
+        ]
 
-        let targetKey = "kad-node-9"
-        await seedRouter(nodes[0], with: [1, 2, 3, 4, 5, 6, 7, 8, 9], nodes: nodes)
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(first, marker: 1)
+        try await node.seedConnectedEndpointForTesting(second, marker: 2)
+        try await node.seedConnectedEndpointForTesting(target, marker: 3)
+        await node.seedKademliaTestEndpoint(first)
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            responses[peer.publicKey] ?? []
+        }
 
-        let endpoints = await nodes[0].findNode(target: targetKey)
-        let targetHash = Router.hash(targetKey)
-        let distances = endpoints.map { Router.xorDistance(Router.hash($0.publicKey), targetHash) }
+        let result = await node.findNode(target: target.publicKey)
 
-        #expect(!endpoints.isEmpty)
-        #expect(distances == distances.sorted())
-        #expect(endpoints.first?.publicKey == targetKey)
+        #expect(result.contains(target))
+        await node.stop()
     }
 
-    @Test("findNode converges on near peers in a larger sparse topology")
-    func findNodeConvergesInLargerSparseTopology() async throws {
-        let nodeCount = 64
-        let nodes = makeKademliaNodes(count: nodeCount)
-        try await connectTransportMesh(nodes)
+    @Test("authenticated network referrals converge across multiple hops")
+    func authenticatedMultiHopNetworkLookup() async throws {
+        let sourceIdentity = TransportTestHarness.identity("kad-network-source")
+        let firstIdentity = TransportTestHarness.identity("kad-network-first")
+        let secondIdentity = TransportTestHarness.identity("kad-network-second")
+        let targetIdentity = TransportTestHarness.identity("kad-network-target")
+        let sourcePort = TransportTestHarness.nextPort()
+        let firstPort = TransportTestHarness.nextPort()
+        let secondPort = TransportTestHarness.nextPort()
+        let targetPort = TransportTestHarness.nextPort()
+        let firstHost = "8.8.8.8"
+        let secondHost = "1.1.1.1"
+        let targetHost = "9.9.9.9"
 
-        let source = 0
-        let target = 63
-        await seedTargetConvergentRoutingTables(nodes, targetIndex: target, outDegree: 12)
+        let source = Ivy(config: TransportTestHarness.config(sourceIdentity, port: sourcePort))
+        let first = Ivy(config: TransportTestHarness.config(
+            firstIdentity,
+            port: firstPort,
+            advertisedHost: firstHost))
+        let second = Ivy(config: TransportTestHarness.config(
+            secondIdentity,
+            port: secondPort,
+            advertisedHost: secondHost))
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            advertisedHost: targetHost))
+        let recorder = TransportTestRecorder()
+        await source.setTestDelegate(recorder)
 
-        let targetKey = "kad-node-\(target)"
-        let targetHash = Router.hash(targetKey)
-        let expectedClosest = expectedClosestKeys(to: targetKey, count: 8, excluding: source, nodeCount: nodeCount)
-        let initialKeys = await routedKeys(nodes[source])
-        let initialBestDistance = bestDistance(from: initialKeys, to: targetKey)
+        let localPorts = [
+            firstHost: firstPort,
+            secondHost: secondPort,
+            targetHost: targetPort,
+        ]
+        await source.setDialEndpointRewriteForTesting { endpoint in
+            guard let port = localPorts[endpoint.host] else { return endpoint }
+            return PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: port)
+        }
 
-        #expect(!initialKeys.contains(targetKey))
+        try await target.start()
+        try await second.start()
+        try await first.start()
+        try await source.start()
+        try await second.connect(to: TransportTestHarness.endpoint(targetIdentity, port: targetPort))
+        try await first.connect(to: TransportTestHarness.endpoint(secondIdentity, port: secondPort))
+        try await source.connect(to: TransportTestHarness.endpoint(firstIdentity, port: firstPort))
 
-        let discovered = await nodes[source].findNode(target: targetKey)
-        let discoveredKeys = discovered.map(\.publicKey)
-        let sourceKeys = await routedKeys(nodes[source])
-        let discoveredDistances = discoveredKeys.map { Router.xorDistance(Router.hash($0), targetHash) }
-        let finalBestDistance = bestDistance(from: sourceKeys, to: targetKey)
+        let firstID = TransportTestHarness.key(firstIdentity).peerID
+        let secondID = TransportTestHarness.key(secondIdentity).peerID
+        let targetKey = TransportTestHarness.key(targetIdentity)
+        try await recorder.waitForConnect(firstID)
 
-        #expect(discoveredDistances == discoveredDistances.sorted())
-        #expect(sourceKeys.count > initialKeys.count)
-        #expect(finalBestDistance < initialBestDistance)
-        #expect(Set(discoveredKeys).intersection(expectedClosest).count >= 1)
+        let lookup = BoundedTestTask { await source.findNode(target: targetKey.hex) }
+        let result = try await lookup.value(waitingFor: "authenticated multi-hop lookup")
+
+        try await recorder.waitForConnect(secondID)
+        try await recorder.waitForConnect(targetKey.peerID)
+        #expect(result.contains(PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: targetHost,
+            port: targetPort)))
+        #expect(await source.peerConnectionCount == 3)
+
+        await source.stop()
+        await first.stop()
+        await second.stop()
+        await target.stop()
     }
 
-    @Test("findNode returns exact top-k when queried peers expose the closest set")
-    func findNodeReturnsExactTopKWhenReachable() async throws {
-        let nodeCount = 64
+    @Test("a public lookup cannot cross stop and restart")
+    func publicLookupIsRunScoped() async throws {
+        let identity = TransportTestHarness.identity("kad-public-run-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let first = testEndpoint("kad-public-run-first", port: 4001)
+        let stale = testEndpoint("kad-public-run-stale", port: 4002)
+        let responseBarrier = TestBarrier("stale neighbor response")
 
-        for target in [17, 33, 63] {
-            let nodes = makeKademliaNodes(count: nodeCount, kBucketSize: 8)
-            try await connectTransportMesh(nodes)
-
-            let source = 0
-            let targetKey = "kad-node-\(target)"
-            let expectedClosest = expectedClosestKeys(to: targetKey, count: 8, excluding: source, nodeCount: nodeCount)
-            let bootstrapIndexes = [1, 2, 3].filter { $0 != target }
-
-            await seedRouter(nodes[source], with: bootstrapIndexes, nodes: nodes)
-            for index in bootstrapIndexes {
-                await seedRouter(nodes[index], with: indexes(for: expectedClosest), nodes: nodes)
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(first, marker: 1)
+        await node.seedKademliaTestEndpoint(first)
+        await node.setNeighborRequestHookForTesting { _, _ in
+            do {
+                try await responseBarrier.arriveAndWait()
+            } catch {
+                Issue.record("\(error)")
             }
-
-            let discovered = await nodes[source].findNode(target: targetKey)
-            let discoveredKeys = Set(discovered.map(\.publicKey))
-
-            #expect(discoveredKeys == expectedClosest)
+            return [stale]
         }
+
+        let lookup = BoundedTestTask { await node.findNode(target: stale.publicKey) }
+        try await responseBarrier.waitForArrivals()
+        await node.stop()
+        try await node.start()
+        await responseBarrier.release()
+
+        #expect(try await lookup.value(waitingFor: "stale lookup completion").isEmpty)
+        #expect(!(await node.knownPeerEndpoints).contains(stale))
+        await node.stop()
     }
 
-    @Test("findNode still reaches exact top-k with noisy farther neighbors")
-    func findNodeIgnoresFartherNoiseWhenExactPathExists() async throws {
-        let nodeCount = 64
-        let nodes = makeKademliaNodes(count: nodeCount, kBucketSize: 8)
-        try await connectTransportMesh(nodes)
+    @Test("findNode does not dial private third-party referrals")
+    func findNodeRejectsPrivateThirdPartyRoutes() async throws {
+        let identities = (0..<4).map { TransportTestHarness.identity("kad-node-\($0)") }
+        let ports = (0..<4).map { _ in TransportTestHarness.nextPort() }
+        let nodes = zip(identities, ports).map { identity, port in
+            Ivy(config: TransportTestHarness.config(identity, port: port))
+        }
 
-        let source = 0
-        let honestBootstrap = 1
-        let noisyBootstrap = 2
-        let targetKey = "kad-node-63"
-        let expectedClosest = expectedClosestKeys(to: targetKey, count: 8, excluding: source, nodeCount: nodeCount)
-        let noisyFarIndexes = farthestIndexes(to: targetKey, count: 8, excluding: [source, honestBootstrap], nodeCount: nodeCount)
+        for node in nodes { try await node.start() }
+        for index in 0..<3 {
+            try await nodes[index].connect(to: TransportTestHarness.endpoint(
+                identities[index + 1],
+                port: ports[index + 1]))
+        }
+        #expect(try await TransportTestHarness.eventually {
+            let counts = await (
+                nodes[0].peerConnectionCount,
+                nodes[1].peerConnectionCount,
+                nodes[2].peerConnectionCount,
+                nodes[3].peerConnectionCount)
+            return counts == (1, 2, 2, 1)
+        })
 
-        await seedRouter(nodes[source], with: [honestBootstrap, noisyBootstrap], nodes: nodes)
-        await seedRouter(nodes[honestBootstrap], with: indexes(for: expectedClosest), nodes: nodes)
-        await seedRouter(nodes[noisyBootstrap], with: noisyFarIndexes, nodes: nodes)
+        let target = TransportTestHarness.key(identities[3]).hex
+        let result = await nodes[0].findNode(target: target)
+        #expect(!result.map(\.publicKey).contains(target))
+        #expect(await nodes[0].peerConnectionCount == 1)
 
-        let discovered = await nodes[source].findNode(target: targetKey)
-        let discoveredKeys = Set(discovered.map(\.publicKey))
-
-        #expect(discoveredKeys == expectedClosest)
+        for node in nodes.reversed() { await node.stop() }
     }
 
-    @Test("concurrent findNode lookups keep neighbor responses separated by nonce")
-    func concurrentFindNodeLookupsKeepResponsesSeparated() async throws {
-        let source = Ivy(config: IvyConfig(
-            publicKey: "kad-concurrent-source",
+    @Test("Concurrent neighbor requests correlate reversed responses by nonce")
+    func concurrentLookupsCorrelateByNonce() async throws {
+        let source = Ivy(config: IvyConfig(publicKey: "nonce-source", listenPort: 0))
+        let peerA = PeerID(publicKey: deterministicTestPeerKey("nonce-peer-a"))
+        let peerB = PeerID(publicKey: deterministicTestPeerKey("nonce-peer-b"))
+        let endpointA = testEndpoint("nonce-result-a", port: 2)
+        let endpointB = testEndpoint("nonce-result-b", port: 3)
+
+        let lookupA = BoundedTestTask {
+            await source.awaitKademliaTestResponse(nonce: 10, from: peerA)
+        }
+        let lookupB = BoundedTestTask {
+            await source.awaitKademliaTestResponse(nonce: 11, from: peerB)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await source.pendingKademliaTestResponseCount() == 2
+        })
+
+        await source.receiveNeighborResponse(nonce: 11, endpoints: [endpointB], from: peerB)
+        await source.receiveNeighborResponse(nonce: 10, endpoints: [endpointA], from: peerA)
+
+        #expect(try await lookupA.value(waitingFor: "neighbor response A") == [endpointA])
+        #expect(try await lookupB.value(waitingFor: "neighbor response B") == [endpointB])
+    }
+
+    @Test("failed routing endpoints are evicted")
+    func failedEndpointIsEvicted() async throws {
+        let identity = TransportTestHarness.identity("kad-failed-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let dead = testEndpoint("kad-dead", port: TransportTestHarness.nextPort())
+
+        try await node.start()
+        await node.seedKademliaTestEndpoint(dead)
+        let result = await node.findNode(target: dead.publicKey)
+
+        #expect(!result.contains(dead))
+        #expect(!(await node.knownPeerEndpoints).contains(dead))
+        await node.stop()
+    }
+
+    @Test("local dial deferral preserves routing evidence")
+    func locallyDeferredEndpointIsRetained() async throws {
+        let identity = TransportTestHarness.identity("kad-deferred-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 2))
+        let referrer = testEndpoint("kad-deferred-referrer", port: 4001)
+        let deferred = testEndpoint("kad-deferred", port: TransportTestHarness.nextPort())
+
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(referrer, marker: 1)
+        await node.seedKademliaTestEndpoint(referrer)
+        #expect(await node.reserveOutgoingDial(to: deferred))
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            peer.publicKey == referrer.publicKey ? [deferred] : []
+        }
+
+        let result = await node.findNode(target: deferred.publicKey)
+
+        #expect(result.contains(deferred))
+        await node.finishOutgoingDial(
+            to: PeerID(publicKey: deferred.publicKey),
+            generation: await node.runGeneration,
+            connected: false)
+        await node.stop()
+    }
+
+    @Test("stale dial completion cannot mutate a newer run")
+    func staleDialCompletionIsRunScoped() async throws {
+        let identity = TransportTestHarness.identity("kad-stale-dial-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 1))
+        let endpoint = testEndpoint("kad-stale-dial", port: TransportTestHarness.nextPort())
+        let peer = PeerID(publicKey: endpoint.publicKey)
+
+        try await node.start()
+        let oldGeneration = await node.runGeneration
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.stop()
+
+        try await node.start()
+        let currentGeneration = await node.runGeneration
+        await node.seedKademliaTestEndpoint(endpoint)
+        #expect(!(await node.reserveOutgoingDial(to: endpoint)))
+
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        #expect(!(await node.reserveOutgoingDial(to: endpoint)))
+        await node.removeFailedRoutingPeer(peer, generation: oldGeneration)
+        #expect((await node.knownPeerEndpoints).contains(endpoint))
+
+        await node.finishOutgoingDial(to: peer, generation: currentGeneration, connected: false)
+        #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.stop()
+    }
+
+    @Test("cancelling a lookup stops future referral rounds")
+    func cancellationStopsLookupRounds() async throws {
+        let identity = TransportTestHarness.identity("kad-cancel-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let first = testEndpoint("kad-cancel-first", port: 4001)
+        let referred = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("kad-cancel-referred"),
+            host: "1.1.1.1",
+            port: 4002)
+        let responseBarrier = TestBarrier("cancelled neighbor response")
+
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(first, marker: 1)
+        await node.seedKademliaTestEndpoint(first)
+        await node.setNeighborRequestHookForTesting { _, _ in
+            try? await responseBarrier.arriveAndWait()
+            return [referred]
+        }
+
+        let lookup = BoundedTestTask { await node.findNode(target: referred.publicKey) }
+        try await responseBarrier.waitForArrivals()
+        lookup.cancel()
+        await responseBarrier.release()
+
+        #expect(try await lookup.value(waitingFor: "cancelled Kademlia lookup").isEmpty)
+        #expect(!(await node.hasEndpointSession(PeerID(publicKey: referred.publicKey))))
+        await node.stop()
+    }
+
+    @Test("cancelling a lookup closes a stalled authentication")
+    func cancellationClosesStalledAuthentication() async throws {
+        let stalledIdentity = TransportTestHarness.identity("kad-cancel-auth-peer")
+        let listener = try await ServerBootstrap(
+            group: MultiThreadedEventLoopGroup.singleton
+        ).childChannelInitializer { channel in
+            channel.eventLoop.makeSucceededVoidFuture()
+        }.bind(host: "127.0.0.1", port: 0).get()
+        let rawPort = try #require(listener.localAddress?.port)
+        let port = try #require(UInt16(exactly: rawPort))
+        let endpoint = TransportTestHarness.endpoint(stalledIdentity, port: port)
+        let node = Ivy(config: IvyConfig(
+            publicKey: "kad-cancel-auth-node",
             listenPort: 0,
-            bootstrapPeers: [],
-            enableLocalDiscovery: false,
-            kBucketSize: 1,
-            healthConfig: PeerHealthConfig(
-                keepaliveInterval: .seconds(999),
-                staleTimeout: .seconds(999),
-                maxMissedPongs: 99,
-                enabled: false
-            ),
-            enablePEX: false
-        ))
-        let sourceID = await source.localID
-        let peerID = PeerID(publicKey: "kad-concurrent-peer")
-        let (sourceSide, peerSide) = LocalPeerConnection.pair(localID: sourceID, remoteID: peerID)
-        await source.registerLocalPeer(sourceSide, as: peerID)
-        await source.addToRouter(peerID, endpoint: PeerEndpoint(publicKey: peerID.publicKey, host: "local", port: 1))
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
 
-        let targetA = "kad-target-a"
-        let targetB = "kad-target-b"
-        let lookupA = Task { await source.findNode(target: targetA) }
-        let lookupB = Task { await source.findNode(target: targetB) }
+        try await node.start()
+        await node.seedKademliaTestEndpoint(endpoint)
+        let lookup = Task { await node.findNode(target: endpoint.publicKey) }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingSessionCountForTesting == 1
+        })
 
-        var iterator = peerSide.messages.makeAsyncIterator()
-        let message1 = await iterator.next()
-        let message2 = await iterator.next()
-        let requests = [message1, message2].compactMap { message -> (target: Data, nonce: UInt64)? in
-            guard case .findNode(let target, _, let nonce) = message else { return nil }
-            return (target, nonce)
-        }
-        #expect(requests.count == 2)
+        lookup.cancel()
+        let completion = BoundedTestTask { await lookup.value }
+        #expect(try await completion.value(waitingFor: "cancelled Kademlia authentication").isEmpty)
+        #expect(try await TransportTestHarness.eventually {
+            let pending = await node.pendingSessionCountForTesting
+            let outgoing = await node.outgoingDialCountForTesting
+            return pending == 0 && outgoing == 0
+        })
 
-        guard let requestA = requests.first(where: { $0.target == Data(Router.hash(targetA)) }),
-              let requestB = requests.first(where: { $0.target == Data(Router.hash(targetB)) }) else {
-            Issue.record("Expected both concurrent findNode requests")
-            return
-        }
-
-        peerSide.send(.neighbors([PeerEndpoint(publicKey: targetB, host: "local", port: 2)], nonce: requestB.nonce))
-        peerSide.send(.neighbors([PeerEndpoint(publicKey: targetA, host: "local", port: 3)], nonce: requestA.nonce))
-
-        let resultA = await lookupA.value
-        let resultB = await lookupB.value
-
-        #expect(resultA.first?.publicKey == targetA)
-        #expect(resultB.first?.publicKey == targetB)
-
-        peerSide.close()
+        await node.stop()
+        try await listener.close().get()
     }
 
-    @Test("findNode uses later alpha responses when an earlier peer is silent")
-    func findNodeUsesLaterAlphaResponsesAfterSilentPeer() async throws {
-        let source = Ivy(config: IvyConfig(
-            publicKey: "kad-alpha-source",
-            listenPort: 0,
-            bootstrapPeers: [],
-            enableLocalDiscovery: false,
-            kBucketSize: 8,
-            healthConfig: PeerHealthConfig(
-                keepaliveInterval: .seconds(999),
-                staleTimeout: .seconds(999),
-                maxMissedPongs: 99,
-                enabled: false
-            ),
-            enablePEX: false
-        ))
-        let sourceID = await source.localID
-        let target = "kad-alpha-target"
-        let peerIDs = [
-            PeerID(publicKey: "kad-alpha-peer-1"),
-            PeerID(publicKey: "kad-alpha-peer-2")
-        ].sorted {
-            Router.isCloser(Router.hash($0.publicKey), than: Router.hash($1.publicKey), to: Router.hash(target))
+    @Test("a new route is retried after the old session disconnects")
+    func newRouteAfterDisconnectIsQueryable() async throws {
+        let sourceIdentity = TransportTestHarness.identity("kad-route-retry-source")
+        let targetIdentity = TransportTestHarness.identity("kad-route-retry-target")
+        let targetPort = TransportTestHarness.nextPort()
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: TransportTestHarness.nextPort()))
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            advertisedHost: "1.1.1.1"))
+        let targetKey = TransportTestHarness.key(targetIdentity)
+        let oldTargetRoute = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "1.1.1.1",
+            port: 4001)
+        let replacement = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "1.1.1.1",
+            port: targetPort)
+        let referrer = testEndpoint("kad-route-retry-referrer", port: 4002)
+        let requests = TestBarrier("route replacement referrals")
+
+        try await target.start()
+        try await source.start()
+        try await source.seedConnectedEndpointForTesting(oldTargetRoute, marker: 1)
+        try await source.seedConnectedEndpointForTesting(referrer, marker: 2)
+        await source.seedKademliaTestEndpoint(oldTargetRoute)
+        await source.seedKademliaTestEndpoint(referrer)
+        await source.setDialEndpointRewriteForTesting { endpoint in
+            guard endpoint.publicKey == targetKey.hex else { return endpoint }
+            return PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: targetPort)
+        }
+        await source.setNeighborRequestHookForTesting { peer, _ in
+            try? await requests.arriveAndWait()
+            return peer == PeerID(publicKey: referrer.publicKey) ? [replacement] : []
         }
 
-        let (firstNodeSide, firstPeerSide) = LocalPeerConnection.pair(localID: sourceID, remoteID: peerIDs[0])
-        let (secondNodeSide, secondPeerSide) = LocalPeerConnection.pair(localID: sourceID, remoteID: peerIDs[1])
-        await source.registerLocalPeer(firstNodeSide, as: peerIDs[0])
-        await source.registerLocalPeer(secondNodeSide, as: peerIDs[1])
-        await source.addToRouter(peerIDs[0], endpoint: PeerEndpoint(publicKey: peerIDs[0].publicKey, host: "local", port: 1))
-        await source.addToRouter(peerIDs[1], endpoint: PeerEndpoint(publicKey: peerIDs[1].publicKey, host: "local", port: 2))
+        let lookup = BoundedTestTask { await source.findNode(target: targetKey.hex) }
+        try await requests.waitForArrivals(2)
+        await source.retireTransportForTesting(targetKey.peerID)
+        await requests.release()
 
-        let lookup = Task { await source.findNode(target: target) }
-        var secondIterator = secondPeerSide.messages.makeAsyncIterator()
-        guard case .findNode(_, _, let secondNonce) = await secondIterator.next() else {
-            Issue.record("Expected second alpha peer to receive findNode")
-            return
+        let result = try await lookup.value(waitingFor: "replacement Kademlia route")
+        #expect(await source.hasEndpointSession(targetKey.peerID))
+        #expect(result.contains { $0.publicKey == targetKey.hex && $0.port == targetPort })
+
+        await source.stop()
+        await target.stop()
+    }
+
+    @Test("lookup preserves alternate routes for one referred identity")
+    func referralRouteAlternatives() async throws {
+        let sourceIdentity = TransportTestHarness.identity("kad-routes-source")
+        let targetIdentity = TransportTestHarness.identity("kad-routes-target")
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: TransportTestHarness.nextPort()))
+        let targetPort = TransportTestHarness.nextPort()
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            advertisedHost: "1.1.1.1"))
+        let initial = testEndpoint("kad-routes-initial", port: 4001)
+        let targetKey = TransportTestHarness.key(targetIdentity)
+        let live = PeerEndpoint(publicKey: targetKey.hex, host: "1.1.1.1", port: targetPort)
+        let dead = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "9.9.9.9",
+            port: TransportTestHarness.nextPort())
+
+        try await target.start()
+        try await source.start()
+        try await source.seedConnectedEndpointForTesting(initial, marker: 1)
+        await source.seedKademliaTestEndpoint(initial)
+        await source.setNeighborRequestHookForTesting { peer, _ in
+            peer.publicKey == initial.publicKey ? [live, dead] : []
         }
-        secondPeerSide.send(.neighbors([PeerEndpoint(publicKey: target, host: "local", port: 3)], nonce: secondNonce))
-
-        let result = await lookup.value
-        #expect(result.contains { $0.publicKey == target })
-
-        firstPeerSide.close()
-        secondPeerSide.close()
-    }
-
-    @Test("findNode continues converging when some sparse-path peers churn out")
-    func findNodeConvergesWithChurnedPeers() async throws {
-        let nodeCount = 64
-        let nodes = makeKademliaNodes(count: nodeCount)
-        try await connectTransportMesh(nodes)
-        await seedTargetConvergentRoutingTables(nodes, targetIndex: 63, outDegree: 12)
-
-        let source = 0
-        let churnedPeers = [3, 7, 15, 31].map { PeerID(publicKey: "kad-node-\($0)") }
-        for peer in churnedPeers {
-            await nodes[source].disconnect(peer)
+        await source.setDialEndpointRewriteForTesting { endpoint in
+            guard endpoint.publicKey == targetKey.hex else { return endpoint }
+            return PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: endpoint.host == live.host ? targetPort : dead.port)
         }
 
-        let targetKey = "kad-node-63"
-        let initialKeys = await routedKeys(nodes[source])
-        let initialBestDistance = bestDistance(from: initialKeys, to: targetKey)
-        let discovered = await nodes[source].findNode(target: targetKey)
-        let discoveredKeys = Set(discovered.map(\.publicKey))
-        let finalBestDistance = bestDistance(from: await routedKeys(nodes[source]), to: targetKey)
+        let result = await source.findNode(target: targetKey.hex)
 
-        #expect(!discoveredKeys.isEmpty)
-        #expect(finalBestDistance < initialBestDistance)
+        #expect(result.contains(live))
+        #expect(await source.hasEndpointSession(targetKey.peerID))
+        await source.stop()
+        await target.stop()
     }
 
-    @Test("provider lookup warms routing before asking closest peers for pins")
-    func providerLookupWarmsRoutingBeforeFindPins() async throws {
-        let nodeCount = 32
-        let source = 0
-        let bootstrap = 1
-        let provider = 23
-        let nodes = makeKademliaNodes(count: nodeCount, kBucketSize: 8)
-        try await connectTransportMesh(nodes)
+    @Test("an authenticated route survives referral alternatives")
+    func authenticatedRouteIsPreserved() {
+        let key = deterministicTestPeerKey("kad-preserved-route")
+        let trusted = PeerEndpoint(publicKey: key, host: "1.1.1.1", port: 4001)
+        var routes = [LookupRoute(endpoint: trusted, source: .authenticated)]
+        for index in 0..<4 {
+            routes = selectedLookupRoutes(
+                routes + [LookupRoute(
+                    endpoint: PeerEndpoint(
+                    publicKey: key,
+                    host: "8.8.8.\(index + 1)",
+                    port: UInt16(4100 + index)),
+                    source: .referral(deterministicTestPeerKey("kad-route-flooder")))],
+                preferred: trusted)
+        }
 
-        let rootCID = cidClosestToNode(provider, nodeCount: nodeCount)
-        let pinner = makePinSigningKey(label: "kad-provider-pinner")
-        let providerID = await nodes[provider].localID
-        let pinnerID = PeerID(publicKey: pinner.publicKey)
-        let (pinnerSide, providerSide) = LocalPeerConnection.pair(localID: pinnerID, remoteID: providerID)
-        await nodes[provider].registerLocalPeer(providerSide, as: pinnerID)
-        let expiry = UInt64(Date().timeIntervalSince1970) + 3600
-        let signature = PinAnnouncementSignature.sign(rootCID: rootCID, publicKey: pinner.publicKey, expiry: expiry, fee: 0, signingKey: pinner.signingKey)!
-        pinnerSide.send(.pinAnnounce(rootCID: rootCID, publicKey: pinner.publicKey, expiry: expiry, signature: signature, fee: 0))
-        try await Task.sleep(for: .milliseconds(100))
-
-        await seedRouter(nodes[source], with: [bootstrap], nodes: nodes)
-        await seedRouter(nodes[bootstrap], with: [provider], nodes: nodes)
-        await seedTargetConvergentRoutingTables(nodes, targetKey: rootCID, outDegree: 8, skipping: [source])
-
-        #expect(!(await routedKeys(nodes[source]).contains("kad-node-\(provider)")))
-
-        let discovered = await nodes[source].discoverPinners(cid: rootCID)
-        let sourceKeys = await routedKeys(nodes[source])
-
-        #expect(discovered.contains(pinner.publicKey))
-        #expect(sourceKeys.contains("kad-node-\(provider)"),
-            "provider discovery should reuse findNode to warm the route toward the CID")
-        pinnerSide.close()
+        #expect(routes.first?.endpoint == trusted)
+        #expect(routes.count == Ivy.maxRoutesPerIdentity)
     }
 
-    @Test("pin lookup ignores wrong-peer and empty responses")
-    func pinLookupIgnoresWrongPeerAndEmptyResponses() async throws {
-        let source = Ivy(config: IvyConfig(
-            publicKey: "kad-pin-source",
-            listenPort: 0,
-            bootstrapPeers: [],
-            enableLocalDiscovery: false,
-            kBucketSize: 1,
-            healthConfig: PeerHealthConfig(
-                keepaliveInterval: .seconds(999),
-                staleTimeout: .seconds(999),
-                maxMissedPongs: 99,
-                enabled: false
-            ),
-            enablePEX: false
-        ))
-        let sourceID = await source.localID
-        let queriedID = PeerID(publicKey: "kad-pin-queried")
-        let wrongID = PeerID(publicKey: "kad-pin-wrong")
-        let (queriedNodeSide, queriedPeerSide) = LocalPeerConnection.pair(localID: sourceID, remoteID: queriedID)
-        let (wrongNodeSide, wrongPeerSide) = LocalPeerConnection.pair(localID: sourceID, remoteID: wrongID)
-        await source.registerLocalPeer(queriedNodeSide, as: queriedID)
-        await source.registerLocalPeer(wrongNodeSide, as: wrongID)
-        await source.addToRouter(queriedID, endpoint: PeerEndpoint(publicKey: queriedID.publicKey, host: "local", port: 1))
+    @Test("route source diversity survives lookup rounds")
+    func referralRoutesPreserveSourceDiversity() {
+        let key = deterministicTestPeerKey("kad-diverse-route")
+        let honest = deterministicTestPeerKey("kad-honest-referrer")
+        let flooding = deterministicTestPeerKey("kad-flooding-referrer")
+        let live = PeerEndpoint(publicKey: key, host: "1.1.1.1", port: 4001)
+        let poisoned = (1...3).map {
+            PeerEndpoint(publicKey: key, host: "8.8.8.\($0)", port: UInt16(4100 + $0))
+        }
 
-        let rootCID = "kad-pin-root"
-        let lookup = Task { await source.discoverPinners(cid: rootCID) }
+        var selected = selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .referral(honest))],
+            preferred: nil)
+        for endpoint in poisoned {
+            selected = selectedLookupRoutes(
+                selected + [LookupRoute(endpoint: endpoint, source: .referral(flooding))],
+                preferred: nil)
+        }
 
-        var queriedMessages = queriedPeerSide.messages.makeAsyncIterator()
-        var sawFindPins = false
-        while !sawFindPins {
-            guard let message = await queriedMessages.next() else {
-                Issue.record("Expected findPins request")
-                return
+        #expect(selected.count == Ivy.maxRoutesPerIdentity)
+        #expect(selected.contains { $0.endpoint == live })
+
+        let retired = LookupRoute(endpoint: live, source: .authenticated)
+        let alternative = LookupRoute(endpoint: poisoned[0], source: .referral(honest))
+        #expect(selectedLookupRoutes(
+            [retired, alternative],
+            preferred: live).first?.endpoint == live)
+        #expect(selectedLookupRoutes(
+            [retired, alternative],
+            preferred: nil).first?.endpoint == alternative.endpoint)
+
+        let attacker = "0" + String(repeating: "0", count: honest.count - 1)
+        let repeated = [LookupRoute(endpoint: live, source: .referral(attacker))]
+            + (1...3).map {
+                LookupRoute(
+                    endpoint: PeerEndpoint(
+                        publicKey: key,
+                        host: "0.0.0.\($0)",
+                        port: UInt16(4200 + $0)),
+                    source: .referral(attacker))
             }
-            switch message {
-            case .findNode(_, _, let nonce):
-                queriedPeerSide.send(.neighbors([], nonce: nonce))
-            case .findPins(let cid):
-                #expect(cid == rootCID)
-                sawFindPins = true
-            default:
-                continue
-            }
+        let deduplicated = selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .referral(honest))] + repeated,
+            preferred: nil)
+        #expect(deduplicated.contains { $0.endpoint == live && $0.source == .referral(honest) })
+        #expect(selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .authenticated)] + repeated,
+            preferred: live).first?.source == .authenticated)
+    }
+
+    @Test("later lookup rounds cannot replace every route from an earlier source")
+    func referralProvenanceSurvivesLookupRounds() async throws {
+        let node = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("kad-round-source"),
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 3))
+        let referrers = [
+            testEndpoint("kad-round-referrer-a", port: 4001),
+            testEndpoint("kad-round-referrer-b", port: 4002),
+        ].sorted { $0.publicKey < $1.publicKey }
+        let honest = referrers[0]
+        let flooding = referrers[1]
+        let targetKey = deterministicTestPeerKey("kad-round-target")
+        let live = PeerEndpoint(publicKey: targetKey, host: "1.1.1.1", port: 4100)
+        let poisoned = (1...3).map {
+            PeerEndpoint(publicKey: targetKey, host: "8.8.8.\($0)", port: UInt16(4200 + $0))
         }
 
-        wrongPeerSide.send(.pins(cid: rootCID, providers: ["spoofed-provider"]))
-        queriedPeerSide.send(.pins(cid: rootCID, providers: []))
-        try await Task.sleep(for: .milliseconds(100))
-
-        #expect(!(await source.providers(for: rootCID).contains(PeerID(publicKey: "spoofed-provider"))))
-
-        queriedPeerSide.send(.pins(cid: rootCID, providers: ["honest-provider"]))
-        let discovered = await lookup.value
-
-        #expect(discovered == ["honest-provider"])
-
-        queriedPeerSide.close()
-        wrongPeerSide.close()
-    }
-}
-
-private func makeKademliaNodes(count: Int, kBucketSize: Int = 20) -> [Ivy] {
-    (0..<count).map { index in
-        Ivy(config: IvyConfig(
-            publicKey: "kad-node-\(index)",
-            listenPort: 0,
-            bootstrapPeers: [],
-            enableLocalDiscovery: false,
-            kBucketSize: kBucketSize,
-            healthConfig: PeerHealthConfig(
-                keepaliveInterval: .seconds(999),
-                staleTimeout: .seconds(999),
-                maxMissedPongs: 99,
-                enabled: false
-            ),
-            enablePEX: false
-        ))
-    }
-}
-
-private func makePinSigningKey(label: String) -> (publicKey: String, signingKey: Data) {
-    let seed = Data(SHA256.hash(data: Data(label.utf8)))
-    let privateKey = try! Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-    let publicKey = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
-    return (publicKey, privateKey.rawRepresentation)
-}
-
-private func connectTransportMesh(_ nodes: [Ivy]) async throws {
-    for i in nodes.indices {
-        for j in nodes.indices where j > i {
-            try Task.checkCancellation()
-            let aID = await nodes[i].localID
-            let bID = await nodes[j].localID
-            let (aSide, bSide) = LocalPeerConnection.pair(localID: aID, remoteID: bID)
-            await nodes[i].registerLocalPeer(aSide, as: bID)
-            await nodes[j].registerLocalPeer(bSide, as: aID)
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(honest, marker: 1)
+        try await node.seedConnectedEndpointForTesting(flooding, marker: 2)
+        await node.seedKademliaTestEndpoint(honest)
+        #expect(await node.reserveOutgoingDial(to: live))
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            if peer.publicKey == honest.publicKey { return [live, flooding] }
+            if peer.publicKey == flooding.publicKey { return poisoned }
+            return []
         }
-    }
-    try await Task.sleep(for: .milliseconds(50))
-}
 
-private func seedRouter(_ node: Ivy, with peerIndexes: [Int], nodes: [Ivy]) async {
-    for index in peerIndexes {
-        let key = "kad-node-\(index)"
-        let peer = PeerID(publicKey: key)
-        let endpoint = PeerEndpoint(publicKey: key, host: "local", port: UInt16(index))
-        await node.addToRouter(peer, endpoint: endpoint)
-    }
-}
+        let result = await node.findNode(target: targetKey)
 
-private func routedKeys(_ node: Ivy) async -> Set<String> {
-    Set(await node.allRouterPeers().map { $0.id.publicKey })
-}
-
-private func seedTargetConvergentRoutingTables(_ nodes: [Ivy], targetIndex: Int, outDegree: Int) async {
-    await seedTargetConvergentRoutingTables(nodes, targetKey: "kad-node-\(targetIndex)", outDegree: outDegree)
-}
-
-private func seedTargetConvergentRoutingTables(
-    _ nodes: [Ivy],
-    targetKey: String,
-    outDegree: Int,
-    skipping skippedIndexes: Set<Int> = []
-) async {
-    let targetHash = Router.hash(targetKey)
-    let ranked = nodes.indices.sorted {
-        Router.xorDistance(Router.hash("kad-node-\($0)"), targetHash) < Router.xorDistance(Router.hash("kad-node-\($1)"), targetHash)
-    }
-    let rankByIndex = Dictionary(uniqueKeysWithValues: ranked.enumerated().map { ($0.element, $0.offset) })
-
-    for index in nodes.indices {
-        if skippedIndexes.contains(index) { continue }
-        let rank = rankByIndex[index]!
-        let closer = ranked[..<rank].suffix(outDegree)
-        var neighbors = Array(closer)
-        if neighbors.count < outDegree {
-            neighbors.append(contentsOf: sparseNeighborIndexes(for: index, nodeCount: nodes.count, outDegree: outDegree - neighbors.count))
-        }
-        await seedRouter(nodes[index], with: Array(neighbors.prefix(outDegree)), nodes: nodes)
+        #expect(result.contains(live))
+        await node.finishOutgoingDial(
+            to: PeerID(publicKey: targetKey),
+            generation: await node.runGeneration,
+            connected: false)
+        await node.stop()
     }
 }
 
-private func sparseNeighborIndexes(for index: Int, nodeCount: Int, outDegree: Int) -> [Int] {
-    var neighbors: [Int] = []
-    var step = 1
-    while neighbors.count < outDegree && step < nodeCount {
-        let forward = index + step
-        if forward < nodeCount {
-            neighbors.append(forward)
-        }
-        let backward = index - step
-        if neighbors.count < outDegree, backward >= 0 {
-            neighbors.append(backward)
-        }
-        step *= 2
-    }
-    return Array(neighbors.prefix(outDegree))
-}
-
-private func expectedClosestKeys(to targetKey: String, count: Int, excluding excludedIndex: Int, nodeCount: Int) -> Set<String> {
-    expectedClosestKeys(to: targetKey, count: count, excluding: Set([excludedIndex]), nodeCount: nodeCount)
-}
-
-private func expectedClosestKeys(to targetKey: String, count: Int, excluding excludedIndexes: Set<Int>, nodeCount: Int) -> Set<String> {
-    let targetHash = Router.hash(targetKey)
-    return Set((0..<nodeCount)
-        .filter { !excludedIndexes.contains($0) }
-        .map { "kad-node-\($0)" }
-        .sorted {
-            Router.xorDistance(Router.hash($0), targetHash) < Router.xorDistance(Router.hash($1), targetHash)
-        }
-        .prefix(count))
-}
-
-private func farthestIndexes(to targetKey: String, count: Int, excluding excludedIndexes: Set<Int>, nodeCount: Int) -> [Int] {
-    let targetHash = Router.hash(targetKey)
-    return (0..<nodeCount)
-        .filter { !excludedIndexes.contains($0) }
-        .sorted {
-            Router.xorDistance(Router.hash("kad-node-\($0)"), targetHash) > Router.xorDistance(Router.hash("kad-node-\($1)"), targetHash)
-        }
-        .prefix(count)
-        .map { $0 }
-}
-
-private func indexes(for keys: Set<String>) -> [Int] {
-    keys.compactMap { key in
-        guard let suffix = key.split(separator: "-").last else { return nil }
-        return Int(suffix)
-    }
-}
-
-private func bestDistance(from keys: Set<String>, to targetKey: String) -> [UInt8] {
-    let targetHash = Router.hash(targetKey)
-    return keys
-        .map { Router.xorDistance(Router.hash($0), targetHash) }
-        .min() ?? Array(repeating: UInt8.max, count: targetHash.count)
-}
-
-private func cidClosestToNode(_ targetIndex: Int, nodeCount: Int) -> String {
-    (0..<10_000)
-        .map { "kad-provider-cid-\(targetIndex)-\($0)" }
-        .first { cid in
-            let closest = (0..<nodeCount).min {
-                Router.xorDistance(Router.hash("kad-node-\($0)"), Router.hash(cid)) <
-                    Router.xorDistance(Router.hash("kad-node-\($1)"), Router.hash(cid))
-            }
-            return closest == targetIndex
-        } ?? "kad-node-\(targetIndex)"
+private func testEndpoint(_ label: String, port: UInt16) -> PeerEndpoint {
+    PeerEndpoint(
+        publicKey: deterministicTestPeerKey(label),
+        host: "127.0.0.1",
+        port: port)
 }

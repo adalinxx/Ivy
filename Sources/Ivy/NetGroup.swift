@@ -12,10 +12,10 @@ import Foundation
 ///
 /// Tag prefixes (`v4:` / `v6:` / `raw:`) guarantee groups from different
 /// address families can never collide.
-public enum NetGroup: Sendable {
+enum NetGroup: Sendable {
 
     /// Coarse network-group key for a host string.
-    public static func group(_ host: String) -> String {
+    static func group(_ host: String) -> String {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // NOTE: a static AS-number override map (host/prefix → ASN) could slot
@@ -27,25 +27,29 @@ public enum NetGroup: Sendable {
         // meaningful network is the embedded IPv4, so group by its /16. This is
         // the form a dual-stack socket reports for an inbound IPv4 peer, so it
         // must collapse onto the same group as the bare IPv4 address.
-        if trimmed.contains(":"), let mapped = embeddedMappedIPv4(trimmed),
-           let v4 = ipv4Group(mapped) {
-            return "v4:" + v4
+        if trimmed.contains(":"), let octets = embeddedIPv4Octets(trimmed) {
+            return "v4:\(octets[0]).\(octets[1])"
         }
         if trimmed.contains(":"), let v6 = ipv6Group(trimmed) { return "v6:" + v6 }
         return "raw:" + trimmed
     }
 
-    /// Extracts the embedded IPv4 from an IPv4-mapped ("::ffff:a.b.c.d") or
-    /// IPv4-compatible ("::a.b.c.d") IPv6 literal; nil for any other input.
-    static func embeddedMappedIPv4(_ host: String) -> String? {
+    /// Extracts embedded IPv4 octets from an IPv4-mapped IPv6 literal in dotted
+    /// or hexadecimal form, plus the legacy dotted IPv4-compatible form.
+    static func embeddedIPv4Octets(_ host: String) -> [Int]? {
         var s = host
         if s.hasPrefix("[") && s.hasSuffix("]") { s = String(s.dropFirst().dropLast()) }
         if let pct = s.firstIndex(of: "%") { s = String(s[s.startIndex..<pct]) }
         let lower = s.lowercased()
-        guard lower.hasPrefix("::ffff:") || lower.hasPrefix("::") else { return nil }
-        guard let lastColon = s.lastIndex(of: ":") else { return nil }
-        let tail = String(s[s.index(after: lastColon)...])
-        return tail.contains(".") ? tail : nil
+        if lower.hasPrefix("::ffff:") || lower.hasPrefix("::"),
+           let lastColon = s.lastIndex(of: ":") {
+            let tail = String(s[s.index(after: lastColon)...])
+            if tail.contains("."), let octets = ipv4Octets(tail) { return octets }
+        }
+        guard let h = ipv6Hextets(s),
+              h.prefix(5).allSatisfy({ $0 == 0 }),
+              h[5] == 0xffff else { return nil }
+        return [Int(h[6] >> 8), Int(h[6] & 0xff), Int(h[7] >> 8), Int(h[7] & 0xff)]
     }
 
     /// The two hextets that an embedded trailing IPv4 ("...:1.2.3.4") occupies,
@@ -131,7 +135,7 @@ public enum NetGroup: Sendable {
         if runs.count == 2 {
             guard let head = hextets(runs[0]), let tail = hextets(runs[1]) else { return nil }
             let fillCount = 8 - head.count - tail.count
-            guard fillCount >= 0 else { return nil }
+            guard fillCount > 0 else { return nil }
             expanded = head + Array(repeating: "0", count: fillCount) + tail
         } else {
             guard let all = hextets(s), all.count == 8 else { return nil }

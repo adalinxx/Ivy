@@ -1,104 +1,191 @@
-import Testing
 import Foundation
+import Testing
 @testable import Ivy
 import Tally
-/// UNSTOPPABLE_LATTICE I11: `pendingRequests` and `pendingVolumeRequests` must
-/// not grow unbounded. A runaway local caller (or peer echoing distinct CIDs
-/// faster than requestTimeout drains) would otherwise allocate continuations
-/// forever. Caps force over-budget callers to receive nil immediately instead
-/// of enqueueing one more waiter.
-@Suite("Pending-request capacity caps")
-struct PendingRequestCapsTests {
 
-    private func cappedConfig(
-        maxPending: Int,
-        maxWaiters: Int
-    ) -> IvyConfig {
+private extension Ivy {
+    func pendingContentSnapshot() -> (requests: Int, waiters: Int) {
+        (
+            pendingContentRequests.count,
+            pendingContentRequests.count
+        )
+    }
+
+    func pendingProviderSnapshot(rootCID: String) -> (requestID: UInt64?, waiters: Int) {
+        guard let pending = pendingProviderQueries[rootCID] else { return (nil, 0) }
+        return (pending.requestID, pending.continuations.count)
+    }
+
+    func storedProviderExpiry(rootCID: String, peer: PeerID) -> UInt64? {
+        providerHints[rootCID]?.first { $0.peer == peer }?.expiresAt
+    }
+}
+
+@Suite("Pending content request caps")
+struct PendingRequestCapsTests {
+    private func cappedConfig(maxPending: Int, maxWaiters: Int) -> IvyConfig {
         IvyConfig(
             publicKey: "capped-node",
             listenPort: 0,
             bootstrapPeers: [],
-            enableLocalDiscovery: false,
-            // Timeouts long enough that the first waves are definitely still
-            // in flight when we probe the cap, but short enough that the
-            // leftover tasks drain quickly at teardown. Nil returns from the
-            // cap-probe must be immediate (<100ms), never from these timeouts.
             requestTimeout: .seconds(1),
-            relayTimeout: .seconds(1),
             healthConfig: PeerHealthConfig(
                 keepaliveInterval: .seconds(999),
                 staleTimeout: .seconds(999),
                 maxMissedPongs: 99,
                 enabled: false
             ),
-            enablePEX: false,
             maxPendingRequests: maxPending,
-            maxWaitersPerPendingCID: maxWaiters
+            maxWaitersPerRequest: maxWaiters,
+            externalAddress: ("10.0.0.10", 4001)
         )
     }
 
-    /// Register a silent local peer (never answers) so `get(cid:target:)`
-    /// fires a request and parks a continuation until requestTimeout.
-    private func attachSilentPeer(to node: Ivy, key: String) async -> PeerID {
-        let peer = PeerID(publicKey: key)
-        let silent = LocalPeerConnection(id: await node.localID)
-        await node.registerLocalPeer(silent, as: peer)
-        await node.addToRouter(peer, endpoint: PeerEndpoint(publicKey: key, host: "local", port: 0))
-        return peer
+    private func waitForSnapshot(
+        _ expected: (requests: Int, waiters: Int),
+        on node: Ivy
+    ) async -> Bool {
+        for _ in 0..<100 {
+            let current = await node.pendingContentSnapshot()
+            if current == expected { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return false
     }
 
-    @Test("get returns nil immediately when the pending dict is full")
-    func testGlobalPendingCap() async throws {
-        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 64))
-        let peer = await attachSilentPeer(to: node, key: "caps-silent-peer")
+    @Test("distinct selections stop at the global cap")
+    func globalCap() async {
+        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 8))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("silent-global-peer"))
+        await node.setContentRequestEnqueueHookForTesting { _ in true }
+        let first = Task {
+            await node.fetchContent(ContentRequestKey(rootCID: "root-a", cids: []), from: [peer])
+        }
+        #expect(await waitForSnapshot((1, 1), on: node))
+        let second = Task {
+            await node.fetchContent(ContentRequestKey(rootCID: "root-b", cids: []), from: [peer])
+        }
+        #expect(await waitForSnapshot((2, 2), on: node))
 
-        // Launch two fetches for distinct CIDs. The silent peer never
-        // answers, so they register and block on requestTimeout.
-        let a = Task { await node.get(cid: "cid-a", target: peer) }
-        let b = Task { await node.get(cid: "cid-b", target: peer) }
-
-        // Give the two fetches time to register before we probe the cap.
-        try await Task.sleep(for: .milliseconds(50))
-
-        // Third distinct CID must bounce off the cap; measure wall time to
-        // prove it didn't block on the request timeout.
         let start = ContinuousClock.now
-        let c = await node.get(cid: "cid-c", target: peer)
-        let elapsed = ContinuousClock.now - start
+        let rejected = await node.fetchContent(
+            ContentRequestKey(rootCID: "root-c", cids: []),
+            from: [peer]
+        )
 
-        #expect(c == nil, "third distinct CID should be rejected")
-        #expect(elapsed < .milliseconds(100),
-                "rejection must be immediate, not wait on requestTimeout — got \(elapsed)")
-
-        // Drain the two still-pending entries so the task doesn't leak.
-        await node.cleanupAllPending()
-        _ = await a.value
-        _ = await b.value
-    }
-
-    @Test("get returns nil immediately when per-CID waiter list is full")
-    func testPerCIDWaiterCap() async throws {
-        let node = Ivy(config: cappedConfig(maxPending: 128, maxWaiters: 2))
-        let peer = await attachSilentPeer(to: node, key: "caps-silent-peer-2")
-
-        // Two concurrent calls for the same CID; the second coalesces onto
-        // the first's waiter list.
-        let a = Task { await node.get(cid: "shared-cid", target: peer) }
-        try await Task.sleep(for: .milliseconds(20))
-        let b = Task { await node.get(cid: "shared-cid", target: peer) }
-        try await Task.sleep(for: .milliseconds(30))
-
-        // Third call onto the same CID is over the waiter cap.
-        let start = ContinuousClock.now
-        let c = await node.get(cid: "shared-cid", target: peer)
-        let elapsed = ContinuousClock.now - start
-
-        #expect(c == nil, "third waiter on the same CID should be rejected")
-        #expect(elapsed < .milliseconds(100),
-                "rejection must be immediate — got \(elapsed)")
+        #expect(rejected.entries.isEmpty)
+        #expect(rejected.servedBy == nil)
+        #expect(ContinuousClock.now - start < .milliseconds(200))
+        let snapshot = await node.pendingContentSnapshot()
+        #expect(snapshot.requests == 2)
+        #expect(snapshot.waiters == 2)
 
         await node.cleanupAllPending()
-        _ = await a.value
-        _ = await b.value
+        _ = await first.value
+        _ = await second.value
     }
+
+    @Test("wire requests have one owner and stop at the global cap")
+    func wireRequestOwnership() async {
+        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 2))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("silent-coalescing-peer"))
+        await node.setContentRequestEnqueueHookForTesting { _ in true }
+        let firstKey = ContentRequestKey(
+            rootCID: "root",
+            cids: ["child-b", "root", "child-a", "child-b"]
+        )
+        let equivalentKey = ContentRequestKey(
+            rootCID: "root",
+            cids: ["child-a", "child-b"]
+        )
+
+        let first = Task { await node.fetchContent(firstKey, from: [peer]) }
+        #expect(await waitForSnapshot((1, 1), on: node))
+        let second = Task { await node.fetchContent(equivalentKey, from: [peer]) }
+        #expect(await waitForSnapshot((2, 2), on: node))
+
+        let start = ContinuousClock.now
+        let rejected = await node.fetchContent(equivalentKey, from: [peer])
+
+        #expect(firstKey == equivalentKey)
+        #expect(rejected.entries.isEmpty)
+        #expect(ContinuousClock.now - start < .milliseconds(200))
+        let snapshot = await node.pendingContentSnapshot()
+        #expect(snapshot.requests == 2)
+        #expect(snapshot.waiters == 2)
+
+        await node.cleanupAllPending()
+        _ = await first.value
+        _ = await second.value
+    }
+
+    @Test("provider queries coalesce, correlate, and aggregate bounded waiters")
+    func providerQueryAggregation() async throws {
+        let node = Ivy(config: cappedConfig(maxPending: 8, maxWaiters: 2))
+        let peers = (0..<2).map {
+            PeerID(publicKey: deterministicTestPeerKey("provider-query-\($0)"))
+        }
+        let endpoints = peers.enumerated().map { index, peer in
+            PeerEndpoint(publicKey: peer.publicKey, host: "1.1.1.\(index + 1)", port: UInt16(4100 + index))
+        }
+        let targets = zip(peers, endpoints).map { peer, endpoint in
+            Router.BucketEntry(
+                id: peer,
+                hash: Router.hash(peer.publicKey),
+                endpoint: endpoint)
+        }
+        #expect(await node.queryProviders(rootCID: "unreachable", targets: targets).isEmpty)
+        #expect(await node.pendingProviderSnapshot(rootCID: "unreachable").requestID == nil)
+        var loopbacks: [TestLoopback] = []
+        for (index, endpoint) in endpoints.enumerated() {
+            let loopback = try await TestLoopback.open()
+            loopbacks.append(loopback)
+            try await node.seedConnectedEndpointForTesting(
+                endpoint,
+                connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+                marker: UInt8(index + 1))
+        }
+
+        let first = Task { await node.queryProviders(rootCID: "root", targets: targets) }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingProviderSnapshot(rootCID: "root").waiters == 1
+        })
+        let second = Task { await node.queryProviders(rootCID: "root", targets: targets) }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingProviderSnapshot(rootCID: "root").waiters == 2
+        })
+        #expect(await node.queryProviders(rootCID: "root", targets: targets).isEmpty)
+
+        guard let requestID = await node.pendingProviderSnapshot(rootCID: "root").requestID else {
+            Issue.record("Expected one coalesced provider query")
+            return
+        }
+        let expiry = await node.nowUnix() + 60
+        await node.handleProvidersResponse(
+            rootCID: "root",
+            requestID: requestID &+ 1,
+            records: [ProviderRecord(endpoint: endpoints[0], expiresAt: expiry)],
+            from: peers[0])
+        #expect(await node.pendingProviderSnapshot(rootCID: "root").waiters == 2)
+
+        await node.handleProvidersResponse(
+            rootCID: "root",
+            requestID: requestID,
+            records: [ProviderRecord(endpoint: endpoints[0], expiresAt: expiry)],
+            from: peers[0])
+        #expect(await node.pendingProviderSnapshot(rootCID: "root").requestID == requestID)
+        await node.handleProvidersResponse(
+            rootCID: "root",
+            requestID: requestID,
+            records: [ProviderRecord(endpoint: endpoints[1], expiresAt: expiry)],
+            from: peers[1])
+
+        #expect(Set(await first.value) == Set(endpoints))
+        #expect(Set(await second.value) == Set(endpoints))
+        #expect(await node.pendingProviderSnapshot(rootCID: "root").requestID == nil)
+        #expect(await node.storedProviderExpiry(rootCID: "root", peer: peers[0]) == expiry)
+        await node.stop()
+        for loopback in loopbacks { await loopback.close() }
+    }
+
 }
