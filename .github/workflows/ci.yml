@@ -48,7 +48,7 @@ jobs:
       - name: Select Xcode 26.6
         run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
       - run: swift --version
-      - run: swift test --scratch-path .build-${{ matrix.sanitizer }} --sanitize ${{ matrix.sanitizer }}
+      - run: swift test --no-parallel --scratch-path .build-${{ matrix.sanitizer }} --sanitize ${{ matrix.sanitizer }}
 
   stress:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
