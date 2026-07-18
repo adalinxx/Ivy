@@ -18,13 +18,16 @@ struct MessageFrameDecoderBoundTests {
     private static let limit: UInt32 = 1024
 
     private func channel(
-        budget: InboundByteBudget = InboundByteBudget(limit: Int(Self.limit) + 4)
+        budget: InboundByteBudget = InboundByteBudget(limit: Int(Self.limit) + 4),
+        connectionBudget: InboundByteBudget? = nil
     ) throws -> (EmbeddedChannel, SessionFrameCollector) {
         let collector = SessionFrameCollector()
         let channel = EmbeddedChannel()
         try channel.pipeline.addHandler(SessionFrameDecoder(
             maxFrameSize: Self.limit,
-            budget: budget)).wait()
+            budget: budget,
+            connectionBudget: connectionBudget
+                ?? InboundByteBudget(limit: 2 * Int(Self.limit) + 4))).wait()
         try channel.pipeline.addHandler(collector).wait()
         try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
         return (channel, collector)
@@ -114,25 +117,51 @@ struct MessageFrameDecoderBoundTests {
         #expect(collector.records.isEmpty)
     }
 
-    @Test("partial headers and bodies hold the shared byte budget")
-    func partialFramesShareBudget() throws {
-        let budget = InboundByteBudget(limit: Int(Self.limit) + 4)
+    @Test("declared lengths do not reserve unseen bytes or evict another connection")
+    func slowlorisIsolation() throws {
+        let budget = InboundByteBudget(limit: 16)
         let (bodyChannel, _) = try channel(budget: budget)
         var partialBody = bodyChannel.allocator.buffer(capacity: 5)
         partialBody.writeInteger(Self.limit, endianness: .big, as: UInt32.self)
         partialBody.writeInteger(UInt8(1))
         try bodyChannel.writeInbound(partialBody)
-        #expect(budget.currentUsage == Int(Self.limit))
+        #expect(budget.currentUsage == 1)
 
-        let (competingChannel, _) = try channel(budget: budget)
-        var competing = competingChannel.allocator.buffer(capacity: 4)
-        competing.writeInteger(UInt32(1), endianness: .big, as: UInt32.self)
-        _ = try? competingChannel.writeInbound(competing)
-        #expect(!competingChannel.isActive)
-        #expect(budget.currentUsage == Int(Self.limit))
+        let (competingChannel, collector) = try channel(budget: budget)
+        var competing = competingChannel.allocator.buffer(capacity: 5)
+        competing.writeBytes(framed([Data([2])]))
+        try competingChannel.writeInbound(competing)
+        #expect(competingChannel.isActive)
+        #expect(collector.records == [Data([2])])
+        #expect(budget.currentUsage == 1)
 
+        _ = try competingChannel.finish()
         _ = try bodyChannel.finish()
         #expect(budget.currentUsage == 0)
+    }
+
+    @Test("one connection cannot exceed its byte reservation")
+    func perConnectionBudget() throws {
+        let budget = InboundByteBudget(limit: 64)
+        let connectionBudget = InboundByteBudget(limit: 8)
+        let (channel, collector) = try channel(
+            budget: budget,
+            connectionBudget: connectionBudget)
+        var partial = channel.allocator.buffer(capacity: 12)
+        partial.writeInteger(UInt32(9), endianness: .big, as: UInt32.self)
+        partial.writeBytes(Array(repeating: UInt8(0xaa), count: 8))
+        try channel.writeInbound(partial)
+        #expect(channel.isActive)
+        #expect(budget.currentUsage == 8)
+        #expect(connectionBudget.currentUsage == 8)
+
+        var finalByte = channel.allocator.buffer(capacity: 1)
+        finalByte.writeInteger(UInt8(0xaa))
+        _ = try? channel.writeInbound(finalByte)
+        #expect(!channel.isActive)
+        #expect(collector.records.isEmpty)
+        #expect(budget.currentUsage == 0)
+        #expect(connectionBudget.currentUsage == 0)
     }
 
     @Test("closing a partial header releases its reservation")
@@ -159,7 +188,7 @@ struct MessageFrameDecoderBoundTests {
             try channel.writeInbound(input)
         }
         #expect(collector.records.isEmpty)
-        #expect(budget.currentUsage == Int(Self.limit))
+        #expect(budget.currentUsage == partial.count - 4)
 
         _ = try channel.finish()
         #expect(budget.currentUsage == 0)
