@@ -188,8 +188,7 @@ struct InboundAdmissionTests {
 
         await ivy.finishOutgoingDial(
             to: TransportTestHarness.key(firstIdentity).peerID,
-            generation: generation,
-            connected: false)
+            generation: generation)
         #expect(await ivy.outgoingDialCountForTesting == 0)
         await ivy.stop()
     }
@@ -214,8 +213,7 @@ struct InboundAdmissionTests {
             currentGeneration: 2)
         let connected = await ivy.finishOutgoingDial(
             to: peer,
-            generation: 1,
-            connected: true)
+            generation: 1)
 
         #expect(!connected)
         #expect(await ivy.outgoingDialCountForTesting == 0)
@@ -244,7 +242,7 @@ struct InboundAdmissionTests {
         await #expect(throws: IvyError.connectionInProgress) {
             try await ivy.connect(to: endpoint)
         }
-        await ivy.finishOutgoingDial(to: peer, generation: 2, connected: false)
+        await ivy.finishOutgoingDial(to: peer, generation: 2)
         await ivy.stop()
     }
 
@@ -268,11 +266,38 @@ struct InboundAdmissionTests {
             currentGeneration: 2)
         let connected = await ivy.finishOutgoingDial(
             to: peer,
-            generation: 2,
-            connected: true)
+            generation: 2)
 
         #expect(!connected)
         #expect(await ivy.testReconnectToken(peer: peer) != nil)
+        await ivy.stop()
+    }
+
+    @Test("a competing authenticated session satisfies an outgoing dial")
+    func competingSessionSatisfiesOutgoingDial() async throws {
+        let endpoint = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("cross-dial-winner-peer"),
+            host: "127.0.0.1",
+            port: 4001)
+        let peer = PeerID(publicKey: endpoint.publicKey)
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "cross-dial-winner-node",
+            listenPort: 0,
+            bootstrapPeers: [endpoint],
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+
+        await ivy.seedOutgoingDialForTesting(
+            endpoint: endpoint,
+            pendingGeneration: 2,
+            currentGeneration: 2)
+        try await ivy.seedConnectedEndpointForTesting(endpoint, marker: 3)
+
+        let connected = await ivy.finishOutgoingDial(to: peer, generation: 2)
+
+        #expect(connected)
+        #expect(await ivy.outgoingDialCountForTesting == 0)
+        #expect(await ivy.testReconnectToken(peer: peer) == nil)
         await ivy.stop()
     }
 
@@ -305,8 +330,7 @@ struct InboundAdmissionTests {
             currentGeneration: 2)
         let connected = await ivy.finishOutgoingDial(
             to: peer,
-            generation: 2,
-            connected: true)
+            generation: 2)
 
         #expect(!connected)
         #expect(!(await ivy.hasEndpointSession(peer)))
@@ -368,7 +392,7 @@ struct InboundAdmissionTests {
             token: 1)
         #expect(await ivy.testReconnectToken(peer: peer) == nil)
 
-        await ivy.finishOutgoingDial(to: peer, generation: 2, connected: false)
+        await ivy.finishOutgoingDial(to: peer, generation: 2)
 
         #expect(await ivy.testReconnectToken(peer: peer) != nil)
         await ivy.stop()
@@ -400,8 +424,7 @@ struct InboundAdmissionTests {
 
         await ivy.finishOutgoingDial(
             to: PeerID(publicKey: first.publicKey),
-            generation: generation,
-            connected: false)
+            generation: generation)
         let admitted = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connect(host: "127.0.0.1", port: Int(port)).get()
         #expect(try await TransportTestHarness.eventually {
@@ -451,8 +474,7 @@ struct InboundAdmissionTests {
         #expect(!(await ivy.reserveOutgoingDial(to: excess)))
         await ivy.finishOutgoingDial(
             to: peerID,
-            generation: generation,
-            connected: false)
+            generation: generation)
         await ivy.stop()
         await peer.stop()
     }
@@ -530,7 +552,7 @@ struct InboundAdmissionTests {
             currentGeneration: 2)
 
         await ivy.disconnect(peer)
-        await ivy.finishOutgoingDial(to: peer, generation: 2, connected: false)
+        await ivy.finishOutgoingDial(to: peer, generation: 2)
 
         #expect(await ivy.outgoingDialCountForTesting == 0)
         #expect(await ivy.testReconnectToken(peer: peer) == nil)
