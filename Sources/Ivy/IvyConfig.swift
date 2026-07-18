@@ -117,9 +117,11 @@ public struct IvyConfig: Sendable {
             }
         }
         if let externalAddress {
-            guard !externalAddress.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            let host = externalAddress.host.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard NetGroup.ipv4Octets(host) != nil || NetGroup.ipv6Hextets(host) != nil,
                   externalAddress.port != 0 else {
-                throw IvyModeError.invalidConfiguration("externalAddress must be dialable")
+                throw IvyModeError.invalidConfiguration(
+                    "externalAddress must be an IP literal with a nonzero port")
             }
         }
 

@@ -48,8 +48,10 @@ struct SessionProtocolTests {
     @Test("frozen v8 session vectors")
     func frozenV8Vectors() throws {
         let route = Data(repeating: 0x11, count: 32)
-        let initiator = try PeerKey(rawRepresentation: Data(repeating: 0x22, count: 32))
-        let responder = try PeerKey(rawRepresentation: Data(repeating: 0x33, count: 32))
+        let initiatorIdentity = identity(1)
+        let responderIdentity = identity(2)
+        let initiator = peerKey(initiatorIdentity)
+        let responder = peerKey(responderIdentity)
         let metadata = Data([0, 0])
         let helloI = SessionHelloInitiator(
             routeBinding: route,
@@ -57,28 +59,10 @@ struct SessionProtocolTests {
             responder: responder,
             nonce: Data(repeating: 0x44, count: 32),
             metadata: metadata)
-        let helloIHex = "0008"
-            + String(repeating: "11", count: 32)
-            + String(repeating: "22", count: 32)
-            + String(repeating: "33", count: 32)
-            + String(repeating: "44", count: 32)
-            + "000000020000"
-        let expectedHelloI = try #require(Data(hexString: helloIHex))
-        #expect(helloI.encode() == expectedHelloI)
-        #expect(try SessionHelloInitiator.decode(expectedHelloI) == helloI)
-
         let signedI = SignedSessionHelloInitiator(
             hello: helloI,
-            signature: Data(repeating: 0x55, count: 64))
-        let expectedWireI = try #require(Data(hexString:
-            "495659080100000088" + helloIHex + String(repeating: "55", count: 64)))
-        #expect(SessionWireRecord.helloInitiator(signedI).serialize() == expectedWireI)
-        #expect(try SessionWireRecord.deserialize(expectedWireI) == .helloInitiator(signedI))
-        var legacyWireI = expectedWireI
-        legacyWireI[legacyWireI.startIndex + 3] = 0x07
-        #expect(throws: (any Error).self) {
-            try SessionWireRecord.deserialize(legacyWireI)
-        }
+            signature: try #require(Data(hexString:
+                "99c40b7a3da299dafa3539ed6d85c0bdda040ee33adaddcd18e9d0096ebca4c9d2ed215b91f411f2575f4639a8b82b4a9be63956dadd2fb077f72872f6a80303")))
 
         let helloR = SessionHelloResponder(
             routeBinding: route,
@@ -87,48 +71,53 @@ struct SessionProtocolTests {
             initiatorNonce: Data(repeating: 0x44, count: 32),
             responderNonce: Data(repeating: 0x66, count: 32),
             metadata: metadata)
-        let helloRHex = "0008"
-            + String(repeating: "11", count: 32)
-            + String(repeating: "33", count: 32)
-            + String(repeating: "22", count: 32)
-            + String(repeating: "44", count: 32)
-            + String(repeating: "66", count: 32)
-            + "000000020000"
         let signedR = SignedSessionHelloResponder(
             hello: helloR,
-            signature: Data(repeating: 0x77, count: 64))
-        let expectedWireR = try #require(Data(hexString:
-            "4956590802000000a8" + helloRHex + String(repeating: "77", count: 64)))
-        #expect(SessionWireRecord.helloResponder(signedR).serialize() == expectedWireR)
-        #expect(try SessionWireRecord.deserialize(expectedWireR) == .helloResponder(signedR))
-
-        let sessionID = try SessionID(bytes: Data(repeating: 0x88, count: 32))
+            signature: try #require(Data(hexString:
+                "b7d300bb3c59e703eac6e5ea8e0f65981167ebe87aa6c43e45def09bf42a74e07e87ff78cb13338640656933c3452d4825043ae1e2d3897a686ba4f5e33cc40e")))
+        let sessionID = try SessionID(initiator: signedI, responder: signedR)
         let finish = SessionFinish(
             sessionID: sessionID,
             sender: initiator,
             receiver: responder,
-            signature: Data(repeating: 0x99, count: 64))
-        let expectedFinish = try #require(Data(hexString:
-            "4956590803"
-                + String(repeating: "88", count: 32)
-                + String(repeating: "22", count: 32)
-                + String(repeating: "33", count: 32)
-                + String(repeating: "99", count: 64)))
-        #expect(SessionWireRecord.finish(finish).serialize() == expectedFinish)
-        #expect(try SessionWireRecord.deserialize(expectedFinish) == .finish(finish))
-
+            signature: try #require(Data(hexString:
+                "9e2aafd4918190a994d30e1de04616085c51a14dc7a5d3734f1044aaf119dbe816f1ed32cd216990b279de6e128e90b50a1c358f0ef540692e9e4221f2c5290a")))
         let dataRecord = SessionDataRecord(
             sessionID: sessionID,
             sequence: 1,
             payload: Data([0xaa, 0xbb]),
-            signature: Data(repeating: 0xcc, count: 64))
-        let expectedData = try #require(Data(hexString:
-            "4956590804"
-                + String(repeating: "88", count: 32)
-                + "000000000000000100000002aabb"
-                + String(repeating: "cc", count: 64)))
-        #expect(SessionWireRecord.data(dataRecord).serialize() == expectedData)
-        #expect(try SessionWireRecord.deserialize(expectedData) == .data(dataRecord))
+            signature: try #require(Data(hexString:
+                "4ca4211e2d5b55f84ff71769e9c872530f5641b871a32854c2b8372453c8b3cb7eb057d7a7df591ae4c7ecd184d506618cef8e296b2a3b2a3910ecc5bd78da03")))
+
+        let vectors = [
+            SessionWireRecord.helloInitiator(signedI).serialize(),
+            SessionWireRecord.helloResponder(signedR).serialize(),
+            sessionID.bytes,
+            SessionWireRecord.finish(finish).serialize(),
+            SessionWireRecord.data(dataRecord).serialize(),
+        ]
+        let expectedHex = [
+            "495659080100000088000811111111111111111111111111111111111111111111111111111111111111118a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394444444444444444444444444444444444444444444444444444444444444444400000002000099c40b7a3da299dafa3539ed6d85c0bdda040ee33adaddcd18e9d0096ebca4c9d2ed215b91f411f2575f4639a8b82b4a9be63956dadd2fb077f72872f6a80303",
+            "4956590802000000a8000811111111111111111111111111111111111111111111111111111111111111118139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c44444444444444444444444444444444444444444444444444444444444444446666666666666666666666666666666666666666666666666666666666666666000000020000b7d300bb3c59e703eac6e5ea8e0f65981167ebe87aa6c43e45def09bf42a74e07e87ff78cb13338640656933c3452d4825043ae1e2d3897a686ba4f5e33cc40e",
+            "167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f7415",
+            "4956590803167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f74158a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3949e2aafd4918190a994d30e1de04616085c51a14dc7a5d3734f1044aaf119dbe816f1ed32cd216990b279de6e128e90b50a1c358f0ef540692e9e4221f2c5290a",
+            "4956590804167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f7415000000000000000100000002aabb4ca4211e2d5b55f84ff71769e9c872530f5641b871a32854c2b8372453c8b3cb7eb057d7a7df591ae4c7ecd184d506618cef8e296b2a3b2a3910ecc5bd78da03",
+        ]
+        for (vector, hex) in zip(vectors, expectedHex) {
+            let actual = vector.map { String(format: "%02x", $0) }.joined()
+            #expect(actual == hex)
+        }
+
+        #expect(signedI.isValid())
+        #expect(signedR.isValid())
+        #expect(finish.isValid())
+        #expect(dataRecord.isValid(sender: initiator, receiver: responder))
+
+        var legacyWire = vectors[0]
+        legacyWire[legacyWire.startIndex + 3] = 0x07
+        #expect(throws: (any Error).self) {
+            try SessionWireRecord.deserialize(legacyWire)
+        }
     }
 
     @Test("metadata contains only canonical listen addresses")

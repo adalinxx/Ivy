@@ -64,7 +64,9 @@ await ivy.setContentSource(store)
 ```
 
 `cids` is the complete canonical selection and includes `rootCID`. Return every
-entry exactly once within `maxDataBytes`, or return `[]`.
+entry exactly once within `maxDataBytes`, or return `[]`. Wire identifiers are
+non-empty ASCII strings, which keeps equality byte-exact; Ivy does not parse
+their meaning.
 
 Fetch the same explicit selection:
 
@@ -123,7 +125,7 @@ violations under pressure, without turning local service history into a ban.
 ## Requirements
 
 - Swift 6
-- macOS 14+, iOS 17+, tvOS 17+, watchOS 10+, or visionOS 1+
+- macOS 14+, iOS 17+, tvOS 17+, watchOS 10+, visionOS 1+, or Linux
 - One Ed25519 signing key per process identity
 
 ```sh

@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import NIOPosix
 import Testing
 @testable import Ivy
 import Tally
@@ -44,6 +45,7 @@ enum TransportTestHarness {
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay,
         relayEnabled: Bool = false,
+        relayTimeout: Duration = .seconds(1),
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxContentCandidates: Int = 8
     ) -> IvyConfig {
@@ -52,7 +54,7 @@ enum TransportTestHarness {
             listenPort: port,
             bootstrapPeers: bootstrapPeers,
             requestTimeout: .seconds(1),
-            relayTimeout: .seconds(1),
+            relayTimeout: relayTimeout,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: maxConnections,
@@ -103,6 +105,10 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
 
     var authenticatedPeers: [AuthenticatedPeer] {
         lock.withLock { connected }
+    }
+
+    func isConnected(_ peer: PeerID) -> Bool {
+        lock.withLock { currentConnections.contains(peer.publicKey) }
     }
 
     func waitForConnect(_ peer: PeerID) async throws {
@@ -156,6 +162,43 @@ final class TransportRawContentSource: IvyContentSource, Sendable {
     }
 }
 
+private actor CancellationAwareContentSource: IvyContentSource {
+    private var started = false
+    private var cancelled = false
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
+        started = true
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {
+            cancelled = true
+        }
+        return []
+    }
+
+    func didStart() -> Bool { started }
+    func wasCancelled() -> Bool { cancelled }
+}
+
+private actor NonCooperativeContentSource: IvyContentSource {
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
+        started = true
+        await withCheckedContinuation { waiters.append($0) }
+        return []
+    }
+
+    func didStart() -> Bool { started }
+
+    func release() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+}
+
 extension Ivy {
     func setTestDelegate(_ delegate: IvyDelegate?) {
         self.delegate = delegate
@@ -196,6 +239,47 @@ struct TCPIntegrationTests {
             TransportTestHarness.key(serverIdentity),
         ])
 
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("connections accepted before discovery completes are health-tracked")
+    func connectionDuringDiscoveryIsHealthTracked() async throws {
+        let serverIdentity = TransportTestHarness.identity("health-before-discovery-server")
+        let clientIdentity = TransportTestHarness.identity("health-before-discovery-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: IvyConfig(
+            signingKey: serverIdentity,
+            listenPort: serverPort,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(
+                keepaliveInterval: .seconds(60),
+                staleTimeout: .seconds(180)),
+            externalAddress: ("127.0.0.1", serverPort)))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let discovery = TestBarrier("listener ready before discovery")
+        await server.setListenerReadyHookForTesting {
+            do {
+                try await discovery.arriveAndWait()
+            } catch {
+                Issue.record("\(error)")
+            }
+        }
+
+        let starting = Task { try await server.start() }
+        try await discovery.waitForArrivals()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort))
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await server.isHealthTrackedForTesting(clientID)
+        })
+
+        await discovery.release()
+        try await starting.value
         await client.stop()
         await server.stop()
     }
@@ -344,6 +428,36 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
+    @Test("closing a connection cancels its active content callback")
+    func connectionCloseCancelsContentCallback() async throws {
+        let serverIdentity = TransportTestHarness.identity("cancel-content-server")
+        let clientIdentity = TransportTestHarness.identity("cancel-content-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let source = CancellationAwareContentSource()
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort))
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let request = BoundedTestTask {
+            await client.fetchContent(
+                ContentRequestKey(rootCID: "root", cids: []),
+                from: [serverID])
+        }
+        #expect(try await TransportTestHarness.eventually { await source.didStart() })
+
+        await server.stop()
+        #expect(try await TransportTestHarness.eventually { await source.wasCancelled() })
+        #expect(try await request.value(waitingFor: "cancelled content callback") == .empty)
+        await client.stop()
+    }
+
     @Test("storage cannot exceed the aggregate content budget")
     func oversizedContentSource() async throws {
         let serverIdentity = TransportTestHarness.identity("tcp-oversized-content-server")
@@ -374,6 +488,41 @@ struct TCPIntegrationTests {
             from: [serverID])
         #expect(response == .empty)
 
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("transport close retires a session even if storage ignores cancellation")
+    func connectionCloseDoesNotWaitForStorage() async throws {
+        let serverIdentity = TransportTestHarness.identity("stuck-content-server")
+        let clientIdentity = TransportTestHarness.identity("stuck-content-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let source = NonCooperativeContentSource()
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort))
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let request = BoundedTestTask {
+            await client.fetchContent(
+                ContentRequestKey(rootCID: "root", cids: []),
+                from: [serverID])
+        }
+        #expect(try await TransportTestHarness.eventually { await source.didStart() })
+
+        await client.disconnect(serverID)
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 0
+        })
+
+        await source.release()
+        #expect(try await request.value(waitingFor: "closed stuck content request") == .empty)
         await client.stop()
         await server.stop()
     }
@@ -497,6 +646,40 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
+    @Test("configured identities fail over across all declared routes")
+    func configuredRouteFailover() async throws {
+        let serverIdentity = TransportTestHarness.identity("route-failover-server")
+        let clientIdentity = TransportTestHarness.identity("route-failover-client")
+        let deadPort = TransportTestHarness.nextPort()
+        let livePort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let dead = TransportTestHarness.endpoint(serverIdentity, port: deadPort)
+        let live = TransportTestHarness.endpoint(serverIdentity, port: livePort)
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let recorder = TransportTestRecorder()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: livePort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            bootstrapPeers: [dead, live],
+            mode: .pinned(peer: serverID.publicKey)))
+        await client.setTestDelegate(recorder)
+
+        try await server.start()
+        try await client.start()
+        try await recorder.waitForConnect(serverID)
+
+        await server.stop()
+        try await recorder.waitForDisconnect(serverID)
+        try await server.start()
+        await client.runPendingReconnectForTesting(serverID)
+        try await recorder.waitForConnect(serverID)
+
+        #expect(await client.peerConnectionCount == 1)
+        await client.stop()
+        await server.stop()
+    }
+
     @Test("an established configured peer reconnects after transport loss")
     func establishedReconnect() async throws {
         let serverIdentity = TransportTestHarness.identity("reconnect-established-server")
@@ -564,6 +747,156 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
+    @Test("an old session cannot deliver after replacement during an actor hop")
+    func staleSessionMessageIsDropped() async throws {
+        let node = Ivy(config: IvyConfig(
+            publicKey: "stale-message-node",
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        let peerIdentity = TransportTestHarness.identity("stale-message-peer")
+        let endpoint = TransportTestHarness.endpoint(peerIdentity, port: 4001)
+        let peer = TransportTestHarness.key(peerIdentity).peerID
+        let recorder = TransportTestRecorder()
+        let activity = TestBarrier("message activity actor hop")
+        await node.setTestDelegate(recorder)
+        try await node.seedConnectedEndpointForTesting(endpoint, marker: 1)
+        await node.setMessageActivityHookForTesting {
+            do {
+                try await activity.arriveAndWait()
+            } catch {
+                Issue.record("\(error)")
+            }
+        }
+
+        let stale = BoundedTestTask {
+            await node.handleCurrentMessageForTesting(
+                .peerMessage(topic: "stale", payload: Data("old".utf8)),
+                from: peer)
+            return true
+        }
+        try await activity.waitForArrivals()
+        try await node.seedConnectedEndpointForTesting(endpoint, marker: 2)
+        await activity.release()
+
+        #expect(try await stale.value(waitingFor: "stale session message"))
+        #expect(!recorder.receivedMessage(
+            topic: "stale",
+            payload: Data("old".utf8),
+            from: peer))
+        await node.stop()
+    }
+
+    @Test("a transport closed during promotion cannot make connect succeed")
+    func closedPromotionFailsAuthentication() async throws {
+        let serverIdentity = TransportTestHarness.identity("closed-promotion-server")
+        let clientIdentity = TransportTestHarness.identity("closed-promotion-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        await client.setPromotionHookForTesting { $0.cancel() }
+
+        try await server.start()
+        try await client.start()
+        await #expect(throws: (any Error).self) {
+            try await client.connect(to: TransportTestHarness.endpoint(
+                serverIdentity,
+                port: serverPort))
+        }
+        #expect(try await TransportTestHarness.eventually {
+            let clientCount = await client.peerConnectionCount
+            let serverCount = await server.peerConnectionCount
+            return clientCount == 0 && serverCount == 0
+        })
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("cancelling authentication immediately releases its socket")
+    func authenticationCancellationReleasesCapacity() async throws {
+        let stalledIdentity = TransportTestHarness.identity("cancel-auth-stalled")
+        let clientIdentity = TransportTestHarness.identity("cancel-auth-client")
+        let accepted = TestChannelRecorder()
+        let listener = try await ServerBootstrap(
+            group: MultiThreadedEventLoopGroup.singleton
+        ).childChannelInitializer { channel in
+            accepted.store(channel)
+            return channel.eventLoop.makeSucceededVoidFuture()
+        }.bind(host: "127.0.0.1", port: 0).get()
+        let rawPort = try #require(listener.localAddress?.port)
+        let port = try #require(UInt16(exactly: rawPort))
+        let client = Ivy(config: IvyConfig(
+            signingKey: clientIdentity,
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        try await client.start()
+
+        let connecting = Task { () -> Bool in
+            do {
+                try await client.connect(to: TransportTestHarness.endpoint(
+                    stalledIdentity,
+                    port: port))
+                return true
+            } catch {
+                return false
+            }
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await client.pendingSessionCountForTesting == 1
+        })
+        #expect(accepted.isActive)
+
+        connecting.cancel()
+        let completion = BoundedTestTask { await connecting.value }
+        #expect(!(try await completion.value(waitingFor: "cancelled authentication")))
+        #expect(try await TransportTestHarness.eventually {
+            let pending = await client.pendingSessionCountForTesting
+            let outgoing = await client.outgoingDialCountForTesting
+            return pending == 0 && outgoing == 0
+        })
+        #expect(try await TransportTestHarness.eventually { !accepted.isActive })
+
+        await client.stop()
+        try await listener.close().get()
+    }
+
+    @Test("configured maintenance survives a transport closing during promotion")
+    func closedPromotionRearmsConfiguredReconnect() async throws {
+        let serverIdentity = TransportTestHarness.identity("promotion-reconnect-server")
+        let clientIdentity = TransportTestHarness.identity("promotion-reconnect-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let endpoint = TransportTestHarness.endpoint(serverIdentity, port: serverPort)
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            bootstrapPeers: [endpoint],
+            mode: .pinned(peer: serverID.publicKey)))
+        await client.setPromotionHookForTesting { $0.cancel() }
+
+        try await server.start()
+        try await client.start()
+        #expect(try await TransportTestHarness.eventually {
+            let reconnecting = await client.reconnectTasks[serverID] != nil
+            let connected = await client.peerConnectionCount
+            return reconnecting && connected == 0
+        })
+
+        await client.setPromotionHookForTesting(nil)
+        await client.runPendingReconnectForTesting(serverID)
+        #expect(try await TransportTestHarness.eventually {
+            await client.peerConnectionCount == 1
+        })
+
+        await client.stop()
+        await server.stop()
+    }
+
     @Test("a pinned reconnect cannot substitute another endpoint identity")
     func pinnedReconnectRejectsSubstituteIdentity() async throws {
         let expectedIdentity = TransportTestHarness.identity("reconnect-expected")
@@ -605,5 +938,38 @@ struct TCPIntegrationTests {
         #expect(await substitute.peerConnectionCount == 0)
         await client.stop()
         await substitute.stop()
+    }
+
+    @Test("releasing a connected node closes its transports")
+    func releasingNodeClosesConnections() async throws {
+        let serverIdentity = TransportTestHarness.identity("release-server")
+        let clientIdentity = TransportTestHarness.identity("release-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort))
+        var client: Ivy? = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort))
+        weak let releasedClient = client
+
+        try await server.start()
+        try await client?.start()
+        try await client?.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            await server.connectedPeers.contains(clientID)
+        })
+
+        client = nil
+
+        #expect(try await TransportTestHarness.eventually { releasedClient == nil })
+        #expect(try await TransportTestHarness.eventually {
+            await !server.connectedPeers.contains(clientID)
+        })
+        await server.stop()
     }
 }

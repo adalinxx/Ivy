@@ -13,6 +13,25 @@ enum EndpointProvenance {
     }
 }
 
+enum LookupRouteSource: Hashable, Sendable, Comparable {
+    case referral(String)
+    case authenticated
+
+    private var sortKey: String {
+        switch self {
+        case .referral(let peer): peer
+        case .authenticated: "~authenticated"
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.sortKey < rhs.sortKey }
+}
+
+struct LookupRoute: Equatable, Sendable {
+    let endpoint: PeerEndpoint
+    let source: LookupRouteSource
+}
+
 extension Ivy {
     // MARK: - DHT
 
@@ -21,16 +40,24 @@ extension Ivy {
     }
 
     func findNode(target: String, generation: UInt64) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation) else { return [] }
+        guard isCurrentRun(generation), !Task.isCancelled else { return [] }
         let targetHash = Router.hash(target)
         let lookupParallelism = min(Self.kademliaLookupParallelism, max(1, config.kBucketSize))
         let maxLookupRounds = max(1, config.kBucketSize)
         var candidatesByKey: [String: Router.BucketEntry] = [:]
+        var routesByKey: [String: [LookupRoute]] = [:]
         var queried: Set<String> = []
 
         for _ in 0..<maxLookupRounds {
+            guard !Task.isCancelled else { return [] }
             for entry in router.closestPeers(to: targetHash, count: config.kBucketSize) {
                 candidatesByKey[entry.id.publicKey] = entry
+                let preferred = hasEndpointSession(entry.id) ? entry.endpoint : nil
+                routesByKey[entry.id.publicKey] = selectedLookupRoutes(
+                    [LookupRoute(
+                        endpoint: entry.endpoint,
+                        source: .authenticated)] + (routesByKey[entry.id.publicKey] ?? []),
+                    preferred: preferred)
             }
 
             let candidates = closestCandidateEntries(candidatesByKey.values, to: targetHash)
@@ -43,68 +70,125 @@ extension Ivy {
                 queried.insert(entry.id.publicKey)
             }
 
-            await withTaskGroup(of: Void.self) { group in
+            let failedConnections = await withTaskGroup(
+                of: String?.self,
+                returning: Set<String>.self
+            ) { group in
                 for entry in batch where !hasEndpointSession(entry.id) {
+                    let selected = selectedLookupRoutes(
+                        routesByKey[entry.id.publicKey] ?? [],
+                        preferred: nil)
+                    routesByKey[entry.id.publicKey] = selected
+                    let routes = selected.isEmpty ? [entry.endpoint] : selected.map(\.endpoint)
                     group.addTask { [weak self] in
-                        guard let self else { return }
-                        guard await self.isCurrentRun(generation) else { return }
+                        guard let self, !Task.isCancelled else { return nil }
                         do {
                             _ = try await self.connectEndpointIfAdmitted(
-                                to: entry.endpoint,
-                                allowRelayFallback: true,
+                                to: routes,
                                 requiredGeneration: generation)
+                            return nil
                         } catch {
-                            await self.removeFailedRoutingPeer(entry.id, generation: generation)
+                            return Task.isCancelled ? nil : entry.id.publicKey
                         }
                     }
                 }
+                var failed: Set<String> = []
+                for await key in group {
+                    if let key { failed.insert(key) }
+                }
+                return failed
             }
-            guard isCurrentRun(generation) else { return [] }
+            guard isCurrentRun(generation), !Task.isCancelled else { return [] }
 
-            let retained = Set(router.allPeers().map { $0.id.publicKey })
-            for entry in batch where !hasEndpointSession(entry.id)
-                && !retained.contains(entry.id.publicKey) {
-                candidatesByKey.removeValue(forKey: entry.id.publicKey)
+            for key in failedConnections {
+                let peer = PeerID(publicKey: key)
+                guard !hasEndpointSession(peer) else { continue }
+                removeFailedRoutingPeer(peer, generation: generation)
+                candidatesByKey.removeValue(forKey: key)
+                routesByKey.removeValue(forKey: key)
             }
 
             let queryable = batch.filter { hasEndpointSession($0.id) }
             let responses = await withTaskGroup(
-                of: [PeerEndpoint].self,
-                returning: [[PeerEndpoint]].self
+                of: (PeerID, [PeerEndpoint]).self,
+                returning: [(PeerID, [PeerEndpoint])].self
             ) { group in
                 for entry in queryable {
                     group.addTask { [weak self] in
-                        guard let self else { return [] }
-                        return await self.requestNeighbors(
+                        guard let self else { return (entry.id, []) }
+                        return (entry.id, await self.requestNeighbors(
                             from: entry.id,
                             targetHash: targetHash,
                             generation: generation,
-                            timeout: .milliseconds(500))
+                            timeout: .milliseconds(500)))
                     }
                 }
-                var result: [[PeerEndpoint]] = []
-                for await response in group where !response.isEmpty {
+                var result: [(PeerID, [PeerEndpoint])] = []
+                for await response in group where !response.1.isEmpty {
                     result.append(response)
                 }
                 return result
             }
-            guard isCurrentRun(generation) else { return [] }
-            for endpoint in responses.flatMap({ $0 }) {
-                let id = PeerID(publicKey: endpoint.publicKey)
-                candidatesByKey[id.publicKey] = Router.BucketEntry(
-                    id: id,
-                    hash: Router.hash(id.publicKey),
-                    endpoint: endpoint
-                )
+            guard isCurrentRun(generation), !Task.isCancelled else { return [] }
+            let preferredRoutes = Dictionary(uniqueKeysWithValues: router.allPeers().filter {
+                hasEndpointSession($0.id)
+            }.map {
+                ($0.id.publicKey, $0.endpoint)
+            })
+            for (source, endpoints) in responses.sorted(by: {
+                $0.0.publicKey < $1.0.publicKey
+            }) {
+                for endpoint in endpoints {
+                    let id = PeerID(publicKey: endpoint.publicKey)
+                    if candidatesByKey[id.publicKey] == nil {
+                        candidatesByKey[id.publicKey] = Router.BucketEntry(
+                            id: id,
+                            hash: Router.hash(id.publicKey),
+                            endpoint: endpoint)
+                    }
+                    let oldRoutes = routesByKey[id.publicKey] ?? []
+                    let newRoutes = selectedLookupRoutes(
+                        oldRoutes + [LookupRoute(
+                            endpoint: endpoint,
+                            source: .referral(source.publicKey))],
+                        preferred: preferredRoutes[id.publicKey])
+                    routesByKey[id.publicKey] = newRoutes
+                    if !hasEndpointSession(id), newRoutes != oldRoutes {
+                        queried.remove(id.publicKey)
+                    }
+                }
             }
 
+            let retainedKeys = Set(closestCandidateEntries(
+                candidatesByKey.values,
+                to: targetHash).map { $0.id.publicKey })
+            candidatesByKey = candidatesByKey.filter { retainedKeys.contains($0.key) }
+            routesByKey = routesByKey.filter { retainedKeys.contains($0.key) }
         }
 
-        guard isCurrentRun(generation) else { return [] }
+        guard isCurrentRun(generation), !Task.isCancelled else { return [] }
         for entry in router.closestPeers(to: targetHash, count: config.kBucketSize) {
             candidatesByKey[entry.id.publicKey] = entry
+            let preferred = hasEndpointSession(entry.id) ? entry.endpoint : nil
+            routesByKey[entry.id.publicKey] = selectedLookupRoutes(
+                [LookupRoute(
+                    endpoint: entry.endpoint,
+                    source: .authenticated)] + (routesByKey[entry.id.publicKey] ?? []),
+                preferred: preferred)
         }
-        return closestCandidateEntries(candidatesByKey.values, to: targetHash).map { $0.endpoint }
+        let currentRoutes = Dictionary(uniqueKeysWithValues: router.allPeers().filter {
+            hasEndpointSession($0.id)
+        }.map {
+            ($0.id.publicKey, $0.endpoint)
+        })
+        return closestCandidateEntries(candidatesByKey.values, to: targetHash).map { entry in
+            let selected = selectedLookupRoutes(
+                routesByKey[entry.id.publicKey] ?? [],
+                preferred: currentRoutes[entry.id.publicKey])
+            return currentRoutes[entry.id.publicKey]
+                ?? selected.first?.endpoint
+                ?? entry.endpoint
+        }
     }
 
     func startRoutingRefresh(generation: UInt64) {
@@ -263,7 +347,7 @@ extension Ivy {
 
     /// Precise IPv4 special-use classification over the full dotted-quad.
     static func isNonRoutableIPv4(_ o: [Int]) -> Bool {
-        let (a, b, c) = (o[0], o[1], o[2])
+        let (a, b, c, d) = (o[0], o[1], o[2], o[3])
         switch a {
         case 0: return true                              // "this network" 0.0.0.0/8 (RFC 1122)
         case 10: return true                             // private 10.0.0.0/8 (RFC 1918)
@@ -273,7 +357,9 @@ extension Ivy {
         case 172: return (16...31).contains(b)           // private 172.16.0.0/12 (RFC 1918)
         case 192:
             if b == 168 { return true }                  // private 192.168.0.0/16 (RFC 1918)
+            if b == 0 && c == 0 { return d != 9 && d != 10 } // IETF special-purpose /24; two global anycasts
             if b == 0 && c == 2 { return true }          // TEST-NET-1 192.0.2.0/24 (RFC 5737)
+            if b == 88 && c == 99 { return true }        // deprecated 6to4 relay anycast 192.88.99.0/24
             return false
         case 198:
             if b == 18 || b == 19 { return true }        // benchmarking 198.18.0.0/15 (RFC 2544)
@@ -288,10 +374,8 @@ extension Ivy {
         }
     }
 
-    /// If `h` is an IPv6 transition form that embeds an IPv4 address, returns the
-    /// four embedded octets so they can be run through the v4 special-use
-    /// classifier; nil otherwise. Covers NAT64 (RFC 6052), 6to4 (RFC 3964) and
-    /// Teredo (RFC 4380) — mirrors Bitcoin Core's IsRFC6052/3964/4380 handling.
+    /// Returns the IPv4 address embedded by the globally reachable NAT64
+    /// well-known prefix, or nil for every other IPv6 form.
     static func embeddedTransitionIPv4(_ h: [UInt16]) -> [Int]? {
         func octets(_ hi: UInt16, _ lo: UInt16) -> [Int] {
             [Int(hi >> 8), Int(hi & 0xff), Int(lo >> 8), Int(lo & 0xff)]
@@ -301,32 +385,56 @@ extension Ivy {
         if h[0] == 0x0064, h[1] == 0xff9b, h[2] == 0, h[3] == 0, h[4] == 0, h[5] == 0 {
             return octets(h[6], h[7])
         }
-        // 6to4 2002::/16 (RFC 3964): the embedded IPv4 is hextets[1..2].
-        if h[0] == 0x2002 {
-            return octets(h[1], h[2])
-        }
-        // Teredo 2001:0000::/32 (RFC 4380): the client IPv4 is the last two
-        // hextets XOR 0xffff. Precisely 2001:0000: (second hextet 0) — distinct
-        // from documentation 2001:db8::/32 and from plain global 2001::/16.
-        if h[0] == 0x2001, h[1] == 0x0000 {
-            return octets(h[6] ^ 0xffff, h[7] ^ 0xffff)
-        }
         return nil
     }
 
     /// Precise IPv6 special-use classification over the full eight hextets.
     static func isNonRoutableIPv6(_ h: [UInt16]) -> Bool {
         let first = h[0]
-        // Transition forms embedding an IPv4 (NAT64/6to4/Teredo): classify by the
-        // embedded v4, so an internal/special-use v4 wrapped in a transition
-        // prefix can't slip past as "routable IPv6" (SSRF on a translation host).
-        // A wrapped globally-routable v4 stays routable.
+        // The NAT64 well-known prefix is globally reachable, but its embedded
+        // destination must still pass the IPv4 special-purpose filter.
         if let v4 = embeddedTransitionIPv4(h) { return isNonRoutableIPv4(v4) }
-        if first == 0 { return true }                    // ::, ::1, IPv4-compat/mapped, discard — non-global (RFC 4291)
-        if (0xfe80...0xfebf).contains(first) { return true } // link-local fe80::/10 (RFC 4291)
-        if (0xfc00...0xfdff).contains(first) { return true } // unique-local fc00::/7 (RFC 4193)
-        if (0xff00...0xffff).contains(first) { return true } // multicast ff00::/8 (RFC 4291)
+        if !(0x2000...0x3fff).contains(first) { return true } // outside global unicast 2000::/3
+        if first == 0x2001 && h[1] <= 0x01ff {
+            let exactAnycast = h[1] == 1
+                && h[2...6].allSatisfy { $0 == 0 }
+                && (1...3).contains(h[7])
+            let globalAssignment = exactAnycast
+                || h[1] == 3
+                || (h[1] == 4 && h[2] == 0x0112)
+                || (0x0030...0x003f).contains(h[1])
+            if !globalAssignment { return true }
+        }
         if first == 0x2001 && h[1] == 0x0db8 { return true } // documentation 2001:db8::/32 (RFC 3849)
+        if first == 0x2002 { return true }                  // deprecated 6to4 2002::/16
+        if first == 0x3fff && h[1] <= 0x0fff { return true } // documentation 3fff::/20
         return false
     }
+}
+
+func selectedLookupRoutes(
+    _ routes: [LookupRoute],
+    preferred: PeerEndpoint?
+) -> [LookupRoute] {
+    var unique: [PeerEndpoint: LookupRoute] = [:]
+    for route in routes where unique[route.endpoint] == nil { unique[route.endpoint] = route }
+
+    var selected: [LookupRoute] = []
+    if let preferred {
+        selected.append(unique.removeValue(forKey: preferred)
+            ?? LookupRoute(endpoint: preferred, source: .authenticated))
+    }
+    let bySource = Dictionary(grouping: unique.values, by: \.source).mapValues {
+        $0.sorted {
+            ($0.endpoint.host, $0.endpoint.port) < ($1.endpoint.host, $1.endpoint.port)
+        }
+    }
+    for index in 0..<Ivy.maxRoutesPerIdentity {
+        for source in bySource.keys.sorted()
+            where selected.count < Ivy.maxRoutesPerIdentity {
+            let alternatives = bySource[source] ?? []
+            if alternatives.indices.contains(index) { selected.append(alternatives[index]) }
+        }
+    }
+    return selected
 }

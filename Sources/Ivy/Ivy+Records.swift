@@ -11,7 +11,8 @@ struct PendingProviderQuery {
     let requestID: UInt64
     var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
     var expectedPeers: Set<String>
-    var endpoints: Set<PeerEndpoint>
+    var responsesByPeer: [String: [ProviderHint]]
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
 extension Ivy {
@@ -20,13 +21,30 @@ extension Ivy {
 
     func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
         evictExpiredProviders(rootCID: rootCID)
-        let records = (providerHints[rootCID] ?? []).compactMap { hint -> ProviderRecord? in
-            guard let endpoint = hint.endpoint else { return nil }
-            return ProviderRecord(endpoint: endpoint, expiresAt: hint.expiresAt)
-        }
+        let records = providerRecordsForWire(providerHints[rootCID] ?? [])
         fireToPeer(
             peer,
             .providers(rootCID: rootCID, requestID: requestID, records: records))
+    }
+
+    func providerRecordsForWire(_ hints: [ProviderHint]) -> [ProviderRecord] {
+        let records = hints.compactMap { hint -> ProviderRecord? in
+            guard let endpoint = hint.endpoint else { return nil }
+            return ProviderRecord(endpoint: endpoint, expiresAt: hint.expiresAt)
+        }.sorted {
+            ($0.endpoint.publicKey, $0.endpoint.host, $0.endpoint.port)
+                < ($1.endpoint.publicKey, $1.endpoint.host, $1.endpoint.port)
+        }
+        let byIdentity = Dictionary(grouping: records, by: \.endpoint.publicKey)
+        var selected: [ProviderRecord] = []
+        for index in 0..<Self.maxRoutesPerIdentity {
+            for identity in byIdentity.keys.sorted()
+                where selected.count < Int(MessageLimits.maxNeighborCount) {
+                let routes = byIdentity[identity] ?? []
+                if routes.indices.contains(index) { selected.append(routes[index]) }
+            }
+        }
+        return selected
     }
 
     func handleProvidersResponse(
@@ -39,6 +57,7 @@ extension Ivy {
               pending.requestID == requestID,
               pending.expectedPeers.remove(peer.publicKey) != nil else { return }
 
+        var accepted: [ProviderHint] = []
         for record in records.prefix(Int(MessageLimits.maxNeighborCount)) {
             let endpoint = record.endpoint
             guard providerExpiryIsValid(record.expiresAt),
@@ -51,14 +70,13 @@ extension Ivy {
                 publicKey: key.hex,
                 host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: endpoint.port)
-            pending.endpoints.insert(canonical)
-            storeProviderHint(
-                rootCID: rootCID,
+            accepted.append(ProviderHint(
                 peer: key.peerID,
                 endpoint: canonical,
-                expiresAt: record.expiresAt)
+                expiresAt: record.expiresAt))
         }
 
+        pending.responsesByPeer[peer.publicKey] = boundedProviderHints(accepted)
         pendingProviderQueries[rootCID] = pending
         if pending.expectedPeers.isEmpty {
             resolveProviderQuery(rootCID: rootCID, requestID: requestID)
@@ -125,8 +143,8 @@ extension Ivy {
     }
 
     private func uniqueProviderEndpoints(_ endpoints: [PeerEndpoint]) -> [PeerEndpoint] {
-        var seen: Set<String> = []
-        return endpoints.filter { seen.insert($0.publicKey).inserted }
+        var seen: Set<PeerEndpoint> = []
+        return endpoints.filter { seen.insert($0).inserted }
     }
 
     func queryProviders(
@@ -135,7 +153,11 @@ extension Ivy {
         generation: UInt64? = nil
     ) async -> [PeerEndpoint] {
         if let generation, !isCurrentRun(generation) { return [] }
-        guard !targets.isEmpty,
+        var seenTargets: Set<String> = []
+        let boundedTargets = targets.filter {
+            seenTargets.insert($0.id.publicKey).inserted
+        }.prefix(min(6, max(1, config.kBucketSize)))
+        guard !boundedTargets.isEmpty,
               pendingProviderQueries[rootCID] != nil
                 || pendingProviderQueries.count < config.maxPendingRequests else { return [] }
         if let pending = pendingProviderQueries[rootCID],
@@ -145,59 +167,58 @@ extension Ivy {
 
         let endpoints = await withCheckedContinuation { continuation in
             if var pending = pendingProviderQueries[rootCID] {
-                let newTargets = targets.filter {
-                    !pending.expectedPeers.contains($0.id.publicKey)
-                }
                 pending.continuations.append(continuation)
-                pending.expectedPeers.formUnion(newTargets.map { $0.id.publicKey })
                 pendingProviderQueries[rootCID] = pending
-                for target in newTargets {
-                    fireToPeer(
-                        target.id,
-                        .findProviders(rootCID: rootCID, requestID: pending.requestID))
-                }
                 return
             }
 
             let requestID = makeProviderRequestID()
-            pendingProviderQueries[rootCID] = PendingProviderQuery(
+            var pending = PendingProviderQuery(
                 requestID: requestID,
                 continuations: [continuation],
-                expectedPeers: Set(targets.map { $0.id.publicKey }),
-                endpoints: [])
-            for target in targets {
-                fireToPeer(
+                expectedPeers: [],
+                responsesByPeer: [:])
+            for target in boundedTargets {
+                if case .enqueued = fireToPeer(
                     target.id,
-                    .findProviders(rootCID: rootCID, requestID: requestID))
-            }
-            Task { [weak self] in
-                do {
-                    try await Task.sleep(for: .milliseconds(500))
-                } catch {
-                    return
+                    .findProviders(rootCID: rootCID, requestID: requestID)) {
+                    pending.expectedPeers.insert(target.id.publicKey)
                 }
+            }
+            guard !pending.expectedPeers.isEmpty else {
+                continuation.resume(returning: [])
+                return
+            }
+            pendingProviderQueries[rootCID] = pending
+            let timeoutTask = delayedTask(after: .milliseconds(500)) { [weak self] in
                 await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
             }
+            pendingProviderQueries[rootCID]?.timeoutTask = timeoutTask
         }
         if let generation, !isCurrentRun(generation) { return [] }
         return endpoints
     }
 
     private func makeProviderRequestID() -> UInt64 {
-        var requestID = UInt64.random(in: 1 ... .max)
-        while pendingProviderQueries.values.contains(where: { $0.requestID == requestID }) {
-            requestID = UInt64.random(in: 1 ... .max)
+        makeWireOperationID { requestID in
+            pendingProviderQueries.values.contains { $0.requestID == requestID }
         }
-        return requestID
     }
 
     func resolveProviderQuery(rootCID: String, requestID: UInt64) {
         guard let pending = pendingProviderQueries[rootCID],
               pending.requestID == requestID else { return }
         pendingProviderQueries.removeValue(forKey: rootCID)
-        let endpoints = pending.endpoints.sorted {
-            ($0.publicKey, $0.host, $0.port) < ($1.publicKey, $1.host, $1.port)
+        pending.timeoutTask?.cancel()
+        let hints = diversifiedProviderHints(pending.responsesByPeer)
+        for hint in hints {
+            storeProviderHint(
+                rootCID: rootCID,
+                peer: hint.peer,
+                endpoint: hint.endpoint,
+                expiresAt: hint.expiresAt)
         }
+        let endpoints = hints.compactMap(\.endpoint)
         for continuation in pending.continuations {
             continuation.resume(returning: endpoints)
         }
@@ -213,24 +234,33 @@ extension Ivy {
     func connectToProviderEndpoints(
         _ endpoints: [PeerEndpoint],
         generation: UInt64
-    ) async -> Set<PeerEndpoint> {
-        guard isCurrentRun(generation) else { return [] }
-        let candidates = uniqueProviderEndpoints(endpoints).filter {
-            !hasEndpointSession(PeerID(publicKey: $0.publicKey))
-        }.prefix(config.maxContentCandidates)
+    ) async {
+        guard isCurrentRun(generation) else { return }
+        var alternativesByPeer: [String: [PeerEndpoint]] = [:]
+        var peerOrder: [String] = []
+        for endpoint in uniqueProviderEndpoints(endpoints) {
+            if alternativesByPeer[endpoint.publicKey] == nil {
+                peerOrder.append(endpoint.publicKey)
+            }
+            alternativesByPeer[endpoint.publicKey, default: []].append(endpoint)
+        }
+        let candidates = Array(peerOrder.compactMap { key -> [PeerEndpoint]? in
+            guard !hasEndpointSession(PeerID(publicKey: key)) else { return nil }
+            return alternativesByPeer[key].map {
+                Array($0.prefix(Self.maxRoutesPerIdentity))
+            }
+        }.prefix(config.maxContentCandidates))
+
         await withTaskGroup(of: Void.self) { group in
-            for endpoint in candidates {
+            for alternatives in candidates {
                 group.addTask { [weak self] in
-                    guard let self,
-                          await self.isCurrentRun(generation) else { return }
+                    guard let self else { return }
                     _ = try? await self.connectEndpointIfAdmitted(
-                        to: endpoint,
-                        allowRelayFallback: true,
+                        to: alternatives,
                         requiredGeneration: generation)
                 }
             }
         }
-        return isCurrentRun(generation) ? Set(candidates) : []
     }
 
     public func rememberProvider(rootCID: String, peer: PeerID) {
@@ -259,13 +289,72 @@ extension Ivy {
            })?.key {
             providerHints.removeValue(forKey: evicted)
         }
-        var hints = providerHints[rootCID] ?? []
-        hints.removeAll { $0.peer == peer }
-        hints.append(ProviderHint(peer: peer, endpoint: endpoint, expiresAt: expiresAt))
-        if hints.count > config.kBucketSize {
-            hints = Array(hints.suffix(config.kBucketSize))
+        providerHints[rootCID] = boundedProviderHints(
+            (providerHints[rootCID] ?? []) + [ProviderHint(
+                peer: peer,
+                endpoint: endpoint,
+                expiresAt: expiresAt)])
+    }
+
+    private func boundedProviderHints(_ input: [ProviderHint]) -> [ProviderHint] {
+        var peerOrder: [PeerID] = []
+        var routesByPeer: [PeerID: [ProviderHint]] = [:]
+        for hint in input {
+            peerOrder.removeAll { $0 == hint.peer }
+            peerOrder.append(hint.peer)
+            var routes = routesByPeer[hint.peer] ?? []
+            routes.removeAll { $0.endpoint == hint.endpoint }
+            routes.append(hint)
+            routesByPeer[hint.peer] = Array(routes.suffix(Self.maxRoutesPerIdentity))
         }
-        providerHints[rootCID] = hints
+        return peerOrder.suffix(config.kBucketSize).flatMap { routesByPeer[$0] ?? [] }
+    }
+
+    private func diversifiedProviderHints(
+        _ responses: [String: [ProviderHint]]
+    ) -> [ProviderHint] {
+        let sources = responses.keys.sorted()
+        var indices = Dictionary(uniqueKeysWithValues: sources.map { ($0, 0) })
+        var selectedPeers: Set<PeerID> = []
+        var peers: [PeerID] = []
+
+        while selectedPeers.count < config.kBucketSize {
+            var madeProgress = false
+            for source in sources {
+                let hints = responses[source] ?? []
+                var index = indices[source] ?? 0
+                while index < hints.count {
+                    let hint = hints[index]
+                    index += 1
+                    if selectedPeers.insert(hint.peer).inserted {
+                        peers.append(hint.peer)
+                        madeProgress = true
+                        break
+                    }
+                }
+                indices[source] = index
+                if selectedPeers.count == config.kBucketSize { break }
+            }
+            if !madeProgress { break }
+        }
+
+        var selected: [ProviderHint] = []
+        var seenEndpoints: Set<PeerEndpoint> = []
+        for routeIndex in 0..<Self.maxRoutesPerIdentity {
+            for peer in peers {
+                for source in sources {
+                    let routes = (responses[source] ?? []).filter { $0.peer == peer }
+                    guard routes.indices.contains(routeIndex),
+                          selected.lazy.filter({ $0.peer == peer }).count
+                            < Self.maxRoutesPerIdentity else { continue }
+                    let hint = routes[routeIndex]
+                    guard let endpoint = hint.endpoint,
+                          seenEndpoints.insert(endpoint).inserted else { continue }
+                    selected.append(hint)
+                }
+            }
+        }
+        return selected
     }
 
     func forgetProvider(rootCID: String, peer: PeerID) {
@@ -280,16 +369,21 @@ extension Ivy {
 
     func connectedProviderIDs(for rootCID: String) -> [PeerID] {
         evictExpiredProviders(rootCID: rootCID)
+        var seen: Set<PeerID> = []
         return (providerHints[rootCID] ?? []).compactMap { hint in
             guard hasEndpointSession(hint.peer),
-                  !isDeficiencySuppressed(rootCID: rootCID, peer: hint.peer) else { return nil }
+                  !isDeficiencySuppressed(rootCID: rootCID, peer: hint.peer),
+                  seen.insert(hint.peer).inserted else { return nil }
             return hint.peer
         }
     }
 
     public func providers(for rootCID: String) -> [PeerID] {
         evictExpiredProviders(rootCID: rootCID)
-        return (providerHints[rootCID] ?? []).map(\.peer)
+        var seen: Set<PeerID> = []
+        return (providerHints[rootCID] ?? []).compactMap { hint in
+            seen.insert(hint.peer).inserted ? hint.peer : nil
+        }
     }
 
     func evictExpiredProviders(rootCID: String) {
@@ -319,13 +413,8 @@ extension Ivy {
     }
 
     func localProviderEndpoint() -> PeerEndpoint? {
-        if let external = config.externalAddress {
-            return PeerEndpoint(publicKey: localKey.hex, host: external.host, port: external.port)
-        }
-        if let publicAddress {
-            return PeerEndpoint(publicKey: localKey.hex, host: publicAddress.host, port: publicAddress.port)
-        }
-        return nil
+        guard let address = advertisedListenAddresses(observedLocalHost: nil).first else { return nil }
+        return PeerEndpoint(publicKey: localKey.hex, host: address.host, port: address.port)
     }
 
     func providerEndpoint(for peer: PeerID) -> PeerEndpoint? {

@@ -53,7 +53,7 @@ struct PeerHealthMonitorTests {
         }.isEmpty)
         #expect(await pings.nonces == [100])
 
-        await monitor.recordPong(from: peer, sessionID: sessionID, nonce: 999)
+        #expect(!(await monitor.recordPong(from: peer, sessionID: sessionID, nonce: 999)))
         #expect(await monitor.health(for: peer)?.pendingPingNonce == 100)
         clock.advance(by: .seconds(60))
         _ = await monitor.checkAndPing { peer, _, nonce in
@@ -61,7 +61,7 @@ struct PeerHealthMonitorTests {
         }
         #expect(await monitor.health(for: peer)?.missedPongs == 1)
 
-        await monitor.recordPong(from: peer, sessionID: sessionID, nonce: 101)
+        #expect(await monitor.recordPong(from: peer, sessionID: sessionID, nonce: 101))
         #expect(await monitor.health(for: peer)?.pendingPingNonce == nil)
         #expect(await monitor.health(for: peer)?.missedPongs == 0)
         clock.advance(by: .seconds(60))

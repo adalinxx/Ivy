@@ -1,5 +1,8 @@
 import Crypto
 import Foundation
+import NIOCore
+import NIOPosix
+import Testing
 @testable import Ivy
 import Tally
 
@@ -10,6 +13,74 @@ func deterministicTestSigningKey(_ label: String) -> Curve25519.Signing.PrivateK
 
 func deterministicTestPeerKey(_ label: String) -> String {
     try! PeerKey(rawRepresentation: deterministicTestSigningKey(label).publicKey.rawRepresentation).hex
+}
+
+final class TestWireSink: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+
+    private let lock = NSLock()
+    private var bytes: [UInt8] = []
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = unwrapInboundIn(data)
+        let incoming = buffer.readBytes(length: buffer.readableBytes) ?? []
+        lock.withLock { bytes.append(contentsOf: incoming) }
+    }
+
+    var byteCount: Int { lock.withLock { bytes.count } }
+
+    var hasRelayClose: Bool {
+        let snapshot = lock.withLock { bytes }
+        var offset = 0
+        while offset + 4 <= snapshot.count {
+            let length = snapshot[offset..<offset + 4].reduce(0) { $0 << 8 | Int($1) }
+            let end = offset + 4 + length
+            guard end <= snapshot.count else { return false }
+            if let wire = try? SessionWireRecord.deserialize(Data(snapshot[offset + 4..<end])),
+               case .data(let record) = wire,
+               case .relayClose? = Message.deserialize(record.payload) {
+                return true
+            }
+            offset = end
+        }
+        return false
+    }
+}
+
+final class TestChannelRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channel: Channel?
+
+    func store(_ channel: Channel) { lock.withLock { self.channel = channel } }
+    var isActive: Bool { lock.withLock { channel?.isActive == true } }
+}
+
+struct TestLoopback {
+    let listener: Channel
+    let client: Channel
+    let sink: TestWireSink
+    let port: UInt16
+
+    static func open() async throws -> Self {
+        let sink = TestWireSink()
+        let listener = try await ServerBootstrap(
+            group: MultiThreadedEventLoopGroup.singleton
+        ).childChannelInitializer { channel in
+            channel.pipeline.addHandler(sink)
+        }.bind(host: "127.0.0.1", port: 0).get()
+        let address = try #require(listener.localAddress)
+        let rawPort = try #require(address.port)
+        let port = try #require(UInt16(exactly: rawPort))
+        let client = try await ClientBootstrap(
+            group: MultiThreadedEventLoopGroup.singleton
+        ).connect(to: address).get()
+        return Self(listener: listener, client: client, sink: sink, port: port)
+    }
+
+    func close() async {
+        try? await client.close().get()
+        try? await listener.close().get()
+    }
 }
 
 enum TestSynchronizationError: Error, CustomStringConvertible {

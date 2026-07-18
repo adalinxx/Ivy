@@ -3,10 +3,11 @@ import NIOCore
 import NIOPosix
 import Tally
 
-public enum IvyError: Error, Sendable {
+public enum IvyError: Error, Sendable, Equatable {
     case notRunning
     case invalidPeerKey
     case peerOutsideMode
+    case connectionInProgress
     case identityVerificationFailed
     case noRelayAvailable
 }
@@ -14,6 +15,7 @@ public enum IvyError: Error, Sendable {
 struct PendingNeighborResponse: Sendable {
     let peer: PeerID
     let continuation: CheckedContinuation<[PeerEndpoint], Never>
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
 private enum PendingSessionDirection {
@@ -30,9 +32,11 @@ private struct PendingSession {
     var sessionID: SessionID?
     var remoteKey: PeerKey?
     var remoteMetadata: PeerMetadata?
+    var continuation: CheckedContinuation<Bool, Never>? = nil
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
-final class AuthenticatedSession {
+final class AuthenticatedSession: @unchecked Sendable {
     let connection: PeerConnection
     let peerKey: PeerKey
     let role: AuthenticatedPeerRole
@@ -59,24 +63,32 @@ final class AuthenticatedSession {
 private struct RelayRoute {
     let source: PeerKey
     let target: PeerKey
+    let lifecycleID: UUID
     var ready: Bool
     var lastActivity: ContinuousClock.Instant
+    var expiryTask: Task<Void, Never>? = nil
 }
 
 private struct InstalledRoute {
     let carrier: PeerKey
     let remote: PeerKey
+    let lifecycleID: UUID
+    var connection: PeerConnection? = nil
+    var expiryTask: Task<Void, Never>? = nil
 }
 
 private struct PendingRelayOpen {
     let carrier: PeerKey
     let target: PeerKey
     let continuation: CheckedContinuation<Data?, Never>
+    var timeoutTask: Task<Void, Never>? = nil
 }
 
 private struct PendingOutgoingDial {
-    let endpoint: PeerEndpoint
+    var endpoint: PeerEndpoint
     let generation: UInt64
+    var cancelled = false
+    var connectionID: UUID? = nil
 }
 
 struct PendingReconnect {
@@ -89,6 +101,12 @@ enum ProtocolViolationEvidence {
     case unverified
     case signedTransport
     case signedPayload
+}
+
+private enum SessionRecordSendResult {
+    case sent
+    case locallyRejected
+    case notConnected
 }
 
 public actor Ivy {
@@ -105,13 +123,9 @@ public actor Ivy {
     public func setContentSource(_ source: IvyContentSource?) { contentSource = source }
 
     private var pendingSessions: [UUID: PendingSession] = [:]
-    private var authenticationWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
-    private var endpointSessions: [PeerKey: AuthenticatedSession] = [:]
-    private var carrierSessions: [PeerKey: AuthenticatedSession] = [:]
-    private var authenticatedConnections: [UUID: (PeerKey, AuthenticatedPeerRole)] = [:]
+    private var sessions: [PeerKey: AuthenticatedSession] = [:]
     private var relayRoutes: [Data: RelayRoute] = [:]
     private var installedRoutes: [Data: InstalledRoute] = [:]
-    private var routeConnections: [Data: PeerConnection] = [:]
     private var pendingRelayOpens: [Data: PendingRelayOpen] = [:]
     static let directRouteBinding = Data(repeating: 0, count: 32)
     static let maxRelayRoutes = 64
@@ -120,10 +134,12 @@ public actor Ivy {
 
     func endpointConnection(for peer: PeerID) -> PeerConnection? {
         guard let key = try? PeerKey(peer.publicKey) else { return nil }
-        return endpointSessions[key]?.connection
+        return endpointSession(for: key)?.connection
     }
 
-    var connectedEndpointPeers: [PeerID] { endpointSessions.keys.map(\.peerID) }
+    var connectedEndpointPeers: [PeerID] {
+        sessions.values.compactMap { $0.role == .endpoint ? $0.peerKey.peerID : nil }
+    }
     var serverChannel: Channel?
     var running = false
     private var lifecycleTail: Task<Void, Never>?
@@ -138,11 +154,13 @@ public actor Ivy {
     private var outgoingDials: [PeerID: PendingOutgoingDial] = [:]
     var reconnectAttempts: [PeerID: Int] = [:]
     var reconnectTasks: [PeerID: PendingReconnect] = [:]
+    private var reconnectSuppressed: Set<PeerID> = []
     private var nextReconnectToken: UInt64 = 0
     static let reconnectBaseDelayMs: UInt64 = 500
     static let reconnectMaxDelayMs: UInt64 = 30_000
     static let reconnectJitterMs: UInt64 = 250
     static let kademliaLookupParallelism = 3
+    static let maxRoutesPerIdentity = 3
 
     var providerHints: [String: [ProviderHint]] = [:]
     static let maxProviderRoots = 10_000
@@ -150,11 +168,14 @@ public actor Ivy {
     static let deficiencySuppressionWindow: Duration = .seconds(30)
 
     var pendingContentRequests: [UInt64: PendingContentRequest] = [:]
-    var contentRequestIDs: [ContentRequestKey: UInt64] = [:]
-    var pendingNetworkFetches: [ContentRequestKey: PendingNetworkFetch] = [:]
-    var nextNetworkFetchToken: UInt64 = 0
+    var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
+    var nextFetchToken: UInt64 = 0
+    var activeFetchCount = 0
     var servingContentRequests: Set<InboundContentRequest> = []
+    var activeLocalContentRequestCount = 0
+    var nextConnectedFallbackOffset = 0
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]
+    var nextWireOperationID: UInt64 = 0
 
     public init(config: IvyConfig, group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton, tally: Tally? = nil) {
         self.config = config
@@ -198,34 +219,9 @@ public actor Ivy {
         serverChannel = listener.channel
         inboundAdmissionGate = listener.gate
         running = true
-
-        if let externalAddress = config.externalAddress {
-            let address = ObservedAddress(host: externalAddress.host, port: externalAddress.port)
-            publicAddress = address
-            delegate?.ivy(self, didDiscoverPublicAddress: address)
-        } else if let address = await stunClient.discoverPublicAddress() {
-            guard isCurrentRun(generation) else { return }
-            publicAddress = address
-            delegate?.ivy(self, didDiscoverPublicAddress: address)
-        }
-        guard isCurrentRun(generation) else { return }
-
-        for endpoint in config.bootstrapPeers {
-            Task {
-                await self.maintainConfiguredConnection(
-                    to: endpoint,
-                    role: .endpoint,
-                    generation: generation)
-            }
-        }
-        for carrier in config.carriers {
-            Task {
-                await self.maintainConfiguredConnection(
-                    to: carrier,
-                    role: .carrier,
-                    generation: generation)
-            }
-        }
+        publicAddress = nil
+        reconnectSuppressed.removeAll()
+        nextConnectedFallbackOffset = 0
 
         let monitor = PeerHealthMonitor(
             config: config.healthConfig,
@@ -247,7 +243,38 @@ public actor Ivy {
                 nonce: nonce,
                 generation: generation)
         }
+#if DEBUG || IVY_TESTING
+        await listenerReadyHookForTesting?()
+#endif
         guard isCurrentRun(generation) else { return }
+
+        if let externalAddress = config.externalAddress {
+            let address = ObservedAddress(host: externalAddress.host, port: externalAddress.port)
+            publicAddress = address
+            delegate?.ivy(self, didDiscoverPublicAddress: address)
+        } else if let address = await stunClient.discoverPublicAddress() {
+            guard isCurrentRun(generation) else { return }
+            publicAddress = address
+            delegate?.ivy(self, didDiscoverPublicAddress: address)
+        }
+        guard isCurrentRun(generation) else { return }
+
+        for peer in configuredPeerKeys(role: .endpoint) {
+            Task {
+                await self.maintainConfiguredConnection(
+                    peer: peer,
+                    role: .endpoint,
+                    generation: generation)
+            }
+        }
+        for peer in configuredPeerKeys(role: .carrier) {
+            Task {
+                await self.maintainConfiguredConnection(
+                    peer: peer,
+                    role: .carrier,
+                    generation: generation)
+            }
+        }
 
         if config.mode.participatesInPublicDiscovery {
             startRoutingRefresh(generation: generation)
@@ -271,7 +298,10 @@ public actor Ivy {
     }
 
     private func stopNow() async {
-        guard running || serverChannel != nil else { return }
+        guard running || serverChannel != nil else {
+            cleanupAllPending()
+            return
+        }
         runGeneration &+= 1
         running = false
         inboundAdmissionGate?.invalidate()
@@ -283,21 +313,16 @@ public actor Ivy {
 
         try? await serverChannel?.close().get()
         serverChannel = nil
-        let pendingConnections = pendingSessions.values.map(\.connection)
-        let endpointConnections = endpointSessions.values.map(\.connection)
-        let carrierConnections = carrierSessions.values.map(\.connection)
-        pendingSessions.removeAll()
-        endpointSessions.removeAll()
-        carrierSessions.removeAll()
-        authenticatedConnections.removeAll()
-        for connection in pendingConnections + endpointConnections + carrierConnections {
+        let authenticatedConnections = sessions.values.map(\.connection)
+        sessions.removeAll()
+        for connection in authenticatedConnections {
             connection.cancel()
         }
+        for route in relayRoutes.values { route.expiryTask?.cancel() }
+        for route in installedRoutes.values { route.expiryTask?.cancel() }
         relayRoutes.removeAll()
         installedRoutes.removeAll()
-        routeConnections.removeAll()
 
-        outgoingDials.removeAll()
         for reconnect in reconnectTasks.values {
             reconnect.task.cancel()
         }
@@ -309,6 +334,16 @@ public actor Ivy {
         running && generation == runGeneration
     }
 
+    func delayedTask(
+        after delay: Duration,
+        perform action: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        Task {
+            do { try await Task.sleep(for: delay) } catch { return }
+            await action()
+        }
+    }
+
     private func sendHealthPing(
         _ peer: PeerID,
         sessionID: SessionID,
@@ -317,7 +352,7 @@ public actor Ivy {
     ) {
         guard isCurrentRun(generation),
               let key = try? PeerKey(peer.publicKey),
-              authenticatedSession(for: key)?.sessionID == sessionID else { return }
+              sessions[key]?.sessionID == sessionID else { return }
         fireToPeer(peer, .ping(nonce: nonce))
     }
 
@@ -338,22 +373,32 @@ public actor Ivy {
 
     // MARK: - Authenticated Connections
 
-    private func authenticatedSession(for key: PeerKey) -> AuthenticatedSession? {
-        endpointSessions[key] ?? carrierSessions[key]
+    private func endpointSession(for key: PeerKey) -> AuthenticatedSession? {
+        guard let session = sessions[key], session.role == .endpoint else { return nil }
+        return session
+    }
+
+    private func carrierSession(for key: PeerKey) -> AuthenticatedSession? {
+        guard let session = sessions[key], session.role == .carrier else { return nil }
+        return session
+    }
+
+    private func session(for connectionID: UUID) -> AuthenticatedSession? {
+        sessions.values.first { $0.connection.connectionID == connectionID }
     }
 
     func isCurrent(_ session: AuthenticatedSession) -> Bool {
-        running && sessionForAuthority((session.peerKey, session.role)) === session
+        running && sessions[session.peerKey] === session
     }
 
     func hasEndpointSession(_ peer: PeerID) -> Bool {
         guard let key = try? PeerKey(peer.publicKey) else { return false }
-        return endpointSessions[key] != nil
+        return endpointSession(for: key)?.connection.isLive == true
     }
 
     func connectionCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
         let excluded = peer.flatMap { try? PeerKey($0.publicKey) }
-        return (Array(endpointSessions.values) + Array(carrierSessions.values)).filter { session in
+        return sessions.values.filter { session in
             session.peerKey != excluded
                 && session.connection.isDirect
                 && connectionNetgroup(session.connection) == group
@@ -368,96 +413,69 @@ public actor Ivy {
     }
 
     public var connectedPeers: [PeerID] {
-        endpointSessions.keys.map(\.peerID)
+        connectedEndpointPeers
     }
 
     public var connectedPeerEndpoints: [PeerEndpoint] {
-        endpointSessions.values.map(\.connection.endpoint)
+        sessions.values.compactMap {
+            $0.role == .endpoint ? $0.connection.endpoint : nil
+        }
     }
 
     public var knownPeerEndpoints: [PeerEndpoint] {
         router.allPeers().map(\.endpoint)
     }
 
-    public var peerConnectionCount: Int { endpointSessions.count }
+    public var peerConnectionCount: Int {
+        sessions.values.lazy.filter { $0.role == .endpoint }.count
+    }
 
     // MARK: - Connection Management
 
     public func connect(to endpoint: PeerEndpoint) async throws {
-        guard try await connectEndpointIfAdmitted(to: endpoint, allowRelayFallback: true) else {
+        guard let key = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
+        reconnectSuppressed.remove(key.peerID)
+        guard try await connectEndpointIfAdmitted(to: [endpoint]) else {
+            if outgoingDials[key.peerID] != nil { throw IvyError.connectionInProgress }
             throw IvyError.identityVerificationFailed
         }
     }
 
     func connectEndpointIfAdmitted(
-        to endpoint: PeerEndpoint,
-        allowRelayFallback: Bool,
+        to routes: [PeerEndpoint],
         requiredGeneration: UInt64? = nil
     ) async throws -> Bool {
+        guard let endpoint = routes.first else { throw IvyError.invalidPeerKey }
         guard let key = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
+        guard routes.allSatisfy({ (try? PeerKey($0.publicKey)) == key }) else {
+            throw IvyError.invalidPeerKey
+        }
         guard config.allowsEndpoint(key) else { throw IvyError.peerOutsideMode }
-        guard running else { throw IvyError.notRunning }
+        guard running, !Task.isCancelled else { throw IvyError.notRunning }
         let generation = runGeneration
         if let requiredGeneration, requiredGeneration != generation {
             throw IvyError.notRunning
         }
-        if endpointSessions[key] != nil { return true }
-        guard reserveOutgoingDial(to: endpoint) else {
-            return endpointSessions[key] != nil
-        }
-
-        let connection: PeerConnection
-        do {
-            let canonical = PeerEndpoint(
-                publicKey: key.hex,
-                host: endpoint.host,
-                port: endpoint.port)
-#if DEBUG || IVY_TESTING
-            let rewritten = dialEndpointRewriteForTesting?(canonical) ?? canonical
-            let dialEndpoint = PeerEndpoint(
-                publicKey: key.hex,
-                host: rewritten.host,
-                port: rewritten.port)
-#else
-            let dialEndpoint = canonical
-#endif
-            connection = try await PeerConnection.dial(
-                endpoint: dialEndpoint,
-                group: group,
-                inboundByteBudget: inboundByteBudget)
-        } catch {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
-            guard isCurrentRun(generation) else { throw IvyError.notRunning }
-            if allowRelayFallback {
-                try await connectViaRelay(to: endpoint, requiredGeneration: generation)
-                return true
+        for route in routes {
+            do {
+                if try await connectDirect(
+                    to: route,
+                    key: key,
+                    role: .endpoint,
+                    generation: generation
+                ) {
+                    return true
+                }
+                return false
+            } catch {
+                guard !Task.isCancelled,
+                      isCurrentRun(generation),
+                      !reconnectSuppressed.contains(key.peerID) else {
+                    throw CancellationError()
+                }
             }
-            throw error
         }
-        guard isCurrentRun(generation) else {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
-            connection.cancel()
-            throw IvyError.notRunning
-        }
-
-        Task { await self.handleInbound(connection) }
-        let authenticated = await authenticateInitiator(
-            connection,
-            expected: key,
-            routeBinding: Self.directRouteBinding)
-        finishOutgoingDial(to: key.peerID, generation: generation, connected: authenticated)
-        guard isCurrentRun(generation) else {
-            connection.cancel()
-            throw IvyError.notRunning
-        }
-        guard authenticated else {
-            connection.cancel()
-            if allowRelayFallback {
-                try await connectViaRelay(to: endpoint, requiredGeneration: generation)
-                return true
-            }
-            throw IvyError.identityVerificationFailed
-        }
+        try await connectViaRelay(to: endpoint, requiredGeneration: generation)
         return true
     }
 
@@ -465,53 +483,110 @@ public actor Ivy {
         guard let key = try? PeerKey(endpoint.publicKey), config.isConfiguredCarrier(key) else {
             throw IvyError.peerOutsideMode
         }
-        guard running else { throw IvyError.notRunning }
+        guard running, !Task.isCancelled else { throw IvyError.notRunning }
         let generation = runGeneration
-        if carrierSessions[key] != nil { return }
-        guard reserveOutgoingDial(to: endpoint) else {
-            if carrierSessions[key] != nil { return }
-            throw IvyError.identityVerificationFailed
-        }
-
-        let connection: PeerConnection
-        do {
-            connection = try await PeerConnection.dial(
-                endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port),
-                group: group,
-                inboundByteBudget: inboundByteBudget)
-        } catch {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
-            throw error
-        }
-        guard isCurrentRun(generation) else {
-            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
-            connection.cancel()
-            throw IvyError.notRunning
-        }
-
-        Task { await self.handleInbound(connection) }
-        let authenticated = await authenticateInitiator(
-            connection,
-            expected: key,
-            routeBinding: Self.directRouteBinding)
-        finishOutgoingDial(to: key.peerID, generation: generation, connected: authenticated)
-        guard authenticated else {
-            connection.cancel()
+        guard try await connectDirect(
+            to: endpoint,
+            key: key,
+            role: .carrier,
+            generation: generation
+        ) else {
             throw IvyError.identityVerificationFailed
         }
     }
 
+    private func connectDirect(
+        to endpoint: PeerEndpoint,
+        key: PeerKey,
+        role: AuthenticatedPeerRole,
+        generation: UInt64
+    ) async throws -> Bool {
+        guard !reconnectSuppressed.contains(key.peerID) else { return false }
+        if sessions[key]?.role == role,
+           sessions[key]?.connection.isLive == true { return true }
+        guard reserveOutgoingDial(to: endpoint) else {
+            return sessions[key]?.role == role && sessions[key]?.connection.isLive == true
+        }
+
+        let canonical = PeerEndpoint(
+            publicKey: key.hex,
+            host: endpoint.host,
+            port: endpoint.port)
+#if DEBUG || IVY_TESTING
+        let rewritten = role == .endpoint
+            ? dialEndpointRewriteForTesting?(canonical) ?? canonical
+            : canonical
+#else
+        let rewritten = canonical
+#endif
+        let connection: PeerConnection
+        do {
+            connection = try await PeerConnection.dial(
+                endpoint: PeerEndpoint(
+                    publicKey: key.hex,
+                    host: rewritten.host,
+                    port: rewritten.port),
+                group: group,
+                inboundByteBudget: inboundByteBudget)
+        } catch {
+            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            guard !Task.isCancelled,
+                  isCurrentRun(generation),
+                  !reconnectSuppressed.contains(key.peerID) else {
+                throw CancellationError()
+            }
+            throw error
+        }
+        guard bindOutgoingDial(
+            to: key.peerID,
+            generation: generation,
+            connection: connection
+        ) else {
+            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            connection.cancel()
+            return false
+        }
+        guard !Task.isCancelled,
+              isCurrentRun(generation),
+              outgoingDials[key.peerID]?.generation == generation,
+              outgoingDials[key.peerID]?.cancelled == false,
+              !reconnectSuppressed.contains(key.peerID) else {
+            finishOutgoingDial(to: key.peerID, generation: generation, connected: false)
+            connection.cancel()
+            throw CancellationError()
+        }
+
+        startInboundTask(connection)
+        let authenticated = await authenticateInitiator(
+            connection,
+            expected: key,
+            routeBinding: Self.directRouteBinding)
+        let connected = finishOutgoingDial(
+            to: key.peerID,
+            generation: generation,
+            connected: authenticated)
+        guard isCurrentRun(generation) else {
+            connection.cancel()
+            throw IvyError.notRunning
+        }
+        guard connected else {
+            connection.cancel()
+            guard !Task.isCancelled, !reconnectSuppressed.contains(key.peerID) else {
+                throw CancellationError()
+            }
+            throw IvyError.identityVerificationFailed
+        }
+        return true
+    }
+
     func reserveOutgoingDial(to endpoint: PeerEndpoint) -> Bool {
         guard let key = try? PeerKey(endpoint.publicKey),
-              authenticatedSession(for: key) == nil,
+              sessions[key] == nil,
               outgoingDials[key.peerID] == nil,
               connectionCapacityUsed < config.maxConnections else { return false }
 
         let targetGroup = NetGroup.group(endpoint.host)
-        let pendingInGroup = outgoingDials.values.filter {
-            NetGroup.group($0.endpoint.host) == targetGroup
-        }.count
-        guard connectionCount(inNetgroup: targetGroup, excluding: key.peerID) + pendingInGroup
+        guard directConnectionCount(inNetgroup: targetGroup)
                 < config.maxConnectionsPerNetgroup else {
             return false
         }
@@ -522,22 +597,66 @@ public actor Ivy {
         return true
     }
 
-    func finishOutgoingDial(to peer: PeerID, generation: UInt64, connected: Bool) {
-        guard outgoingDials[peer]?.generation == generation else { return }
+    private func bindOutgoingDial(
+        to peer: PeerID,
+        generation: UInt64,
+        connection: PeerConnection
+    ) -> Bool {
+        guard var dial = outgoingDials[peer], dial.generation == generation else { return false }
+        dial.connectionID = connection.connectionID
+        if let host = connection.observedHost, !host.isEmpty {
+            dial.endpoint = PeerEndpoint(
+                publicKey: dial.endpoint.publicKey,
+                host: host,
+                port: dial.endpoint.port)
+        }
+        outgoingDials[peer] = dial
+        return directConnectionCount(inNetgroup: NetGroup.group(dial.endpoint.host))
+            <= config.maxConnectionsPerNetgroup
+    }
+
+    @discardableResult
+    func finishOutgoingDial(to peer: PeerID, generation: UInt64, connected: Bool) -> Bool {
+        guard outgoingDials[peer]?.generation == generation else { return false }
         outgoingDials.removeValue(forKey: peer)
-        if connected {
+        let key = try? PeerKey(peer.publicKey)
+        let ownsCurrentSession = connected
+            && isCurrentRun(generation)
+            && key.flatMap({ sessions[$0] })?.connection.isLive == true
+        if ownsCurrentSession {
             reconnectAttempts.removeValue(forKey: peer)
             reconnectTasks.removeValue(forKey: peer)?.task.cancel()
+            return true
         }
+        if running, let key {
+            let role: AuthenticatedPeerRole = config.isConfiguredCarrier(key) ? .carrier : .endpoint
+            if !configuredEndpoints(for: key, role: role).isEmpty {
+                scheduleReconnect(peer: peer, role: role, generation: runGeneration)
+            }
+        }
+        return false
     }
 
     public func disconnect(_ peer: PeerID) {
         guard let key = try? PeerKey(peer.publicKey) else { return }
+        reconnectSuppressed.insert(key.peerID)
         reconnectTasks.removeValue(forKey: key.peerID)?.task.cancel()
         reconnectAttempts.removeValue(forKey: key.peerID)
-        guard let session = authenticatedSession(for: key) else { return }
-        teardownAuthenticatedSession(session, reconnect: false)
-        session.connection.cancel()
+        if var dial = outgoingDials[key.peerID] {
+            dial.cancelled = true
+            outgoingDials[key.peerID] = dial
+        }
+        let pendingIDs = pendingSessions.compactMap { connectionID, pending -> UUID? in
+            guard case .initiator(let expected, _) = pending.direction,
+                  expected == key else { return nil }
+            return connectionID
+        }
+        for connectionID in pendingIDs { failPendingSession(connectionID) }
+        removeRoutes(involving: key)
+        if let session = sessions[key] {
+            teardownAuthenticatedSession(session, reconnect: false)
+            session.connection.cancel()
+        }
     }
 
     private func disconnectStale(
@@ -547,36 +666,29 @@ public actor Ivy {
     ) {
         guard isCurrentRun(generation),
               let key = try? PeerKey(peer.publicKey),
-              let session = authenticatedSession(for: key),
+              let session = sessions[key],
               session.sessionID == sessionID else { return }
         teardownAuthenticatedSession(session, reconnect: true)
         session.connection.cancel()
     }
 
     private func scheduleReconnect(
-        to endpoint: PeerEndpoint,
         peer: PeerID,
         role: AuthenticatedPeerRole,
         generation: UInt64
     ) {
         guard let key = try? PeerKey(peer.publicKey),
               isCurrentRun(generation),
-              authenticatedSession(for: key) == nil,
+              !reconnectSuppressed.contains(peer),
+              sessions[key] == nil,
               outgoingDials[peer] == nil,
               reconnectTasks[peer] == nil else { return }
 
         let delay = reconnectDelay(for: peer)
         nextReconnectToken &+= 1
         let token = nextReconnectToken
-        let task = Task { [weak self] in
-            do {
-                try await Task.sleep(for: delay)
-            } catch {
-                return
-            }
-            guard let self else { return }
-            await self.runScheduledReconnect(
-                to: endpoint,
+        let task = delayedTask(after: delay) { [weak self] in
+            await self?.runScheduledReconnect(
                 peer: peer,
                 role: role,
                 generation: generation,
@@ -598,7 +710,6 @@ public actor Ivy {
     }
 
     func runScheduledReconnect(
-        to endpoint: PeerEndpoint,
         peer: PeerID,
         role: AuthenticatedPeerRole,
         generation: UInt64,
@@ -607,55 +718,78 @@ public actor Ivy {
         guard reconnectTasks[peer]?.generation == generation,
               reconnectTasks[peer]?.token == token else { return }
         reconnectTasks.removeValue(forKey: peer)
-        guard isCurrentRun(generation) else { return }
-        await maintainConfiguredConnection(to: endpoint, role: role, generation: generation)
+        guard isCurrentRun(generation),
+              !reconnectSuppressed.contains(peer),
+              let key = try? PeerKey(peer.publicKey) else { return }
+        await maintainConfiguredConnection(peer: key, role: role, generation: generation)
     }
 
     private func maintainConfiguredConnection(
-        to endpoint: PeerEndpoint,
+        peer key: PeerKey,
         role: AuthenticatedPeerRole,
         generation: UInt64
     ) async {
-        guard isCurrentRun(generation), let key = try? PeerKey(endpoint.publicKey) else { return }
-        do {
-            if role == .carrier {
-                try await connectCarrier(to: endpoint)
-            } else {
-                try await connect(to: endpoint)
+        guard isCurrentRun(generation), !reconnectSuppressed.contains(key.peerID) else { return }
+        let endpoints = configuredEndpoints(for: key, role: role)
+        if role == .endpoint {
+            if (try? await connectEndpointIfAdmitted(
+                to: endpoints,
+                requiredGeneration: generation)) == true {
+                return
             }
-        } catch {
-            scheduleReconnect(
-                to: endpoint,
-                peer: key.peerID,
-                role: role,
-                generation: generation)
+        } else {
+            for endpoint in endpoints {
+                guard isCurrentRun(generation),
+                      !Task.isCancelled,
+                      sessions[key]?.connection.isLive != true else { return }
+                do {
+                    try await connectCarrier(to: endpoint)
+                    return
+                } catch {
+                    if Task.isCancelled { return }
+                }
+            }
         }
+        scheduleReconnect(peer: key.peerID, role: role, generation: generation)
     }
 
     // MARK: - Session Authentication
 
-    private var connectionCapacityUsed: Int {
-        var representedDials = Set(authenticatedConnections.values.map { $0.0.peerID })
-        for pending in pendingSessions.values {
-            if case .initiator(let expected, _) = pending.direction {
-                representedDials.insert(expected.peerID)
-            }
+    private var unrepresentedOutgoingDials: [PendingOutgoingDial] {
+        let represented = Set(pendingSessions.keys).union(
+            sessions.values.map(\.connection.connectionID))
+        return outgoingDials.values.filter { dial in
+            guard let connectionID = dial.connectionID else { return true }
+            return !represented.contains(connectionID)
         }
-        let reservedOnly = outgoingDials.keys.lazy.filter { !representedDials.contains($0) }.count
-        return authenticatedConnections.count + pendingSessions.count + reservedOnly
+    }
+
+    private var connectionCapacityUsed: Int {
+        sessions.count + pendingSessions.count + unrepresentedOutgoingDials.count
+    }
+
+    private func directConnectionCount(inNetgroup group: String) -> Int {
+        let authenticated = sessions.values.lazy.filter {
+            $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
+        }.count
+        let pending = pendingSessions.values.lazy.filter {
+            $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
+        }.count
+        let reserved = unrepresentedOutgoingDials.lazy.filter {
+            NetGroup.group($0.endpoint.host) == group
+        }.count
+        return authenticated + pending + reserved
     }
 
     @discardableResult
     func registerInboundConnection(_ connection: PeerConnection, generation: UInt64) -> Bool {
         let netgroup = connectionNetgroup(connection)
-        let pendingInNetgroup = pendingSessions.values.lazy.filter {
-            $0.connection.isDirect && self.connectionNetgroup($0.connection) == netgroup
-        }.count
         guard isCurrentRun(generation),
               connection.isLive,
               connectionCapacityUsed < config.maxConnections,
-              connectionCount(inNetgroup: netgroup, excluding: nil) + pendingInNetgroup
-                < config.maxConnectionsPerNetgroup else {
+              (!connection.isDirect
+                || directConnectionCount(inNetgroup: netgroup)
+                    < config.maxConnectionsPerNetgroup) else {
             connection.cancel()
             return false
         }
@@ -664,7 +798,7 @@ public actor Ivy {
             connection: connection,
             direction: .responder,
             generation: generation)
-        Task { await self.handleInbound(connection) }
+        startInboundTask(connection)
         schedulePendingTimeout(connection.connectionID, generation: generation)
         return true
     }
@@ -685,31 +819,60 @@ public actor Ivy {
             return false
         }
 
+        let generation = runGeneration
         pendingSessions[connection.connectionID] = PendingSession(
             connection: connection,
             direction: .initiator(expected: expected, routeBinding: routeBinding),
-            generation: runGeneration,
+            generation: generation,
             helloInitiator: signed)
 
-        return await withCheckedContinuation { continuation in
-            authenticationWaiters[connection.connectionID] = continuation
-            guard sendSessionRecord(.helloInitiator(signed), on: connection) else {
-                failPendingSession(connection.connectionID)
-                return
+        let authenticated = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard var pending = pendingSessions[connection.connectionID] else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                pending.continuation = continuation
+                pendingSessions[connection.connectionID] = pending
+                guard case .sent = sendSessionRecord(.helloInitiator(signed), on: connection) else {
+                    failPendingSession(connection.connectionID)
+                    return
+                }
+                schedulePendingTimeout(connection.connectionID, generation: generation)
             }
-            schedulePendingTimeout(connection.connectionID, generation: runGeneration)
+        } onCancel: { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            Task {
+                await self.cancelAuthentication(
+                    connection.connectionID,
+                    generation: generation)
+            }
         }
+        if Task.isCancelled {
+            cancelAuthentication(connection.connectionID, generation: generation)
+            return false
+        }
+        return authenticated
+    }
+
+    private func cancelAuthentication(_ connectionID: UUID, generation: UInt64) {
+        if pendingSessions[connectionID]?.generation == generation {
+            failPendingSession(connectionID)
+            return
+        }
+        guard let session = session(for: connectionID) else { return }
+        teardownAuthenticatedSession(session, reconnect: true)
+        session.connection.cancel()
     }
 
     private func schedulePendingTimeout(_ connectionID: UUID, generation: UInt64) {
-        Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(30))
-            } catch {
-                return
-            }
+        guard var pending = pendingSessions[connectionID],
+              pending.generation == generation else { return }
+        pending.timeoutTask?.cancel()
+        pending.timeoutTask = delayedTask(after: .seconds(30)) { [weak self] in
             await self?.timeoutPendingSession(connectionID, generation: generation)
         }
+        pendingSessions[connectionID] = pending
     }
 
     private func timeoutPendingSession(_ connectionID: UUID, generation: UInt64) {
@@ -720,17 +883,26 @@ public actor Ivy {
 
     private func failPendingSession(_ connectionID: UUID) {
         guard let pending = pendingSessions.removeValue(forKey: connectionID) else { return }
-        authenticationWaiters.removeValue(forKey: connectionID)?.resume(returning: false)
+        pending.timeoutTask?.cancel()
+        pending.continuation?.resume(returning: false)
         removeRouteConnection(pending.connection)
         pending.connection.cancel()
     }
 
-    private func handleInbound(_ connection: PeerConnection) async {
-        for await frame in connection.records {
-            await handleSessionRecord(frame.bytes, on: connection)
-            withExtendedLifetime(frame) {}
+    private func startInboundTask(_ connection: PeerConnection) {
+        let records = connection.records
+        let task = Task { [weak self, weak connection] in
+            for await frame in records {
+                guard let self, let connection else { return }
+                await self.handleSessionRecord(frame.bytes, on: connection)
+                withExtendedLifetime(frame) {}
+            }
         }
-        connectionEnded(connection)
+        connection.installCloseHandler { [weak self, weak connection] in
+            task.cancel()
+            guard let self, let connection else { return }
+            Task { await self.connectionEnded(connection) }
+        }
     }
 
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
@@ -742,8 +914,7 @@ public actor Ivy {
             return
         }
 
-        if let authority = authenticatedConnections[connection.connectionID],
-           let session = sessionForAuthority(authority),
+        if let session = session(for: connection.connectionID),
            session.connection === connection {
             guard case .data(let dataRecord) = record else {
                 rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
@@ -761,10 +932,6 @@ public actor Ivy {
             return
         }
         await handlePendingRecord(record, on: connection)
-    }
-
-    private func sessionForAuthority(_ authority: (PeerKey, AuthenticatedPeerRole)) -> AuthenticatedSession? {
-        authority.1 == .endpoint ? endpointSessions[authority.0] : carrierSessions[authority.0]
     }
 
     private func handlePendingRecord(_ record: SessionWireRecord, on connection: PeerConnection) async {
@@ -804,7 +971,7 @@ public actor Ivy {
             pending.remoteKey = signed.hello.initiator
             pending.remoteMetadata = remoteMetadata
             pendingSessions[connection.connectionID] = pending
-            guard sendSessionRecord(.helloResponder(signedResponder), on: connection) else {
+            guard case .sent = sendSessionRecord(.helloResponder(signedResponder), on: connection) else {
                 failPendingSession(connection.connectionID)
                 return
             }
@@ -835,7 +1002,7 @@ public actor Ivy {
             pending.remoteKey = expected
             pending.remoteMetadata = remoteMetadata
             pendingSessions[connection.connectionID] = pending
-            guard sendSessionRecord(.finish(finish), on: connection) else {
+            guard case .sent = sendSessionRecord(.finish(finish), on: connection) else {
                 failPendingSession(connection.connectionID)
                 return
             }
@@ -881,25 +1048,32 @@ public actor Ivy {
     }
 
     private func localMetadata(for connection: PeerConnection) -> PeerMetadata {
+        PeerMetadata(listenAddresses: advertisedListenAddresses(
+            observedLocalHost: connection.channel?.localAddress?.ipAddress))
+    }
+
+    func advertisedListenAddresses(observedLocalHost: String?) -> [ListenAddress] {
         var addresses: [ListenAddress] = []
         if let external = config.externalAddress {
             addresses.append(ListenAddress(host: external.host, port: external.port))
         } else {
-            if let publicAddress {
-                addresses.append(ListenAddress(host: publicAddress.host, port: publicAddress.port))
+            if let publicAddress, config.listenPort != 0 {
+                addresses.append(ListenAddress(host: publicAddress.host, port: config.listenPort))
             }
-            if let localHost = connection.channel?.localAddress?.ipAddress,
+            if config.listenPort != 0,
+               let localHost = observedLocalHost,
                localHost != "0.0.0.0", localHost != "::" {
                 addresses.append(ListenAddress(host: localHost, port: config.listenPort))
             }
         }
-        return PeerMetadata(listenAddresses: addresses)
+        return addresses
     }
 
     private func promotePendingSession(_ pending: PendingSession) async {
         let connectionID = pending.connection.connectionID
         guard isCurrentRun(pending.generation),
               pendingSessions[connectionID]?.generation == pending.generation,
+              pending.connection.isLive,
               let peerKey = pending.remoteKey,
               let metadata = pending.remoteMetadata,
               let sessionID = pending.sessionID,
@@ -907,7 +1081,7 @@ public actor Ivy {
             failPendingSession(connectionID)
             return
         }
-        pendingSessions.removeValue(forKey: connectionID)
+        pendingSessions.removeValue(forKey: connectionID)?.timeoutTask?.cancel()
 
         // Role is local policy: configured carrier identities stay carrier-only.
         let role: AuthenticatedPeerRole = config.isConfiguredCarrier(peerKey) ? .carrier : .endpoint
@@ -918,24 +1092,19 @@ public actor Ivy {
             role: role,
             sessionID: sessionID,
             metadata: metadata)
-        let existing = role == .endpoint ? endpointSessions[peerKey] : carrierSessions[peerKey]
+        let existing = sessions[peerKey]
 
         if let existing,
            existing.connection.isLive,
            existing.sessionID == Self.preferredSessionID(existing.sessionID, sessionID) {
-            authenticationWaiters.removeValue(forKey: connectionID)?.resume(returning: true)
+            pending.continuation?.resume(returning: true)
             removeRouteConnection(pending.connection)
             pending.connection.cancel()
             return
         }
 
-        if existing == nil,
-           (authenticatedConnections.count >= config.maxConnections
-            || (pending.connection.isDirect
-                && connectionCount(
-                    inNetgroup: connectionNetgroup(pending.connection),
-                    excluding: peerKey.peerID) >= config.maxConnectionsPerNetgroup)) {
-            authenticationWaiters.removeValue(forKey: connectionID)?.resume(returning: false)
+        if !canPromote(pending.connection, peerKey: peerKey) {
+            pending.continuation?.resume(returning: false)
             removeRouteConnection(pending.connection)
             pending.connection.cancel()
             return
@@ -943,13 +1112,20 @@ public actor Ivy {
 
         if let existing {
             session.didNotifyConnect = existing.didNotifyConnect
-            authenticatedConnections.removeValue(forKey: existing.connection.connectionID)
+            if existing.role == .endpoint {
+                router.removePeer(peerKey.peerID)
+                cleanupPendingForPeer(peerKey.peerID)
+            }
+            removeRoutes(involving: peerKey, preserving: pending.connection)
             existing.connection.cancel()
         }
 
-        authenticatedConnections[connectionID] = (peerKey, role)
+        sessions[peerKey] = session
+        if !reconnectSuppressed.contains(peerKey.peerID) {
+            reconnectAttempts.removeValue(forKey: peerKey.peerID)
+            reconnectTasks.removeValue(forKey: peerKey.peerID)?.task.cancel()
+        }
         if role == .endpoint {
-            endpointSessions[peerKey] = session
             let route: PeerEndpoint?
             if let endpoint = firstAdvertisedListenEndpoint(
                 key: peerKey,
@@ -971,15 +1147,14 @@ public actor Ivy {
                 pending.connection.endpoint = route
                 router.addPeer(peerKey.peerID, endpoint: route)
             }
-        } else {
-            carrierSessions[peerKey] = session
         }
         pending.connection.releaseInboundAdmission()
 
+#if DEBUG || IVY_TESTING
+        promotionHookForTesting?(pending.connection)
+#endif
         await healthMonitor?.trackPeer(peerKey.peerID, sessionID: session.sessionID)
-        if isCurrent(session),
-           session.connection.isLive,
-           !session.didNotifyConnect {
+        if isCurrent(session), session.connection.isLive, !session.didNotifyConnect {
             session.didNotifyConnect = true
             delegate?.ivy(self, didConnect: AuthenticatedPeer(
                 key: peerKey,
@@ -987,7 +1162,24 @@ public actor Ivy {
                 route: pending.connection.route,
                 metadata: metadata))
         }
-        authenticationWaiters.removeValue(forKey: connectionID)?.resume(returning: true)
+        if isCurrent(session), !session.connection.isLive {
+            teardownAuthenticatedSession(session, reconnect: true)
+        }
+        let selected = sessions[peerKey]
+        pending.continuation?.resume(returning: selected?.connection.isLive == true)
+    }
+
+    private func canPromote(
+        _ connection: PeerConnection,
+        peerKey: PeerKey
+    ) -> Bool {
+        if sessions[peerKey] == nil, sessions.count >= config.maxConnections {
+            return false
+        }
+        return !connection.isDirect
+            || connectionCount(
+                inNetgroup: connectionNetgroup(connection),
+                excluding: peerKey.peerID) < config.maxConnectionsPerNetgroup
     }
 
     private func firstAdvertisedListenEndpoint(
@@ -1009,8 +1201,7 @@ public actor Ivy {
     }
 
     private func rejectRecord(on connection: PeerConnection) {
-        if let authority = authenticatedConnections[connection.connectionID],
-           let session = sessionForAuthority(authority) {
+        if let session = session(for: connection.connectionID) {
             rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
                 session.peerKey,
                 direct: session.connection.isDirect,
@@ -1036,8 +1227,7 @@ public actor Ivy {
             failPendingSession(connection.connectionID)
             return
         }
-        guard let authority = authenticatedConnections[connection.connectionID],
-              let session = sessionForAuthority(authority),
+        guard let session = session(for: connection.connectionID),
               session.connection === connection else {
             removeRouteConnection(connection)
             return
@@ -1050,17 +1240,13 @@ public actor Ivy {
         reconnect: Bool
     ) {
         let key = session.peerKey
+        guard sessions[key] === session else { return }
+        sessions.removeValue(forKey: key)
         if session.role == .endpoint {
-            guard endpointSessions[key] === session else { return }
-            endpointSessions.removeValue(forKey: key)
             router.removePeer(key.peerID)
             cleanupPendingForPeer(key.peerID)
-        } else {
-            guard carrierSessions[key] === session else { return }
-            carrierSessions.removeValue(forKey: key)
         }
 
-        authenticatedConnections.removeValue(forKey: session.connection.connectionID)
         removeRoutes(involving: key)
         if let monitor = healthMonitor {
             let peer = key.peerID
@@ -1075,32 +1261,52 @@ public actor Ivy {
 
         guard reconnect,
               running,
-              let endpoint = configuredReconnectEndpoint(for: key, role: session.role) else { return }
-        scheduleReconnect(
-            to: endpoint,
-            peer: key.peerID,
-            role: session.role,
-            generation: runGeneration)
+              !configuredEndpoints(for: key, role: session.role).isEmpty else { return }
+        scheduleReconnect(peer: key.peerID, role: session.role, generation: runGeneration)
     }
 
-    private func configuredReconnectEndpoint(
+    private func configuredEndpoints(
         for key: PeerKey,
         role: AuthenticatedPeerRole
-    ) -> PeerEndpoint? {
+    ) -> [PeerEndpoint] {
         let endpoints = role == .carrier ? config.carriers : config.bootstrapPeers
-        return endpoints.first { (try? PeerKey($0.publicKey)) == key }
+        return endpoints.filter { (try? PeerKey($0.publicKey)) == key }
     }
 
-    private func removeRoutes(involving key: PeerKey) {
+    private func configuredPeerKeys(role: AuthenticatedPeerRole) -> [PeerKey] {
+        let endpoints = role == .carrier ? config.carriers : config.bootstrapPeers
+        var seen: Set<PeerKey> = []
+        return endpoints.compactMap { endpoint in
+            guard let key = try? PeerKey(endpoint.publicKey), seen.insert(key).inserted else {
+                return nil
+            }
+            return key
+        }
+    }
+
+    private func removeRoutes(
+        involving key: PeerKey,
+        preserving connection: PeerConnection? = nil
+    ) {
+        let preservedRouteID: Data?
+        if let connection, case .relayed(let routeID, _) = connection.transport {
+            preservedRouteID = routeID
+        } else {
+            preservedRouteID = nil
+        }
         let serviceRouteIDs = relayRoutes.compactMap { routeID, route in
-            route.source == key || route.target == key ? routeID : nil
+            routeID != preservedRouteID && (route.source == key || route.target == key)
+                ? routeID
+                : nil
         }
         for routeID in serviceRouteIDs {
             closeRelayRoute(routeID, excluding: key)
         }
 
         let installedRouteIDs = installedRoutes.compactMap { routeID, route in
-            route.carrier == key || route.remote == key ? routeID : nil
+            routeID != preservedRouteID && (route.carrier == key || route.remote == key)
+                ? routeID
+                : nil
         }
         for routeID in installedRouteIDs {
             guard let route = installedRoutes[routeID] else { continue }
@@ -1108,16 +1314,18 @@ public actor Ivy {
         }
 
         let requestIDs = pendingRelayOpens.compactMap { requestID, request in
-            request.carrier == key || request.target == key ? requestID : nil
+            requestID != preservedRouteID && (request.carrier == key || request.target == key)
+                ? requestID
+                : nil
         }
         for requestID in requestIDs {
-            pendingRelayOpens.removeValue(forKey: requestID)?.continuation.resume(returning: nil)
+            timeoutRelayOpen(requestID)
         }
     }
 
     private func removeRouteConnection(_ connection: PeerConnection) {
         guard case .relayed(let routeID, _) = connection.transport,
-              routeConnections[routeID] === connection else { return }
+              installedRoutes[routeID]?.connection === connection else { return }
         closeInstalledRoute(routeID, notifyCarrier: true)
     }
 
@@ -1126,7 +1334,7 @@ public actor Ivy {
         for participant in [route.source, route.target] where participant != excluded {
             _ = sendRelayControl(.relayClose(routeID: routeID), to: participant)
         }
-        relayRoutes.removeValue(forKey: routeID)
+        relayRoutes.removeValue(forKey: routeID)?.expiryTask?.cancel()
     }
 
     private func closeInstalledRoute(_ routeID: Data, notifyCarrier: Bool) {
@@ -1135,8 +1343,14 @@ public actor Ivy {
             _ = sendRelayControl(.relayClose(routeID: routeID), to: route.carrier)
         }
         installedRoutes.removeValue(forKey: routeID)
-        let connection = routeConnections.removeValue(forKey: routeID)
-        connection?.cancel()
+        route.expiryTask?.cancel()
+        route.connection?.cancel()
+    }
+
+    private func removePendingRelayOpen(_ routeID: Data) -> PendingRelayOpen? {
+        let pending = pendingRelayOpens.removeValue(forKey: routeID)
+        pending?.timeoutTask?.cancel()
+        return pending
     }
 
     // MARK: - Signed Sending
@@ -1147,8 +1361,8 @@ public actor Ivy {
 
     public func broadcastMessage(topic: String, payload: Data) {
         let message = Message.peerMessage(topic: topic, payload: payload)
-        for key in endpointSessions.keys {
-            _ = enqueueEndpoint(message, to: key.peerID)
+        for session in sessions.values where session.role == .endpoint {
+            _ = enqueue(message, on: session, bypassAdmission: false)
         }
     }
 
@@ -1159,16 +1373,17 @@ public actor Ivy {
         bypassAdmission: Bool = false
     ) -> SendMessageResult {
         guard let key = try? PeerKey(peer.publicKey) else { return .notConnected }
-        if let session = endpointSessions[key] {
+        if let session = endpointSession(for: key) {
             return enqueue(message, on: session, bypassAdmission: bypassAdmission)
-        } else if message.isKeepalive, let session = carrierSessions[key] {
+        } else if message.isKeepalive, let session = carrierSession(for: key) {
             return enqueue(message, on: session, bypassAdmission: true)
         }
         return .notConnected
     }
 
     private func enqueueEndpoint(_ message: Message, to peer: PeerID) -> SendMessageResult {
-        guard let key = try? PeerKey(peer.publicKey), let session = endpointSessions[key] else {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = endpointSession(for: key) else {
             return .notConnected
         }
         return enqueue(message, on: session, bypassAdmission: false)
@@ -1193,21 +1408,26 @@ public actor Ivy {
         on session: AuthenticatedSession,
         bypassAdmission: Bool
     ) -> SendMessageResult {
+        guard isCurrent(session) else { return .notConnected }
         guard bypassAdmission || tally.shouldAllow(peer: session.peerKey.peerID) else {
             return .locallyRejected
         }
-        guard let sequence = session.sequenceState.takeNextOutgoing() else { return .locallyRejected }
+        var sequenceState = session.sequenceState
+        guard let sequence = sequenceState.takeNextOutgoing() else { return .locallyRejected }
         guard let record = try? SessionDataRecord.sign(
             sessionID: session.sessionID,
             sender: localKey,
             receiver: session.peerKey,
             sequence: sequence,
             payload: payload,
-            with: config.signingKey),
-              !SessionWireRecord.data(record).serialize().isEmpty else {
+            with: config.signingKey) else { return .locallyRejected }
+        let sendResult = sendSessionRecord(.data(record), on: session.connection)
+        switch sendResult {
+        case .sent:
+            session.sequenceState = sequenceState
+        case .locallyRejected:
             return .locallyRejected
-        }
-        guard sendSessionRecord(.data(record), on: session.connection) else {
+        case .notConnected:
             return .notConnected
         }
 
@@ -1226,33 +1446,57 @@ public actor Ivy {
     }
 
     private func sendRelayControl(_ message: Message, to key: PeerKey) -> Bool {
+        if case .sent = sendRelayControlResult(message, to: key) { return true }
+        return false
+    }
+
+    private func sendRelayControlResult(
+        _ message: Message,
+        to key: PeerKey
+    ) -> SessionRecordSendResult {
         let session: AuthenticatedSession?
-        if let carrier = carrierSessions[key] {
+        if let carrier = carrierSession(for: key) {
             session = carrier
-        } else if let endpoint = endpointSessions[key],
+        } else if let endpoint = endpointSession(for: key),
                   endpoint.connection.isDirect,
                   endpointMayReceiveRelayControl(message, peer: key) {
             session = endpoint
         } else {
             session = nil
         }
-        guard let session else { return false }
+        guard let session else { return .notConnected }
+        switch enqueue(message, on: session, bypassAdmission: true) {
+        case .enqueued:
+            return .sent
+        case .locallyRejected:
+            return .locallyRejected
+        case .notConnected:
+            return .notConnected
+        }
+    }
+
+    private func sendRelayReply(_ message: Message, to key: PeerKey) -> Bool {
+        let session = sessions[key]
+        guard let session, session.connection.isDirect else { return false }
         if case .enqueued = enqueue(message, on: session, bypassAdmission: true) {
             return true
         }
         return false
     }
 
-    private func sendSessionRecord(_ record: SessionWireRecord, on connection: PeerConnection) -> Bool {
+    private func sendSessionRecord(
+        _ record: SessionWireRecord,
+        on connection: PeerConnection
+    ) -> SessionRecordSendResult {
+        let payload = record.serialize()
+        guard !payload.isEmpty else { return .locallyRejected }
         switch connection.transport {
         case .direct:
-            return connection.sendRecord(record)
+            return connection.sendSerializedRecord(payload) ? .sent : .notConnected
         case .relayed(let routeID, let carrier):
             guard connection.isLive,
-                  installedRoutes[routeID]?.carrier == carrier else { return false }
-            let payload = record.serialize()
-            guard !payload.isEmpty else { return false }
-            return sendRelayControl(
+                  installedRoutes[routeID]?.carrier == carrier else { return .notConnected }
+            return sendRelayControlResult(
                 .relayPacket(routeID: routeID, opaqueEndpointRecord: payload),
                 to: carrier)
         }
@@ -1339,10 +1583,6 @@ public actor Ivy {
         session: AuthenticatedSession
     ) -> Bool {
         guard session.connection.isDirect else { return false }
-        if session.role == .carrier {
-            return config.isConfiguredCarrier(session.peerKey)
-        }
-
         switch message {
         case .relayOpen:
             return config.relayEnabled
@@ -1351,13 +1591,17 @@ public actor Ivy {
             // relayed handshake still authenticates both endpoint keys.
             return true
         case .relayAccept(let routeID, _):
-            return relayRoutes[routeID]?.target == session.peerKey
+            if let route = relayRoutes[routeID] { return route.target == session.peerKey }
+            return config.relayEnabled && relayRouteIsUnknown(routeID)
         case .relayReady(let routeID, _):
             return pendingRelayOpens[routeID]?.carrier == session.peerKey
-        case .relayPacket(let routeID, _):
-            return relayParticipant(routeID, peer: session.peerKey)
-        case .relayClose(let routeID):
-            return relayCloseMatches(routeID, sender: session.peerKey)
+                || installedRoutes[routeID]?.carrier == session.peerKey
+                || (config.isConfiguredCarrier(session.peerKey)
+                    && relayRouteIsUnknown(routeID))
+        case .relayPacket(let routeID, _), .relayClose(let routeID):
+            // Unknown and late frames are idempotent, Tally-gated no-ops.
+            return relayRouteIsUnknown(routeID)
+                || relayParticipant(routeID, peer: session.peerKey)
         default:
             return false
         }
@@ -1384,6 +1628,13 @@ public actor Ivy {
             || pendingRelayOpens[routeID]?.carrier == peer
     }
 
+    private func relayRouteIsUnknown(_ routeID: Data) -> Bool {
+        routeID != Self.directRouteBinding
+            && relayRoutes[routeID] == nil
+            && installedRoutes[routeID] == nil
+            && pendingRelayOpens[routeID] == nil
+    }
+
     private func relayCloseMatches(_ routeID: Data, sender: PeerKey) -> Bool {
         if let route = relayRoutes[routeID] {
             return route.source == sender || route.target == sender
@@ -1395,6 +1646,8 @@ public actor Ivy {
     // MARK: - Relay Routes
 
     public func connectViaRelay(to endpoint: PeerEndpoint) async throws {
+        guard let key = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
+        reconnectSuppressed.remove(key.peerID)
         try await connectViaRelay(to: endpoint, requiredGeneration: runGeneration)
     }
 
@@ -1404,43 +1657,79 @@ public actor Ivy {
     ) async throws {
         guard let target = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
         guard config.allowsEndpoint(target) else { throw IvyError.peerOutsideMode }
-        guard isCurrentRun(generation) else { throw IvyError.notRunning }
-        if endpointSessions[target] != nil { return }
-        guard installedRoutes.count + pendingRelayOpens.count < Self.maxRelayRoutes else {
-            throw IvyError.noRelayAvailable
-        }
-
-        let candidates = carrierSessions.values
-            .filter { $0.connection.isDirect }
+        guard isCurrentRun(generation),
+              !Task.isCancelled,
+              !reconnectSuppressed.contains(target.peerID) else { throw IvyError.notRunning }
+        if endpointSession(for: target)?.connection.isLive == true { return }
+        let candidates = sessions.values
+            .filter { $0.role == .carrier && $0.connection.isDirect }
             .map(\.peerKey)
 
         for carrier in candidates.sorted() {
-            guard isCurrentRun(generation) else { throw IvyError.notRunning }
+            guard isCurrentRun(generation),
+                  !Task.isCancelled,
+                  !reconnectSuppressed.contains(target.peerID) else {
+                throw CancellationError()
+            }
             guard let routeID = await requestRelayRoute(
                 target: target,
                 via: carrier,
                 generation: generation) else {
                 continue
             }
-            guard isCurrentRun(generation) else { throw IvyError.notRunning }
-            let connection = makeRelayedConnection(
-                endpoint: PeerEndpoint(publicKey: target.hex, host: endpoint.host, port: endpoint.port),
+            guard isCurrentRun(generation),
+                  !Task.isCancelled,
+                  !reconnectSuppressed.contains(target.peerID) else {
+                closeInstalledRoute(routeID, notifyCarrier: true)
+                throw CancellationError()
+            }
+            guard let connection = openInstalledRouteConnection(
+                endpoint: PeerEndpoint(
+                    publicKey: target.hex,
+                    host: endpoint.host,
+                    port: endpoint.port),
+                target: target,
                 routeID: routeID,
-                carrier: carrier)
-            routeConnections[routeID] = connection
-            Task { await self.handleInbound(connection) }
+                carrier: carrier) else {
+                closeInstalledRoute(routeID, notifyCarrier: true)
+                continue
+            }
+            startInboundTask(connection)
             let authenticated = await authenticateInitiator(
                 connection,
                 expected: target,
                 routeBinding: routeID)
-            guard isCurrentRun(generation) else {
+            guard isCurrentRun(generation),
+                  !Task.isCancelled,
+                  !reconnectSuppressed.contains(target.peerID) else {
                 connection.cancel()
-                throw IvyError.notRunning
+                throw CancellationError()
             }
-            if authenticated { return }
+            if authenticated,
+               sessions[target]?.connection.isLive == true { return }
             closeInstalledRoute(routeID, notifyCarrier: true)
         }
         throw IvyError.noRelayAvailable
+    }
+
+    private func openInstalledRouteConnection(
+        endpoint: PeerEndpoint,
+        target: PeerKey,
+        routeID: Data,
+        carrier: PeerKey
+    ) -> PeerConnection? {
+        guard var route = installedRoutes[routeID],
+              route.carrier == carrier,
+              route.remote == target,
+              route.connection == nil,
+              connectionCapacityUsed < config.maxConnections else { return nil }
+        let connection = makeRelayedConnection(
+            endpoint: endpoint,
+            routeID: routeID,
+            carrier: carrier)
+        route.connection = connection
+        installedRoutes[routeID] = route
+        return connection
     }
 
     private func requestRelayRoute(
@@ -1448,33 +1737,53 @@ public actor Ivy {
         via carrier: PeerKey,
         generation: UInt64
     ) async -> Data? {
-        guard isCurrentRun(generation) else { return nil }
+        guard isCurrentRun(generation), !Task.isCancelled,
+              installedRoutes.count + pendingRelayOpens.count < Self.maxRelayRoutes,
+              installedRoutes.values.lazy.filter({ $0.carrier == carrier }).count
+                + pendingRelayOpens.values.lazy.filter({ $0.carrier == carrier }).count
+                < Self.maxRelayRoutesPerPeer else { return nil }
         let routeID = freshRouteID()
 
-        return await withCheckedContinuation { continuation in
-            pendingRelayOpens[routeID] = PendingRelayOpen(
-                carrier: carrier,
-                target: target,
-                continuation: continuation)
-            guard sendRelayControl(.relayOpen(routeID: routeID, targetKey: target), to: carrier) else {
-                pendingRelayOpens.removeValue(forKey: routeID)
-                continuation.resume(returning: nil)
-                return
-            }
-            Task { [weak self] in
-                guard let self else { return }
-                do {
-                    try await Task.sleep(for: self.config.relayTimeout)
-                } catch {
+        let opened = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var pending = PendingRelayOpen(
+                    carrier: carrier,
+                    target: target,
+                    continuation: continuation)
+                pendingRelayOpens[routeID] = pending
+                guard sendRelayControl(
+                    .relayOpen(routeID: routeID, targetKey: target),
+                    to: carrier
+                ) else {
+                    _ = removePendingRelayOpen(routeID)
+                    continuation.resume(returning: nil)
                     return
                 }
+                let timeout = config.relayTimeout
+                pending.timeoutTask = delayedTask(after: timeout) { [weak self] in
+                    await self?.timeoutRelayOpen(routeID)
+                }
+                pendingRelayOpens[routeID] = pending
+            }
+        } onCancel: { [weak self] in
+            guard let self else { return }
+            Task {
                 await self.timeoutRelayOpen(routeID)
             }
         }
+        if Task.isCancelled {
+            if let opened {
+                closeInstalledRoute(opened, notifyCarrier: true)
+            } else {
+                timeoutRelayOpen(routeID)
+            }
+            return nil
+        }
+        return opened
     }
 
     private func timeoutRelayOpen(_ routeID: Data) {
-        guard let pending = pendingRelayOpens.removeValue(forKey: routeID) else { return }
+        guard let pending = removePendingRelayOpen(routeID) else { return }
         _ = sendRelayControl(.relayClose(routeID: routeID), to: pending.carrier)
         pending.continuation.resume(returning: nil)
     }
@@ -1483,26 +1792,24 @@ public actor Ivy {
         switch message {
         case .relayOpen(let routeID, let target):
             guard routeID.count == 32,
-                  routeID != Self.directRouteBinding,
-                  relayRoutes[routeID] == nil,
-                  installedRoutes[routeID] == nil else {
+                  relayRouteIsUnknown(routeID) else {
                 tally.recordProtocolViolation(peer: sender.peerID)
                 return
             }
             guard relayRoutes.count < Self.maxRelayRoutes else {
-                _ = sendRelayControl(.relayReady(routeID: routeID, status: 1), to: sender)
+                _ = sendRelayReply(.relayReady(routeID: routeID, status: 1), to: sender)
                 return
             }
             guard relayRoutes.values.lazy.filter({ $0.source == sender }).count
                     < Self.maxRelayRoutesPerPeer else {
-                _ = sendRelayControl(.relayReady(routeID: routeID, status: 1), to: sender)
+                _ = sendRelayReply(.relayReady(routeID: routeID, status: 1), to: sender)
                 return
             }
             guard config.relayEnabled,
                   sender != target,
-                  let targetSession = endpointSessions[target],
+                  let targetSession = endpointSession(for: target),
                   targetSession.connection.isDirect else {
-                _ = sendRelayControl(
+                _ = sendRelayReply(
                     .relayReady(
                         routeID: routeID,
                         status: 1),
@@ -1513,12 +1820,13 @@ public actor Ivy {
             relayRoutes[routeID] = RelayRoute(
                 source: sender,
                 target: target,
+                lifecycleID: UUID(),
                 ready: false,
                 lastActivity: .now)
             scheduleUnreadyRelayExpiry(routeID)
             guard sendRelayControl(.relayOffer(routeID: routeID, sourceKey: sender), to: target) else {
-                relayRoutes.removeValue(forKey: routeID)
-                _ = sendRelayControl(
+                relayRoutes.removeValue(forKey: routeID)?.expiryTask?.cancel()
+                _ = sendRelayReply(
                     .relayReady(routeID: routeID, status: 1),
                     to: sender)
                 return
@@ -1527,36 +1835,41 @@ public actor Ivy {
         case .relayOffer(let routeID, let source):
             guard routeID.count == 32,
                   source != localKey,
+                  source != sender,
                   config.allowsEndpoint(source),
-                  relayRoutes[routeID] == nil,
-                  installedRoutes[routeID] == nil else {
-                _ = sendRelayControl(.relayAccept(routeID: routeID, status: 1), to: sender)
+                  relayRouteIsUnknown(routeID) else {
+                _ = sendRelayReply(.relayAccept(routeID: routeID, status: 1), to: sender)
                 return
             }
-            guard installedRoutes.count < Self.maxRelayRoutes else {
-                _ = sendRelayControl(.relayAccept(routeID: routeID, status: 1), to: sender)
+            guard installedRoutes.count + pendingRelayOpens.count < Self.maxRelayRoutes else {
+                _ = sendRelayReply(.relayAccept(routeID: routeID, status: 1), to: sender)
                 return
             }
             guard installedRoutes.values.lazy.filter({ $0.carrier == sender }).count
+                    + pendingRelayOpens.values.lazy.filter({ $0.carrier == sender }).count
                     < Self.maxRelayRoutesPerPeer else {
-                _ = sendRelayControl(.relayAccept(routeID: routeID, status: 1), to: sender)
+                _ = sendRelayReply(.relayAccept(routeID: routeID, status: 1), to: sender)
                 return
             }
-            installedRoutes[routeID] = InstalledRoute(carrier: sender, remote: source)
+            installedRoutes[routeID] = InstalledRoute(
+                carrier: sender,
+                remote: source,
+                lifecycleID: UUID())
             scheduleIdleInstalledRouteExpiry(routeID, carrier: sender)
             guard sendRelayControl(.relayAccept(routeID: routeID, status: 0), to: sender) else {
-                installedRoutes.removeValue(forKey: routeID)
+                installedRoutes.removeValue(forKey: routeID)?.expiryTask?.cancel()
                 return
             }
 
         case .relayAccept(let routeID, let status):
-            guard var route = relayRoutes[routeID], route.target == sender else {
+            guard var route = relayRoutes[routeID] else { return }
+            guard route.target == sender else {
                 tally.recordProtocolViolation(peer: sender.peerID)
                 return
             }
             guard status == 0 else {
-                relayRoutes.removeValue(forKey: routeID)
-                _ = sendRelayControl(
+                relayRoutes.removeValue(forKey: routeID)?.expiryTask?.cancel()
+                _ = sendRelayReply(
                     .relayReady(routeID: routeID, status: status),
                     to: route.source)
                 return
@@ -1573,23 +1886,29 @@ public actor Ivy {
             }
 
         case .relayReady(let routeID, let status):
-            guard let pending = pendingRelayOpens.removeValue(forKey: routeID),
-                  pending.carrier == sender else {
+            guard let pending = pendingRelayOpens[routeID] else { return }
+            guard pending.carrier == sender else {
                 tally.recordProtocolViolation(peer: sender.peerID)
                 return
             }
-            guard status == 0,
-                  routeID.count == 32,
-                  routeID != Self.directRouteBinding,
+            _ = removePendingRelayOpen(routeID)
+            guard status == 0 else {
+                pending.continuation.resume(returning: nil)
+                return
+            }
+            guard routeID.count == 32,
                   installedRoutes.count < Self.maxRelayRoutes,
-                  installedRoutes[routeID] == nil,
-                  relayRoutes[routeID] == nil else {
+                  installedRoutes.values.lazy.filter({ $0.carrier == sender }).count
+                    < Self.maxRelayRoutesPerPeer,
+                  relayRouteIsUnknown(routeID) else {
+                _ = sendRelayControl(.relayClose(routeID: routeID), to: sender)
                 pending.continuation.resume(returning: nil)
                 return
             }
             installedRoutes[routeID] = InstalledRoute(
                 carrier: sender,
-                remote: pending.target)
+                remote: pending.target,
+                lifecycleID: UUID())
             scheduleIdleInstalledRouteExpiry(routeID, carrier: sender)
             pending.continuation.resume(returning: routeID)
 
@@ -1600,7 +1919,7 @@ public actor Ivy {
                 return
             }
             if let pending = pendingRelayOpens[routeID], pending.carrier == sender {
-                pendingRelayOpens.removeValue(forKey: routeID)?.continuation.resume(returning: nil)
+                removePendingRelayOpen(routeID)?.continuation.resume(returning: nil)
                 return
             }
             guard installedRoutes[routeID]?.carrier == sender else { return }
@@ -1620,7 +1939,7 @@ public actor Ivy {
                 }
                 route.lastActivity = .now
                 relayRoutes[routeID] = route
-                guard let destinationSession = endpointSessions[destination],
+                guard let destinationSession = endpointSession(for: destination),
                       destinationSession.connection.isDirect else {
                     closeRelayRoute(routeID)
                     return
@@ -1634,11 +1953,11 @@ public actor Ivy {
                 return
             }
 
-            guard let installed = installedRoutes[routeID],
+            guard var installed = installedRoutes[routeID],
                   installed.carrier == sender else {
                 return
             }
-            if let connection = routeConnections[routeID] {
+            if let connection = installed.connection {
                 guard connection.feedRecord(opaqueRecord) else {
                     closeInstalledRoute(routeID, notifyCarrier: true)
                     return
@@ -1669,7 +1988,8 @@ public actor Ivy {
                 closeInstalledRoute(routeID, notifyCarrier: true)
                 return
             }
-            routeConnections[routeID] = connection
+            installed.connection = connection
+            installedRoutes[routeID] = installed
             guard connection.feedRecord(opaqueRecord) else {
                 failPendingSession(connection.connectionID)
                 closeInstalledRoute(routeID, notifyCarrier: true)
@@ -1682,36 +2002,39 @@ public actor Ivy {
     }
 
     private func scheduleUnreadyRelayExpiry(_ routeID: Data) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await Task.sleep(for: self.config.relayTimeout)
-            } catch {
-                return
-            }
-            await self.expireUnreadyRelayRoute(routeID)
+        guard var route = relayRoutes[routeID], !route.ready else { return }
+        route.expiryTask?.cancel()
+        let lifecycleID = route.lifecycleID
+        let timeout = config.relayTimeout
+        route.expiryTask = delayedTask(after: timeout) { [weak self] in
+            await self?.expireUnreadyRelayRoute(routeID, lifecycleID: lifecycleID)
         }
+        relayRoutes[routeID] = route
     }
 
-    private func expireUnreadyRelayRoute(_ routeID: Data) {
-        guard relayRoutes[routeID]?.ready == false else { return }
+    private func expireUnreadyRelayRoute(_ routeID: Data, lifecycleID: UUID) {
+        guard let route = relayRoutes[routeID],
+              route.lifecycleID == lifecycleID,
+              !route.ready else { return }
         closeRelayRoute(routeID)
     }
 
     private func scheduleRelayIdleExpiry(_ routeID: Data, after delay: Duration? = nil) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await Task.sleep(for: delay ?? Self.relayIdleTimeout)
-            } catch {
-                return
-            }
-            await self.expireIdleRelayRoute(routeID)
+        guard var route = relayRoutes[routeID], route.ready else { return }
+        route.expiryTask?.cancel()
+        let lifecycleID = route.lifecycleID
+        route.expiryTask = delayedTask(
+            after: delay ?? Self.relayIdleTimeout
+        ) { [weak self] in
+            await self?.expireIdleRelayRoute(routeID, lifecycleID: lifecycleID)
         }
+        relayRoutes[routeID] = route
     }
 
-    private func expireIdleRelayRoute(_ routeID: Data) {
-        guard let route = relayRoutes[routeID], route.ready else { return }
+    private func expireIdleRelayRoute(_ routeID: Data, lifecycleID: UUID) {
+        guard let route = relayRoutes[routeID],
+              route.lifecycleID == lifecycleID,
+              route.ready else { return }
         let idle = route.lastActivity.duration(to: .now)
         if idle >= Self.relayIdleTimeout {
             closeRelayRoute(routeID)
@@ -1721,28 +2044,34 @@ public actor Ivy {
     }
 
     private func scheduleIdleInstalledRouteExpiry(_ routeID: Data, carrier: PeerKey) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await Task.sleep(for: self.config.relayTimeout)
-            } catch {
-                return
-            }
-            await self.expireIdleInstalledRoute(routeID, carrier: carrier)
+        guard var route = installedRoutes[routeID], route.carrier == carrier else { return }
+        route.expiryTask?.cancel()
+        let lifecycleID = route.lifecycleID
+        let timeout = config.relayTimeout
+        route.expiryTask = delayedTask(after: timeout) { [weak self] in
+            await self?.expireIdleInstalledRoute(
+                routeID,
+                carrier: carrier,
+                lifecycleID: lifecycleID)
         }
+        installedRoutes[routeID] = route
     }
 
-    private func expireIdleInstalledRoute(_ routeID: Data, carrier: PeerKey) {
-        guard routeConnections[routeID] == nil,
-              installedRoutes[routeID]?.carrier == carrier else { return }
+    private func expireIdleInstalledRoute(
+        _ routeID: Data,
+        carrier: PeerKey,
+        lifecycleID: UUID
+    ) {
+        guard let route = installedRoutes[routeID],
+              route.connection == nil,
+              route.carrier == carrier,
+              route.lifecycleID == lifecycleID else { return }
         closeInstalledRoute(routeID, notifyCarrier: true)
     }
 
     private func freshRouteID() -> Data {
         var routeID = secureRandom32()
-        while routeID == Self.directRouteBinding
-            || relayRoutes[routeID] != nil
-            || installedRoutes[routeID] != nil {
+        while !relayRouteIsUnknown(routeID) {
             routeID = secureRandom32()
         }
         return routeID
@@ -1767,28 +2096,33 @@ public actor Ivy {
         from peer: PeerID,
         session: AuthenticatedSession? = nil
     ) async {
+        var exactPong = false
         if let session {
             guard isCurrent(session) else { return }
             if let monitor = healthMonitor {
-                await monitor.recordActivity(from: peer, sessionID: session.sessionID)
+                if case .pong(let nonce) = message {
+                    exactPong = await monitor.recordPong(
+                        from: peer,
+                        sessionID: session.sessionID,
+                        nonce: nonce)
+                } else {
+                    await monitor.recordActivity(from: peer, sessionID: session.sessionID)
+                }
             }
+#if DEBUG || IVY_TESTING
+            await messageActivityHookForTesting?()
+#endif
+            guard isCurrent(session) else { return }
         }
-        if case .pong = message {
-            // Pongs discharge a ping already admitted by this node.
-        } else if !tally.shouldAllow(peer: peer) {
+        if !exactPong && !tally.shouldAllow(peer: peer) {
             return
         }
         switch message {
         case .ping(let nonce):
             fireToPeer(peer, .pong(nonce: nonce))
 
-        case .pong(let nonce):
-            if let monitor = healthMonitor, let session {
-                await monitor.recordPong(
-                    from: peer,
-                    sessionID: session.sessionID,
-                    nonce: nonce)
-            }
+        case .pong:
+            return
 
         case .relayOpen, .relayOffer, .relayAccept, .relayReady, .relayPacket, .relayClose:
             return
@@ -1857,11 +2191,11 @@ public actor Ivy {
         generation: UInt64,
         timeout: Duration
     ) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation) else { return [] }
+        guard isCurrentRun(generation), !Task.isCancelled else { return [] }
 #if DEBUG || IVY_TESTING
         if let hook = neighborRequestHookForTesting {
             let endpoints = await hook(peer, targetHash)
-            return isCurrentRun(generation) ? endpoints : []
+            return isCurrentRun(generation) && !Task.isCancelled ? endpoints : []
         }
 #endif
         guard hasEndpointSession(peer),
@@ -1877,16 +2211,12 @@ public actor Ivy {
                 resolveNeighborResponse(nonce: nonce, endpoints: [])
                 return
             }
-            Task { [weak self] in
-                do {
-                    try await Task.sleep(for: timeout)
-                } catch {
-                    return
-                }
+            let timeoutTask = delayedTask(after: timeout) { [weak self] in
                 await self?.resolveNeighborResponse(nonce: nonce, endpoints: [])
             }
+            pendingNeighborResponses[nonce]?.timeoutTask = timeoutTask
         }
-        return isCurrentRun(generation) ? endpoints : []
+        return isCurrentRun(generation) && !Task.isCancelled ? endpoints : []
     }
 
     func receiveNeighborResponse(nonce: UInt64, endpoints: [PeerEndpoint], from peer: PeerID) {
@@ -1896,6 +2226,7 @@ public actor Ivy {
 
     func resolveNeighborResponse(nonce: UInt64, endpoints: [PeerEndpoint]) {
         guard let pending = pendingNeighborResponses.removeValue(forKey: nonce) else { return }
+        pending.timeoutTask?.cancel()
         pending.continuation.resume(returning: endpoints)
     }
 
@@ -1904,11 +2235,14 @@ public actor Ivy {
     }
 
     func makeFindNodeNonce() -> UInt64 {
-        var nonce = UInt64.random(in: 1...UInt64.max)
-        while pendingNeighborResponses[nonce] != nil {
-            nonce = UInt64.random(in: 1...UInt64.max)
-        }
-        return nonce
+        makeWireOperationID { pendingNeighborResponses[$0] != nil }
+    }
+
+    func makeWireOperationID(whileInUse isInUse: (UInt64) -> Bool) -> UInt64 {
+        repeat {
+            nextWireOperationID &+= 1
+        } while nextWireOperationID == 0 || isInUse(nextWireOperationID)
+        return nextWireOperationID
     }
 
     // MARK: - Cleanup
@@ -1919,6 +2253,13 @@ public actor Ivy {
         }
         for requestID in requestIDs {
             markContentCandidateDone(requestID: requestID, peer: peer)
+        }
+
+        let neighborNonces = pendingNeighborResponses.compactMap { nonce, pending in
+            pending.peer == peer ? nonce : nil
+        }
+        for nonce in neighborNonces {
+            resolveNeighborResponse(nonce: nonce, endpoints: [])
         }
 
         let peerKey = peer.publicKey
@@ -1939,58 +2280,80 @@ public actor Ivy {
     /// Resume every in-flight continuation with an empty result. Shared by
     /// `cleanupAllPending` (stop/reset) and `deinit` (teardown safety net).
     private static func drainAllPending(
+        pendingSessions: [UUID: PendingSession],
         pendingContentRequests: [UInt64: PendingContentRequest],
         pendingNeighborResponses: [UInt64: PendingNeighborResponse],
         pendingProviderQueries: [String: PendingProviderQuery],
-        authenticationWaiters: [UUID: CheckedContinuation<Bool, Never>],
         pendingRelayOpens: [Data: PendingRelayOpen]
     ) {
+        for pending in pendingSessions.values {
+            pending.timeoutTask?.cancel()
+            pending.continuation?.resume(returning: false)
+        }
         for (_, request) in pendingContentRequests {
-            for cont in request.continuations { cont.resume(returning: .empty) }
+            request.timeoutTask?.cancel()
+            request.continuation.resume(returning: .empty)
         }
         for (_, pending) in pendingNeighborResponses {
+            pending.timeoutTask?.cancel()
             pending.continuation.resume(returning: [])
         }
         for (_, pending) in pendingProviderQueries {
+            pending.timeoutTask?.cancel()
             for cont in pending.continuations { cont.resume(returning: []) }
         }
-        for (_, continuation) in authenticationWaiters {
-            continuation.resume(returning: false)
-        }
         for (_, request) in pendingRelayOpens {
+            request.timeoutTask?.cancel()
             request.continuation.resume(returning: nil)
         }
     }
 
     /// Safety net for an instance released with requests still in flight.
     deinit {
+        lifecycleTail?.cancel()
+        routingRefreshTask?.cancel()
+        serverChannel?.close(promise: nil)
+        for reconnect in reconnectTasks.values { reconnect.task.cancel() }
+        for route in relayRoutes.values { route.expiryTask?.cancel() }
+        for route in installedRoutes.values {
+            route.expiryTask?.cancel()
+            route.connection?.cancel()
+        }
+        for pending in pendingSessions.values { pending.connection.cancel() }
+        for session in sessions.values { session.connection.cancel() }
+        for pending in pendingFetches.values {
+            pending.operationTask?.cancel()
+            pending.timeoutTask?.cancel()
+            for continuation in pending.continuations { continuation.resume(returning: .empty) }
+        }
         Self.drainAllPending(
+            pendingSessions: pendingSessions,
             pendingContentRequests: pendingContentRequests,
             pendingNeighborResponses: pendingNeighborResponses,
             pendingProviderQueries: pendingProviderQueries,
-            authenticationWaiters: authenticationWaiters,
             pendingRelayOpens: pendingRelayOpens
         )
     }
 
     func cleanupAllPending() {
         Self.drainAllPending(
+            pendingSessions: pendingSessions,
             pendingContentRequests: pendingContentRequests,
             pendingNeighborResponses: pendingNeighborResponses,
             pendingProviderQueries: pendingProviderQueries,
-            authenticationWaiters: authenticationWaiters,
             pendingRelayOpens: pendingRelayOpens
         )
+        for pending in pendingSessions.values { pending.connection.cancel() }
+        pendingSessions.removeAll()
         pendingContentRequests.removeAll()
-        contentRequestIDs.removeAll()
-        for pending in pendingNetworkFetches.values {
-            for waiter in pending.waiters { waiter.resume(returning: .empty) }
+        for pending in pendingFetches.values {
+            pending.operationTask?.cancel()
+            pending.timeoutTask?.cancel()
+            for continuation in pending.continuations { continuation.resume(returning: .empty) }
         }
-        pendingNetworkFetches.removeAll()
-        servingContentRequests.removeAll()
+        pendingFetches.removeAll()
         pendingNeighborResponses.removeAll()
         pendingProviderQueries.removeAll()
-        authenticationWaiters.removeAll()
         pendingRelayOpens.removeAll()
     }
 
@@ -2014,15 +2377,23 @@ public actor Ivy {
     var contentReplyConnectionsForTesting: [UUID] = []
     var lifecycleRequestCountForTesting = 0
     var lifecycleStartHookForTesting: (@Sendable () async -> Void)?
+    var listenerReadyHookForTesting: (@Sendable () async -> Void)?
     var lifecycleRequestHookForTesting: (@Sendable (Int) async -> Void)?
     var neighborRequestHookForTesting: (@Sendable (PeerID, [UInt8]) async -> [PeerEndpoint])?
     var networkFetchHookForTesting: (
         @Sendable (ContentRequestKey, UInt64, UInt64) async -> AttributedContentResponse
     )?
+    var messageActivityHookForTesting: (@Sendable () async -> Void)?
+    var promotionHookForTesting: (@Sendable (PeerConnection) -> Void)?
     var dialEndpointRewriteForTesting: (@Sendable (PeerEndpoint) -> PeerEndpoint)?
+    var contentRequestEnqueueHookForTesting: (@Sendable (PeerID) -> Bool)?
 
     func setLifecycleStartHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         lifecycleStartHookForTesting = hook
+    }
+
+    func setListenerReadyHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        listenerReadyHookForTesting = hook
     }
 
     func setLifecycleRequestHookForTesting(_ hook: (@Sendable (Int) async -> Void)?) {
@@ -2043,34 +2414,51 @@ public actor Ivy {
         networkFetchHookForTesting = hook
     }
 
+    func setMessageActivityHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        messageActivityHookForTesting = hook
+    }
+
+    func setPromotionHookForTesting(_ hook: (@Sendable (PeerConnection) -> Void)?) {
+        promotionHookForTesting = hook
+    }
+
     func setDialEndpointRewriteForTesting(
         _ rewrite: (@Sendable (PeerEndpoint) -> PeerEndpoint)?
     ) {
         dialEndpointRewriteForTesting = rewrite
     }
 
+    func setContentRequestEnqueueHookForTesting(
+        _ hook: (@Sendable (PeerID) -> Bool)?
+    ) {
+        contentRequestEnqueueHookForTesting = hook
+    }
+
     func seedConnectedEndpointForTesting(
         _ endpoint: PeerEndpoint,
         connection suppliedConnection: PeerConnection? = nil,
+        role: AuthenticatedPeerRole = .endpoint,
         marker: UInt8
     ) throws {
+        running = true
         let peerKey = try PeerKey(endpoint.publicKey)
         let connection = suppliedConnection ?? PeerConnection(
             endpoint: endpoint,
             routeID: Data(repeating: marker, count: 32),
             carrier: peerKey,
             inboundByteBudget: inboundByteBudget)
-        endpointSessions[peerKey] = AuthenticatedSession(
+        let session = AuthenticatedSession(
             connection: connection,
             peerKey: peerKey,
-            role: .endpoint,
+            role: role,
             sessionID: try SessionID(bytes: Data(repeating: marker, count: 32)),
             metadata: PeerMetadata())
+        sessions[peerKey] = session
     }
 
     func sendAuthenticatedMessageForTesting(_ message: Message, to peer: PeerID) -> Bool {
         guard let key = try? PeerKey(peer.publicKey),
-              let session = authenticatedSession(for: key) else { return false }
+              let session = sessions[key] else { return false }
         if case .enqueued = enqueue(message, on: session, bypassAdmission: true) {
             return true
         }
@@ -2082,15 +2470,134 @@ public actor Ivy {
     }
 
     var installedRouteCountForTesting: Int { installedRoutes.count }
+    var activeFetchCountForTesting: Int { activeFetchCount }
+    var pendingRelayOpenCountForTesting: Int { pendingRelayOpens.count }
+    var pendingRelayRouteForTesting: Data? { pendingRelayOpens.keys.first }
+    var outgoingDialCountForTesting: Int { outgoingDials.count }
+    var routeConnectionCountForTesting: Int {
+        installedRoutes.values.lazy.filter { $0.connection != nil }.count
+    }
+
+    func isHealthTrackedForTesting(_ peer: PeerID) async -> Bool {
+        guard let healthMonitor else { return false }
+        return await healthMonitor.health(for: peer) != nil
+    }
+
+    func bindInstalledRouteForTesting(
+        routeID: Data,
+        carrier: PeerKey,
+        remote: PeerKey,
+        connection: PeerConnection? = nil
+    ) {
+        installedRoutes[routeID] = InstalledRoute(
+            carrier: carrier,
+            remote: remote,
+            lifecycleID: UUID(),
+            connection: connection)
+    }
+
+    func bindRelayRouteForTesting(routeID: Data, source: PeerKey, target: PeerKey) {
+        relayRoutes[routeID] = RelayRoute(
+            source: source,
+            target: target,
+            lifecycleID: UUID(),
+            ready: true,
+            lastActivity: .now)
+    }
+
+    func cleanupRoutesForReplacementForTesting(
+        peer: PeerKey,
+        preserving connection: PeerConnection?
+    ) {
+        removeRoutes(involving: peer, preserving: connection)
+    }
+
+    func hasInstalledRouteForTesting(_ routeID: Data) -> Bool {
+        installedRoutes[routeID] != nil
+    }
+
+    func openInstalledRouteConnectionForTesting(
+        endpoint: PeerEndpoint,
+        target: PeerKey,
+        routeID: Data,
+        carrier: PeerKey
+    ) -> Bool {
+        openInstalledRouteConnection(
+            endpoint: endpoint,
+            target: target,
+            routeID: routeID,
+            carrier: carrier) != nil
+    }
+
+    func canPromoteForTesting(_ connection: PeerConnection, peerKey: PeerKey) -> Bool {
+        canPromote(connection, peerKey: peerKey)
+    }
+
+    func seedOutgoingDialForTesting(
+        endpoint: PeerEndpoint,
+        pendingGeneration: UInt64,
+        currentGeneration: UInt64
+    ) {
+        running = true
+        runGeneration = currentGeneration
+        let peer = PeerID(publicKey: endpoint.publicKey)
+        outgoingDials[peer] = PendingOutgoingDial(
+            endpoint: endpoint,
+            generation: pendingGeneration)
+    }
+
+    func awaitRelayOpenForTesting(
+        routeID: Data,
+        carrier: PeerKey,
+        target: PeerKey
+    ) async -> Data? {
+        await withCheckedContinuation { continuation in
+            pendingRelayOpens[routeID] = PendingRelayOpen(
+                carrier: carrier,
+                target: target,
+                continuation: continuation)
+        }
+    }
+
+    func installedRouteLifecycleForTesting(_ routeID: Data) -> UUID? {
+        installedRoutes[routeID]?.lifecycleID
+    }
+
+    func expireInstalledRouteForTesting(
+        _ routeID: Data,
+        carrier: PeerKey,
+        lifecycleID: UUID
+    ) {
+        expireIdleInstalledRoute(routeID, carrier: carrier, lifecycleID: lifecycleID)
+    }
+
+    func handleCurrentMessageForTesting(_ message: Message, from peer: PeerID) async {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = sessions[key] else { return }
+        await handleMessage(message, from: peer, session: session)
+    }
+
+    func retireTransportForTesting(_ peer: PeerID) {
+        guard let key = try? PeerKey(peer.publicKey), let session = sessions[key] else { return }
+        teardownAuthenticatedSession(session, reconnect: false)
+        session.connection.cancel()
+    }
+
+    func setPublicAddressForTesting(_ address: ObservedAddress?) {
+        publicAddress = address
+    }
+
+    func advertisedListenAddressesForTesting(observedLocalHost: String? = nil) -> [ListenAddress] {
+        advertisedListenAddresses(observedLocalHost: observedLocalHost)
+    }
 
     func runPendingReconnectForTesting(_ peer: PeerID) async {
         guard let pending = reconnectTasks[peer],
               let key = try? PeerKey(peer.publicKey) else { return }
         let role: AuthenticatedPeerRole = config.isConfiguredCarrier(key) ? .carrier : .endpoint
-        guard let endpoint = configuredReconnectEndpoint(for: key, role: role) else { return }
+        guard !configuredEndpoints(for: key, role: role).isEmpty else { return }
         pending.task.cancel()
         await runScheduledReconnect(
-            to: endpoint,
             peer: peer,
             role: role,
             generation: pending.generation,
@@ -2110,7 +2617,7 @@ public actor Ivy {
             sessionID: try! SessionID(bytes: Data(repeating: sessionMarker, count: 32)),
             metadata: PeerMetadata())
         running = true
-        endpointSessions[session.peerKey] = session
+        sessions[session.peerKey] = session
         await handleContentRequest(
             requestID: requestID,
             rootCID: "root",
@@ -2121,7 +2628,7 @@ public actor Ivy {
 
     func selectedSessionIDForTesting(_ peer: PeerID) -> Data? {
         guard let key = try? PeerKey(peer.publicKey) else { return nil }
-        return endpointSessions[key]?.sessionID.bytes
+        return endpointSession(for: key)?.sessionID.bytes
     }
 
     var pendingSessionCountForTesting: Int { pendingSessions.count }
@@ -2135,21 +2642,23 @@ public actor Ivy {
         let gate = InboundAdmissionGate(
             maxConnections: config.maxConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
+        let inboundByteBudget = self.inboundByteBudget
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
-            .childChannelInitializer { channel in
+            .childChannelInitializer { [weak self] channel in
+                guard let self else { return channel.close() }
                 let connectionBudget = InboundByteBudget(
                     limit: PeerConnection.maxInboundBufferedBytes)
                 let decoder = SessionFrameDecoder(
-                    budget: self.inboundByteBudget,
+                    budget: inboundByteBudget,
                     connectionBudget: connectionBudget)
                 let acceptor = InboundConnectionAcceptor(
                     ivy: self,
                     generation: generation,
                     admissionGate: gate,
-                    inboundByteBudget: self.inboundByteBudget,
+                    inboundByteBudget: inboundByteBudget,
                     connectionInboundByteBudget: connectionBudget
                 )
                 return channel.pipeline.addHandlers([decoder, acceptor])

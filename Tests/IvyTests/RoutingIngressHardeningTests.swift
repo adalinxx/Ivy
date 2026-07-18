@@ -93,8 +93,10 @@ struct RoutingIngressHardeningTests {
         let endpointKey = deterministicTestPeerKey("routing-endpoint")
 
         for host in [
-            "127.0.0.1", "10.0.0.1", "169.254.169.254", "192.0.2.1",
-            "::1", "fc00::1", "64:ff9b::0a00:0001", "example.com",
+            "127.0.0.1", "10.0.0.1", "169.254.169.254", "192.0.0.1",
+            "192.0.2.1", "192.88.99.1", "::1", "fc00::1", "100::1", "4000::1",
+            "2001:2::1", "2001:20::1", "2002:0808:0808::1", "3fff::1",
+            "64:ff9b::0a00:0001", "example.com",
         ] {
             let endpoint = PeerEndpoint(publicKey: endpointKey, host: host, port: 4001)
             #expect(!(await node.isAcceptableDiscoveredEndpoint(
@@ -104,7 +106,8 @@ struct RoutingIngressHardeningTests {
         }
 
         for host in [
-            "1.1.1.1", "2606:4700:4700::1111", "64:ff9b::0808:0808",
+            "1.1.1.1", "192.0.0.9", "2001:3::1", "2606:4700:4700::1111",
+            "64:ff9b::0808:0808",
             "::ffff:0808:0808",
         ] {
             let endpoint = PeerEndpoint(publicKey: endpointKey, host: host, port: 4001)

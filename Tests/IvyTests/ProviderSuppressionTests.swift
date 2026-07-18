@@ -106,6 +106,32 @@ struct ProviderSuppressionTests {
         await requester.stop()
         await provider.stop()
     }
+
+    @Test("provider caching preserves bounded route alternatives per identity")
+    func providerRouteAlternatives() async {
+        let node = Ivy(config: IvyConfig(
+            publicKey: "provider-route-alternatives",
+            listenPort: 0,
+            kBucketSize: 2))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("provider-route-peer"))
+        let first = PeerEndpoint(publicKey: peer.publicKey, host: "1.1.1.1", port: 4001)
+        let second = PeerEndpoint(publicKey: peer.publicKey, host: "8.8.8.8", port: 4001)
+        let expiry = await node.nowUnix() + 60
+
+        await node.storeProviderHint(
+            rootCID: "root",
+            peer: peer,
+            endpoint: first,
+            expiresAt: expiry)
+        await node.storeProviderHint(
+            rootCID: "root",
+            peer: peer,
+            endpoint: second,
+            expiresAt: expiry)
+
+        #expect(Set(await node.cachedProviderEndpoints(rootCID: "root")) == Set([first, second]))
+        #expect(await node.providers(for: "root") == [peer])
+    }
 }
 
 private extension Ivy {

@@ -1,4 +1,5 @@
 import Foundation
+import NIOPosix
 import Testing
 @testable import Ivy
 import Tally
@@ -326,16 +327,25 @@ struct KademliaConvergenceTests {
         let node = Ivy(config: TransportTestHarness.config(
             identity,
             port: TransportTestHarness.nextPort(),
-            maxConnections: 1))
+            maxConnections: 2))
+        let referrer = testEndpoint("kad-deferred-referrer", port: 4001)
         let deferred = testEndpoint("kad-deferred", port: TransportTestHarness.nextPort())
 
         try await node.start()
-        await node.seedKademliaTestEndpoint(deferred)
+        try await node.seedConnectedEndpointForTesting(referrer, marker: 1)
+        await node.seedKademliaTestEndpoint(referrer)
         #expect(await node.reserveOutgoingDial(to: deferred))
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            peer.publicKey == referrer.publicKey ? [deferred] : []
+        }
 
-        _ = await node.findNode(target: deferred.publicKey)
+        let result = await node.findNode(target: deferred.publicKey)
 
-        #expect((await node.knownPeerEndpoints).contains(deferred))
+        #expect(result.contains(deferred))
+        await node.finishOutgoingDial(
+            to: PeerID(publicKey: deferred.publicKey),
+            generation: await node.runGeneration,
+            connected: false)
         await node.stop()
     }
 
@@ -357,8 +367,10 @@ struct KademliaConvergenceTests {
         try await node.start()
         let currentGeneration = await node.runGeneration
         await node.seedKademliaTestEndpoint(endpoint)
-        #expect(await node.reserveOutgoingDial(to: endpoint))
+        #expect(!(await node.reserveOutgoingDial(to: endpoint)))
 
+        await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
+        #expect(await node.reserveOutgoingDial(to: endpoint))
         await node.finishOutgoingDial(to: peer, generation: oldGeneration, connected: false)
         #expect(!(await node.reserveOutgoingDial(to: endpoint)))
         await node.removeFailedRoutingPeer(peer, generation: oldGeneration)
@@ -366,6 +378,281 @@ struct KademliaConvergenceTests {
 
         await node.finishOutgoingDial(to: peer, generation: currentGeneration, connected: false)
         #expect(await node.reserveOutgoingDial(to: endpoint))
+        await node.stop()
+    }
+
+    @Test("cancelling a lookup stops future referral rounds")
+    func cancellationStopsLookupRounds() async throws {
+        let identity = TransportTestHarness.identity("kad-cancel-source")
+        let node = Ivy(config: TransportTestHarness.config(
+            identity,
+            port: TransportTestHarness.nextPort()))
+        let first = testEndpoint("kad-cancel-first", port: 4001)
+        let referred = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("kad-cancel-referred"),
+            host: "1.1.1.1",
+            port: 4002)
+        let responseBarrier = TestBarrier("cancelled neighbor response")
+
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(first, marker: 1)
+        await node.seedKademliaTestEndpoint(first)
+        await node.setNeighborRequestHookForTesting { _, _ in
+            try? await responseBarrier.arriveAndWait()
+            return [referred]
+        }
+
+        let lookup = BoundedTestTask { await node.findNode(target: referred.publicKey) }
+        try await responseBarrier.waitForArrivals()
+        lookup.cancel()
+        await responseBarrier.release()
+
+        #expect(try await lookup.value(waitingFor: "cancelled Kademlia lookup").isEmpty)
+        #expect(!(await node.hasEndpointSession(PeerID(publicKey: referred.publicKey))))
+        await node.stop()
+    }
+
+    @Test("cancelling a lookup closes a stalled authentication")
+    func cancellationClosesStalledAuthentication() async throws {
+        let stalledIdentity = TransportTestHarness.identity("kad-cancel-auth-peer")
+        let listener = try await ServerBootstrap(
+            group: MultiThreadedEventLoopGroup.singleton
+        ).childChannelInitializer { channel in
+            channel.eventLoop.makeSucceededVoidFuture()
+        }.bind(host: "127.0.0.1", port: 0).get()
+        let rawPort = try #require(listener.localAddress?.port)
+        let port = try #require(UInt16(exactly: rawPort))
+        let endpoint = TransportTestHarness.endpoint(stalledIdentity, port: port)
+        let node = Ivy(config: IvyConfig(
+            publicKey: "kad-cancel-auth-node",
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+
+        try await node.start()
+        await node.seedKademliaTestEndpoint(endpoint)
+        let lookup = Task { await node.findNode(target: endpoint.publicKey) }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingSessionCountForTesting == 1
+        })
+
+        lookup.cancel()
+        let completion = BoundedTestTask { await lookup.value }
+        #expect(try await completion.value(waitingFor: "cancelled Kademlia authentication").isEmpty)
+        #expect(try await TransportTestHarness.eventually {
+            let pending = await node.pendingSessionCountForTesting
+            let outgoing = await node.outgoingDialCountForTesting
+            return pending == 0 && outgoing == 0
+        })
+
+        await node.stop()
+        try await listener.close().get()
+    }
+
+    @Test("a new route is retried after the old session disconnects")
+    func newRouteAfterDisconnectIsQueryable() async throws {
+        let sourceIdentity = TransportTestHarness.identity("kad-route-retry-source")
+        let targetIdentity = TransportTestHarness.identity("kad-route-retry-target")
+        let targetPort = TransportTestHarness.nextPort()
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: TransportTestHarness.nextPort()))
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            advertisedHost: "1.1.1.1"))
+        let targetKey = TransportTestHarness.key(targetIdentity)
+        let oldTargetRoute = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "1.1.1.1",
+            port: 4001)
+        let replacement = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "1.1.1.1",
+            port: targetPort)
+        let referrer = testEndpoint("kad-route-retry-referrer", port: 4002)
+        let requests = TestBarrier("route replacement referrals")
+
+        try await target.start()
+        try await source.start()
+        try await source.seedConnectedEndpointForTesting(oldTargetRoute, marker: 1)
+        try await source.seedConnectedEndpointForTesting(referrer, marker: 2)
+        await source.seedKademliaTestEndpoint(oldTargetRoute)
+        await source.seedKademliaTestEndpoint(referrer)
+        await source.setDialEndpointRewriteForTesting { endpoint in
+            guard endpoint.publicKey == targetKey.hex else { return endpoint }
+            return PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: targetPort)
+        }
+        await source.setNeighborRequestHookForTesting { peer, _ in
+            try? await requests.arriveAndWait()
+            return peer == PeerID(publicKey: referrer.publicKey) ? [replacement] : []
+        }
+
+        let lookup = BoundedTestTask { await source.findNode(target: targetKey.hex) }
+        try await requests.waitForArrivals(2)
+        await source.retireTransportForTesting(targetKey.peerID)
+        await requests.release()
+
+        let result = try await lookup.value(waitingFor: "replacement Kademlia route")
+        #expect(await source.hasEndpointSession(targetKey.peerID))
+        #expect(result.contains { $0.publicKey == targetKey.hex && $0.port == targetPort })
+
+        await source.stop()
+        await target.stop()
+    }
+
+    @Test("lookup preserves alternate routes for one referred identity")
+    func referralRouteAlternatives() async throws {
+        let sourceIdentity = TransportTestHarness.identity("kad-routes-source")
+        let targetIdentity = TransportTestHarness.identity("kad-routes-target")
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: TransportTestHarness.nextPort()))
+        let targetPort = TransportTestHarness.nextPort()
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort,
+            advertisedHost: "1.1.1.1"))
+        let initial = testEndpoint("kad-routes-initial", port: 4001)
+        let targetKey = TransportTestHarness.key(targetIdentity)
+        let live = PeerEndpoint(publicKey: targetKey.hex, host: "1.1.1.1", port: targetPort)
+        let dead = PeerEndpoint(
+            publicKey: targetKey.hex,
+            host: "9.9.9.9",
+            port: TransportTestHarness.nextPort())
+
+        try await target.start()
+        try await source.start()
+        try await source.seedConnectedEndpointForTesting(initial, marker: 1)
+        await source.seedKademliaTestEndpoint(initial)
+        await source.setNeighborRequestHookForTesting { peer, _ in
+            peer.publicKey == initial.publicKey ? [live, dead] : []
+        }
+        await source.setDialEndpointRewriteForTesting { endpoint in
+            guard endpoint.publicKey == targetKey.hex else { return endpoint }
+            return PeerEndpoint(
+                publicKey: endpoint.publicKey,
+                host: "127.0.0.1",
+                port: endpoint.host == live.host ? targetPort : dead.port)
+        }
+
+        let result = await source.findNode(target: targetKey.hex)
+
+        #expect(result.contains(live))
+        #expect(await source.hasEndpointSession(targetKey.peerID))
+        await source.stop()
+        await target.stop()
+    }
+
+    @Test("an authenticated route survives referral alternatives")
+    func authenticatedRouteIsPreserved() {
+        let key = deterministicTestPeerKey("kad-preserved-route")
+        let trusted = PeerEndpoint(publicKey: key, host: "1.1.1.1", port: 4001)
+        var routes = [LookupRoute(endpoint: trusted, source: .authenticated)]
+        for index in 0..<4 {
+            routes = selectedLookupRoutes(
+                routes + [LookupRoute(
+                    endpoint: PeerEndpoint(
+                    publicKey: key,
+                    host: "8.8.8.\(index + 1)",
+                    port: UInt16(4100 + index)),
+                    source: .referral(deterministicTestPeerKey("kad-route-flooder")))],
+                preferred: trusted)
+        }
+
+        #expect(routes.first?.endpoint == trusted)
+        #expect(routes.count == Ivy.maxRoutesPerIdentity)
+    }
+
+    @Test("route source diversity survives lookup rounds")
+    func referralRoutesPreserveSourceDiversity() {
+        let key = deterministicTestPeerKey("kad-diverse-route")
+        let honest = deterministicTestPeerKey("kad-honest-referrer")
+        let flooding = deterministicTestPeerKey("kad-flooding-referrer")
+        let live = PeerEndpoint(publicKey: key, host: "1.1.1.1", port: 4001)
+        let poisoned = (1...3).map {
+            PeerEndpoint(publicKey: key, host: "8.8.8.\($0)", port: UInt16(4100 + $0))
+        }
+
+        var selected = selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .referral(honest))],
+            preferred: nil)
+        for endpoint in poisoned {
+            selected = selectedLookupRoutes(
+                selected + [LookupRoute(endpoint: endpoint, source: .referral(flooding))],
+                preferred: nil)
+        }
+
+        #expect(selected.count == Ivy.maxRoutesPerIdentity)
+        #expect(selected.contains { $0.endpoint == live })
+
+        let retired = LookupRoute(endpoint: live, source: .authenticated)
+        let alternative = LookupRoute(endpoint: poisoned[0], source: .referral(honest))
+        #expect(selectedLookupRoutes(
+            [retired, alternative],
+            preferred: live).first?.endpoint == live)
+        #expect(selectedLookupRoutes(
+            [retired, alternative],
+            preferred: nil).first?.endpoint == alternative.endpoint)
+
+        let attacker = "0" + String(repeating: "0", count: honest.count - 1)
+        let repeated = [LookupRoute(endpoint: live, source: .referral(attacker))]
+            + (1...3).map {
+                LookupRoute(
+                    endpoint: PeerEndpoint(
+                        publicKey: key,
+                        host: "0.0.0.\($0)",
+                        port: UInt16(4200 + $0)),
+                    source: .referral(attacker))
+            }
+        let deduplicated = selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .referral(honest))] + repeated,
+            preferred: nil)
+        #expect(deduplicated.contains { $0.endpoint == live && $0.source == .referral(honest) })
+        #expect(selectedLookupRoutes(
+            [LookupRoute(endpoint: live, source: .authenticated)] + repeated,
+            preferred: live).first?.source == .authenticated)
+    }
+
+    @Test("later lookup rounds cannot replace every route from an earlier source")
+    func referralProvenanceSurvivesLookupRounds() async throws {
+        let node = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("kad-round-source"),
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 3))
+        let referrers = [
+            testEndpoint("kad-round-referrer-a", port: 4001),
+            testEndpoint("kad-round-referrer-b", port: 4002),
+        ].sorted { $0.publicKey < $1.publicKey }
+        let honest = referrers[0]
+        let flooding = referrers[1]
+        let targetKey = deterministicTestPeerKey("kad-round-target")
+        let live = PeerEndpoint(publicKey: targetKey, host: "1.1.1.1", port: 4100)
+        let poisoned = (1...3).map {
+            PeerEndpoint(publicKey: targetKey, host: "8.8.8.\($0)", port: UInt16(4200 + $0))
+        }
+
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(honest, marker: 1)
+        try await node.seedConnectedEndpointForTesting(flooding, marker: 2)
+        await node.seedKademliaTestEndpoint(honest)
+        #expect(await node.reserveOutgoingDial(to: live))
+        await node.setNeighborRequestHookForTesting { peer, _ in
+            if peer.publicKey == honest.publicKey { return [live, flooding] }
+            if peer.publicKey == flooding.publicKey { return poisoned }
+            return []
+        }
+
+        let result = await node.findNode(target: targetKey)
+
+        #expect(result.contains(live))
+        await node.finishOutgoingDial(
+            to: PeerID(publicKey: targetKey),
+            generation: await node.runGeneration,
+            connected: false)
         await node.stop()
     }
 }

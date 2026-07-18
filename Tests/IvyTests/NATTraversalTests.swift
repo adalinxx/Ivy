@@ -27,6 +27,51 @@ struct STUNParsingTests {
         #expect(address == ObservedAddress(host: "192.0.2.1", port: 32_853))
     }
 
+    @Test("A present FINGERPRINT must contain the correct CRC")
+    func corruptedFingerprintIsRejected() throws {
+        let data = try #require(Data(hexString:
+            "0101003c2112a442b7e7a701bc34d686fa87dfae"
+                + "8022000b7465737420766563746f7220"
+                + "002000080001a147e112a643"
+                + "000800142b91f599fd9e90c38c7489f92af9ba53f06be7d7"
+                + "80280004c07d4c97"))
+        var buffer = ByteBuffer(bytes: data)
+
+        #expect(STUNResponseHandler.parseResponse(&buffer) == nil)
+    }
+
+    @Test("FINGERPRINT must be the final attribute")
+    func fingerprintBeforeAnotherAttributeIsRejected() {
+        var buffer = buildSTUNResponse(
+            attrType: 0x0020,
+            xorMapped: true,
+            ip: "203.0.113.5",
+            port: 4001)
+        buffer.setInteger(UInt16(24), at: 2, endianness: .big)
+        let fingerprintOffset = buffer.writerIndex
+        let message = Array(buffer.readableBytesView)
+        let fingerprint = STUNResponseHandler.crc32(message.prefix(fingerprintOffset))
+            ^ 0x5354554e
+        buffer.writeInteger(UInt16(0x8028), endianness: .big)
+        buffer.writeInteger(UInt16(4), endianness: .big)
+        buffer.writeInteger(fingerprint, endianness: .big)
+        buffer.writeInteger(UInt16(0x8022), endianness: .big)
+        buffer.writeInteger(UInt16(0), endianness: .big)
+
+        #expect(STUNResponseHandler.parseResponse(&buffer) == nil)
+    }
+
+    @Test("Unknown comprehension-required attributes reject the response")
+    func unknownRequiredAttributeIsRejected() throws {
+        let data = try #require(Data(hexString:
+            "010100102112a4420102030405060708090a0b0c"
+                + "0020000800012eb3ea12d547"
+                + "7ffe0000"))
+        var buffer = ByteBuffer(bytes: data)
+
+        #expect(STUNResponseHandler.parseResponse(&buffer) == nil)
+    }
+
     @Test("Parse XOR-MAPPED-ADDRESS IPv4")
     func testXorMappedAddress() {
         let txnID = Array(UInt8(1)...UInt8(12))
@@ -37,14 +82,41 @@ struct STUNParsingTests {
         #expect(addr?.port == 4001)
     }
 
-    @Test("Parse MAPPED-ADDRESS IPv4")
-    func testMappedAddress() {
+    @Test("Parse XOR-MAPPED-ADDRESS IPv6")
+    func xorMappedIPv6() {
+        let transactionID = Array(UInt8(1)...UInt8(12))
+        let address: [UInt8] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 1,
+        ]
+        let mask = [UInt8(0x21), 0x12, 0xa4, 0x42] + transactionID
+        let encoded = zip(address, mask).map { pair in pair.0 ^ pair.1 }
+
+        var buffer = ByteBuffer()
+        buffer.writeInteger(UInt16(0x0101), endianness: .big)
+        buffer.writeInteger(UInt16(24), endianness: .big)
+        buffer.writeInteger(UInt32(0x2112a442), endianness: .big)
+        buffer.writeBytes(transactionID)
+        buffer.writeInteger(UInt16(0x0020), endianness: .big)
+        buffer.writeInteger(UInt16(20), endianness: .big)
+        buffer.writeInteger(UInt8(0))
+        buffer.writeInteger(UInt8(0x02))
+        buffer.writeInteger(UInt16(4001) ^ 0x2112, endianness: .big)
+        buffer.writeBytes(encoded)
+
+        #expect(STUNResponseHandler.parseResponse(
+            &buffer,
+            expectedTransactionID: transactionID)
+            == ObservedAddress(host: "2001:db8:0:0:0:0:0:1", port: 4001))
+    }
+
+    @Test("legacy MAPPED-ADDRESS is not accepted as a public route")
+    func mappedAddressIsRejected() {
         let txnID = Array(UInt8(13)...UInt8(24))
         var buf = buildSTUNResponse(attrType: 0x0001, xorMapped: false, ip: "192.168.1.1", port: 8080, transactionID: txnID)
-        let addr = STUNResponseHandler.parseResponse(&buf, expectedTransactionID: txnID)
-        #expect(addr != nil)
-        #expect(addr?.host == "192.168.1.1")
-        #expect(addr?.port == 8080)
+        #expect(STUNResponseHandler.parseResponse(
+            &buf,
+            expectedTransactionID: txnID) == nil)
     }
 
     @Test("Mismatched transaction ID returns nil")
@@ -102,6 +174,20 @@ struct STUNParsingTests {
         var buf = ByteBuffer()
         buf.writeBytes([0x01, 0x01, 0x00])
         #expect(STUNResponseHandler.parseResponse(&buf) == nil)
+    }
+
+    @Test("attributes outside the declared STUN body are rejected")
+    func testAttributeBeyondDeclaredBody() {
+        let txnID = Array(UInt8(1)...UInt8(12))
+        var buf = buildSTUNResponse(
+            attrType: 0x0020,
+            xorMapped: true,
+            ip: "203.0.113.5",
+            port: 4001,
+            transactionID: txnID)
+        buf.setInteger(UInt16(4), at: 2, endianness: .big)
+
+        #expect(STUNResponseHandler.parseResponse(&buf, expectedTransactionID: txnID) == nil)
     }
 
     private func buildSTUNResponse(
@@ -242,6 +328,44 @@ struct ObservedAddressTests {
         var set: Set<ObservedAddress> = [a]
         set.insert(b)
         #expect(set.count == 1)
+    }
+}
+
+@Suite("STUN advertisement")
+struct STUNAdvertisementTests {
+    @Test("STUN contributes the observed host, not its UDP source port")
+    func observedUDPPortIsNotAdvertisedAsTCP() async {
+        let node = Ivy(config: IvyConfig(
+            publicKey: "stun-advertisement",
+            listenPort: 4001,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        await node.setPublicAddressForTesting(ObservedAddress(
+            host: "8.8.8.8",
+            port: 59_999))
+
+        #expect(await node.advertisedListenAddressesForTesting() == [
+            ListenAddress(host: "8.8.8.8", port: 4001),
+        ])
+        #expect(await node.localProviderEndpoint()?.port == 4001)
+    }
+
+    @Test("a new run does not retain an old observed address")
+    func observedAddressIsRunScoped() async throws {
+        let port = TransportTestHarness.nextPort()
+        let node = Ivy(config: IvyConfig(
+            publicKey: "stun-run-scope",
+            listenPort: port,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        await node.setPublicAddressForTesting(ObservedAddress(
+            host: "8.8.8.8",
+            port: 59_999))
+
+        try await node.start()
+
+        #expect(await node.publicAddress == nil)
+        await node.stop()
     }
 }
 

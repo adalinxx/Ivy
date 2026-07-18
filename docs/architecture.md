@@ -45,6 +45,11 @@ bound exhaustion close it.
 - Strings, collections, connections, netgroups, pending requests, waiters,
   candidates, routing entries, provider hints, and relay routes are bounded.
 - Content framing overhead is subtracted before storage materializes bytes.
+- Each connection owns its inbound reader task, so close cancels cooperative
+  work. Local and remote content callbacks share one concurrency cap; a
+  callback that ignores cancellation keeps its slot until it actually exits.
+- A physical dial keeps its connection-cap reservation until the underlying
+  NIO future completes, including across stop and restart.
 
 Tally gates authenticated application work using peer-global traffic evidence
 and pressure. A relay packet's full signed carrier payload is recorded before
@@ -73,7 +78,9 @@ entries; only a successful authenticated session promotes an endpoint into
 routing. A referral must use a globally routable IP. A private or loopback
 self-advertisement is usable only when it exactly matches the observed socket
 address. Pinned mode admits one endpoint identity. Ivy has no peer-exchange
-protocol.
+protocol. STUN contributes an observed host only; configure `externalAddress`
+with an IP literal when the externally reachable TCP port differs from
+`listenPort`.
 
 A content request is exactly:
 
@@ -81,12 +88,14 @@ A content request is exactly:
 rootCID + deduplicated selected identifiers
 ```
 
-The source must return that set exactly once within the direct or relayed byte
+Identifiers are non-empty ASCII wire strings, so equality is byte-exact without
+assigning them semantics. The source must return that set exactly once within the direct or relayed byte
 budget. Duplicate, extra, missing, oversized, unsolicited, and unexpected-peer
 responses are unavailable, never partial.
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
-the wire request. Provider hints are bounded and expiring. A failed local dial
+the wire request. `requestTimeout` bounds that whole fetch for its callers;
+timed-out backend or network work remains counted until it exits. Provider hints are bounded and expiring. A failed local dial
 does not erase a hint, and a failed address does not suppress a healthy address
 for the same identity.
 

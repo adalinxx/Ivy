@@ -14,21 +14,27 @@ private extension Ivy {
     }
 
     func networkFetchWaiterCount(for key: ContentRequestKey) -> Int {
-        pendingNetworkFetches[key]?.waiters.count ?? 0
+        max(0, (pendingFetches[key]?.continuations.count ?? 0) - 1)
     }
 }
 
 private actor BlockingContentSource: IvyContentSource {
     private var starts = 0
+    private var active = 0
+    private var maximumActive = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
         starts += 1
+        active += 1
+        maximumActive = max(maximumActive, active)
         await withCheckedContinuation { waiters.append($0) }
+        active -= 1
         return []
     }
 
     func startedCount() -> Int { starts }
+    func maxActiveCount() -> Int { maximumActive }
 
     func releaseAll() {
         let current = waiters
@@ -71,6 +77,8 @@ private actor ControlledNetworkFetch {
         completions[invocation] = response
     }
 
+    func count() -> Int { invocationCount }
+
     private func hasCompletion(_ invocation: Int) -> Bool { completions[invocation] != nil }
     private func hasInvocations(_ count: Int) -> Bool { invocationCount >= count }
 }
@@ -110,6 +118,131 @@ struct ContentExchangeTests {
             publicKey: key,
             listenPort: 0,
             requestTimeout: .seconds(1)))
+    }
+
+    @Test("public network fetch leaders stop at the pending-request cap")
+    func publicNetworkFetchCap() async throws {
+        let port = TransportTestHarness.nextPort()
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-network-cap",
+            listenPort: port,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxPendingRequests: 2,
+            externalAddress: ("127.0.0.1", port)))
+        let controlled = ControlledNetworkFetch()
+        await ivy.setNetworkFetchHookForTesting { _, _, _ in await controlled.run() }
+
+        try await ivy.start()
+        let first = BoundedTestTask { await ivy.fetchContent(rootCID: "root-a") }
+        let second = BoundedTestTask { await ivy.fetchContent(rootCID: "root-b") }
+        try await controlled.waitForInvocations(2)
+
+        let rejected = BoundedTestTask { await ivy.fetchContent(rootCID: "root-c") }
+        #expect(try await rejected.value(waitingFor: "capped network fetch") == .empty)
+        #expect(await controlled.count() == 2)
+
+        await controlled.complete(0, with: .empty)
+        await controlled.complete(1, with: .empty)
+        #expect(try await first.value(waitingFor: "first capped fetch") == .empty)
+        #expect(try await second.value(waitingFor: "second capped fetch") == .empty)
+        await ivy.stop()
+    }
+
+    @Test("local fetches coalesce and retain their concurrency slots across restart")
+    func localFetchWorkRemainsBoundedAcrossRestart() async throws {
+        let port = TransportTestHarness.nextPort()
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-local-cap",
+            listenPort: port,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxConcurrentContentRequests: 2,
+            externalAddress: ("127.0.0.1", port)))
+        let source = BlockingContentSource()
+        await ivy.setContentSource(source)
+        try await ivy.start()
+
+        let first = BoundedTestTask { await ivy.fetchContent(rootCID: "root-a") }
+        try await TestSynchronization.wait(for: "first local fetch") {
+            await source.startedCount() == 1
+        }
+        let follower = BoundedTestTask { await ivy.fetchContent(rootCID: "root-a") }
+        let key = ContentRequestKey(rootCID: "root-a", cids: [])
+        try await TestSynchronization.wait(for: "coalesced local fetch") {
+            await ivy.networkFetchWaiterCount(for: key) == 1
+        }
+        let second = BoundedTestTask { await ivy.fetchContent(rootCID: "root-b") }
+        try await TestSynchronization.wait(for: "second local fetch") {
+            await source.startedCount() == 2
+        }
+
+        await ivy.stop()
+        #expect(try await follower.value(waitingFor: "stopped local follower") == .empty)
+        try await ivy.start()
+        #expect(await ivy.fetchContent(rootCID: "root-c") == .empty)
+        #expect(await source.startedCount() == 2)
+
+        await source.releaseAll()
+        #expect(try await first.value(waitingFor: "old first local fetch") == .empty)
+        #expect(try await second.value(waitingFor: "old second local fetch") == .empty)
+        #expect(await source.maxActiveCount() == 2)
+        await ivy.stop()
+    }
+
+    @Test("the fetch deadline returns while stalled work retains its bounded slot")
+    func fetchDeadlineKeepsStalledWorkBounded() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-deadline",
+            listenPort: 0,
+            requestTimeout: .milliseconds(50),
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxPendingRequests: 1,
+            maxConcurrentContentRequests: 1))
+        let source = BlockingContentSource()
+        await ivy.setContentSource(source)
+
+        let first = BoundedTestTask { await ivy.fetchContent(rootCID: "root-a") }
+        #expect(try await first.value(waitingFor: "timed-out local fetch") == .empty)
+        #expect(await ivy.activeFetchCountForTesting == 1)
+
+        let second = BoundedTestTask { await ivy.fetchContent(rootCID: "root-b") }
+        #expect(try await second.value(waitingFor: "capacity-rejected local fetch") == .empty)
+        #expect(await source.startedCount() == 1)
+
+        await source.releaseAll()
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.activeFetchCountForTesting == 0
+        })
+    }
+
+    @Test("stop drains a local fetch before the first network start")
+    func stopDrainsOfflineFetch() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "offline-content-stop",
+            listenPort: 0,
+            requestTimeout: .seconds(5),
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        let blocked = BlockingContentSource()
+        await ivy.setContentSource(blocked)
+
+        let stale = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        try await TestSynchronization.wait(for: "offline local fetch") {
+            await blocked.startedCount() == 1
+        }
+
+        await ivy.stop()
+        #expect(try await stale.value(waitingFor: "stopped offline fetch") == .empty)
+
+        let expected = Data("new".utf8)
+        await ivy.setContentSource(TestContentSource(entries: ["root": expected]))
+        try await ivy.start()
+        #expect(await ivy.fetchContent(rootCID: "root").entries == ["root": expected])
+
+        await blocked.releaseAll()
+        await ivy.stop()
     }
 
     @Test("coalesced public fetches are isolated across stop and restart")
@@ -261,6 +394,17 @@ struct ContentExchangeTests {
         #expect((await source.requests()).isEmpty)
     }
 
+    @Test("non-ASCII identifiers are rejected before storage")
+    func nonASCIIIdentifier() async {
+        let ivy = node("non-ascii-content-requester")
+        let source = TestContentSource(entries: [:])
+        await ivy.setContentSource(source)
+
+        #expect(await ivy.fetchContent(rootCID: "\u{00e9}") == .empty)
+        #expect(await ivy.fetchContent(rootCID: "e\u{0301}") == .empty)
+        #expect((await source.requests()).isEmpty)
+    }
+
     @Test("an incomplete selection is reported as unavailable")
     func incompleteSelection() async {
         let ivy = node("incomplete-requester")
@@ -301,6 +445,7 @@ struct ContentExchangeTests {
         let candidateA = PeerID(publicKey: deterministicTestPeerKey("candidate-a"))
         let candidateB = PeerID(publicKey: deterministicTestPeerKey("candidate-b"))
         let stranger = PeerID(publicKey: deterministicTestPeerKey("stranger"))
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
         let key = ContentRequestKey(rootCID: "root", cids: ["child"])
         let fetch = Task { await ivy.fetchContent(key, from: [candidateA, candidateB]) }
         #expect(try await TransportTestHarness.eventually {
@@ -341,6 +486,52 @@ struct ContentExchangeTests {
             ],
             servedBy: candidateB))
         #expect(await ivy.pendingContentState().requestID == nil)
+    }
+
+    @Test("a request rejected before enqueue does not wait for its network timeout")
+    func locallyRejectedRequestCompletesImmediately() async {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-local-rejection",
+            listenPort: 0,
+            requestTimeout: .seconds(5)))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("missing-content-peer"))
+
+        let started = ContinuousClock.now
+        let response = await ivy.fetchContent(
+            ContentRequestKey(rootCID: "root", cids: []),
+            from: [peer])
+
+        #expect(response == .empty)
+        #expect(ContinuousClock.now - started < .milliseconds(200))
+        #expect(await ivy.pendingContentState().requestID == nil)
+    }
+
+    @Test("last-resort content fallback rotates across connected peers")
+    func connectedFallbackIsFair() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-fallback-fairness",
+            listenPort: 0,
+            maxContentCandidates: 2))
+        let peers = (0..<3).map {
+            PeerID(publicKey: deterministicTestPeerKey("fallback-peer-\($0)"))
+        }
+        for (index, peer) in peers.enumerated() {
+            let endpoint = PeerEndpoint(
+                publicKey: peer.publicKey,
+                host: "127.0.0.1",
+                port: UInt16(4100 + index))
+            try await ivy.seedConnectedEndpointForTesting(
+                endpoint,
+                marker: UInt8(index + 1))
+        }
+
+        let first = await ivy.connectedFallbackCandidates(rootCID: "root", excluding: [:])
+        let second = await ivy.connectedFallbackCandidates(rootCID: "root", excluding: [:])
+
+        #expect(first.count == 2)
+        #expect(second.count == 2)
+        #expect(Set(first + second) == Set(peers))
+        await ivy.stop()
     }
 
     @Test("inbound storage callbacks obey the global concurrency bound")

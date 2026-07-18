@@ -92,13 +92,12 @@ actor PeerHealthMonitor {
         peers[peer]?.missedPongs = 0
     }
 
-    func recordPong(from peer: PeerID, sessionID: SessionID, nonce: UInt64) {
-        guard let health = peers[peer], health.sessionID == sessionID else { return }
-        if health.pendingPingNonce == nonce {
-            peers[peer]?.pendingPingNonce = nil
-            peers[peer]?.missedPongs = 0
-            peers[peer]?.lastActivity = now()
-        }
+    func recordPong(from peer: PeerID, sessionID: SessionID, nonce: UInt64) -> Bool {
+        guard let health = peers[peer],
+              health.sessionID == sessionID,
+              health.pendingPingNonce == nonce else { return false }
+        recordActivity(from: peer, sessionID: sessionID)
+        return true
     }
 
     func checkAndPing(

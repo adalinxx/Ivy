@@ -63,6 +63,8 @@ struct NetGroupTests {
         #expect(NetGroup.group("999.1.1.1") == "raw:999.1.1.1")   // octet out of range
         #expect(NetGroup.group("1.2.3") == "raw:1.2.3")            // too few octets
         #expect(NetGroup.group("2001:db8::xyz") == "raw:2001:db8::xyz") // bad hex
+        #expect(NetGroup.group("2606::4700:1:2:3:4:5:6")
+            == "raw:2606::4700:1:2:3:4:5:6") // :: must compress at least one group
         // Two distinct malformed hosts get distinct groups (no merge).
         #expect(NetGroup.group("foo") != NetGroup.group("bar"))
     }
