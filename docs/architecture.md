@@ -37,9 +37,10 @@ bound exhaustion close it.
 ## Bounds
 
 - Every encoder, decoder, direct peer, and relay uses one 4 MiB frame-body cap.
-- One node-wide byte budget covers partial headers, declared frame bodies,
-  relayed records, and queued records. Its default is 64 MiB; exhaustion closes
-  the affected connection without peer blame.
+- Each connection may hold at most two maximum frame bodies plus a partial
+  header. One node-wide byte budget also covers bytes actually received in
+  partial frames, relayed records, and queued records. Its default is 64 MiB;
+  exhaustion closes the affected connection without peer blame.
 - Canonical session metadata is limited to 64 KiB.
 - Strings, collections, connections, netgroups, pending requests, waiters,
   candidates, routing entries, provider hints, and relay routes are bounded.

@@ -3,6 +3,17 @@ import Testing
 @testable import Ivy
 import Tally
 
+private actor CountingContentSource: IvyContentSource {
+    private var requestCount = 0
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        requestCount += 1
+        return cids.map { ContentEntry(cid: $0, data: Data("available".utf8)) }
+    }
+
+    var requests: Int { requestCount }
+}
+
 @Suite("Provider suppression")
 struct ProviderSuppressionTests {
     @Test("caller-reported invalid content suppresses only that root without a Tally penalty")
@@ -58,6 +69,42 @@ struct ProviderSuppressionTests {
 
         #expect(await node.providers(for: "root") == Array(retained.suffix(2)))
         #expect(await node.deficiencySuppressionCount(for: "bad-root") == 2)
+    }
+
+    @Test("same-root deficiency is honored by last-resort connected fallback")
+    func deficiencySuppressesConnectedFallback() async throws {
+        let requesterIdentity = TransportTestHarness.identity("suppression-requester")
+        let providerIdentity = TransportTestHarness.identity("suppression-provider")
+        let requesterPort = TransportTestHarness.nextPort()
+        let providerPort = TransportTestHarness.nextPort()
+        let requester = Ivy(config: TransportTestHarness.config(
+            requesterIdentity,
+            port: requesterPort))
+        let provider = Ivy(config: TransportTestHarness.config(
+            providerIdentity,
+            port: providerPort))
+        let source = CountingContentSource()
+        await provider.setContentSource(source)
+
+        try await provider.start()
+        try await requester.start()
+        try await requester.connect(to: TransportTestHarness.endpoint(
+            providerIdentity,
+            port: providerPort))
+        let providerID = TransportTestHarness.key(providerIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await requester.peerConnectionCount == 1
+        })
+
+        await requester.reportDeficientContent(
+            rootCID: "suppressed-root",
+            servedBy: providerID)
+        let response = await requester.fetchContent(rootCID: "suppressed-root")
+
+        #expect(response == .empty)
+        #expect(await source.requests == 0)
+        await requester.stop()
+        await provider.stop()
     }
 }
 

@@ -311,6 +311,7 @@ extension Ivy {
 
         candidates = Array(connectedEndpointIDs()
             .filter { !attemptedPeers.contains($0) }
+            .filter { !isDeficiencySuppressed(rootCID: key.rootCID, peer: $0) }
             .prefix(config.maxContentCandidates))
         guard !candidates.isEmpty else { return .empty }
         let response = await fetchContent(key, from: candidates, generation: generation)

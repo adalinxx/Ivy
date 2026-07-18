@@ -2140,12 +2140,17 @@ public actor Ivy {
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
             .childChannelInitializer { channel in
-                let decoder = SessionFrameDecoder(budget: self.inboundByteBudget)
+                let connectionBudget = InboundByteBudget(
+                    limit: PeerConnection.maxInboundBufferedBytes)
+                let decoder = SessionFrameDecoder(
+                    budget: self.inboundByteBudget,
+                    connectionBudget: connectionBudget)
                 let acceptor = InboundConnectionAcceptor(
                     ivy: self,
                     generation: generation,
                     admissionGate: gate,
-                    inboundByteBudget: self.inboundByteBudget
+                    inboundByteBudget: self.inboundByteBudget,
+                    connectionInboundByteBudget: connectionBudget
                 )
                 return channel.pipeline.addHandlers([decoder, acceptor])
             }
