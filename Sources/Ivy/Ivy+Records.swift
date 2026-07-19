@@ -207,9 +207,7 @@ extension Ivy {
     }
 
     private func makeProviderRequestID() -> UInt64 {
-        makeWireOperationID { requestID in
-            pendingProviderQueries.values.contains { $0.requestID == requestID }
-        }
+        makeWireOperationID(avoiding: Set(pendingProviderQueries.values.map(\.requestID)))
     }
 
     func resolveProviderQuery(rootCID: String, requestID: UInt64) {
