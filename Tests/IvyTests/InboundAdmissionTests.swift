@@ -641,7 +641,7 @@ private extension Ivy {
         reconnectTasks[peer] = PendingReconnect(
             generation: generation,
             token: token,
-            task: Task {})
+            task: MultiThreadedEventLoopGroup.singleton.next().scheduleTask(in: .seconds(60)) {})
     }
 
     func testReconnectToken(peer: PeerID) -> UInt64? {
