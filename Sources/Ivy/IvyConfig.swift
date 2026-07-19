@@ -28,6 +28,8 @@ public struct IvyConfig: Sendable {
     public let routingRefreshInterval: Duration
     public let logger: any IvyLogger
     public let maxConnections: Int
+    /// Slots held back from inbound handshakes so an outbound configured peer can connect.
+    public let reservedOutboundConnectionSlots: Int
     public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
     public let maxWaitersPerRequest: Int
@@ -51,6 +53,7 @@ public struct IvyConfig: Sendable {
         routingRefreshInterval: Duration = .seconds(120),
         logger: any IvyLogger = NullLogger(),
         maxConnections: Int = IvyConfig.defaultMaxConnections,
+        reservedOutboundConnectionSlots: Int = 0,
         maxConnectionsPerNetgroup: Int = 2,
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
@@ -79,6 +82,7 @@ public struct IvyConfig: Sendable {
         self.routingRefreshInterval = routingRefreshInterval
         self.logger = logger
         self.maxConnections = maxConnections
+        self.reservedOutboundConnectionSlots = reservedOutboundConnectionSlots
         self.maxConnectionsPerNetgroup = maxConnectionsPerNetgroup
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
@@ -97,6 +101,10 @@ public struct IvyConfig: Sendable {
               maxConcurrentContentRequests > 0,
               maxContentCandidates > 0 else {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
+        }
+        guard (0...maxConnections).contains(reservedOutboundConnectionSlots) else {
+            throw IvyModeError.invalidConfiguration(
+                "reserved outbound connection slots must fit within maxConnections")
         }
         guard maxInboundBufferedBytes >= Int(IvyConfig.protocolMaxFrameSize) + 4 else {
             throw IvyModeError.invalidConfiguration(
@@ -179,5 +187,9 @@ public struct IvyConfig: Sendable {
 
     func allowsEndpoint(_ key: PeerKey) -> Bool {
         key != peerKey && mode.allowsEndpoint(key) && !isConfiguredCarrier(key)
+    }
+
+    var maxInboundConnections: Int {
+        maxConnections - reservedOutboundConnectionSlots
     }
 }
