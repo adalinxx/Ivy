@@ -150,6 +150,7 @@ public actor Ivy {
     private var inboundAdmissionGate: InboundAdmissionGate?
 
     let stunClient: STUNClient
+    private var publicAddressDiscoveryTask: Task<Void, Never>?
     private(set) public var publicAddress: ObservedAddress?
     var routingRefreshTimer: RepeatedTask?
     var pendingNeighborResponses: [UInt64: PendingNeighborResponse] = [:]
@@ -222,6 +223,8 @@ public actor Ivy {
         serverChannel = listener.channel
         inboundAdmissionGate = listener.gate
         running = true
+        publicAddressDiscoveryTask?.cancel()
+        publicAddressDiscoveryTask = nil
         publicAddress = nil
         reconnectSuppressed.removeAll()
         nextConnectedFallbackOffset = 0
@@ -255,10 +258,8 @@ public actor Ivy {
             let address = ObservedAddress(host: externalAddress.host, port: externalAddress.port)
             publicAddress = address
             delegate?.ivy(self, didDiscoverPublicAddress: address)
-        } else if let address = await stunClient.discoverPublicAddress() {
-            guard isCurrentRun(generation) else { return }
-            publicAddress = address
-            delegate?.ivy(self, didDiscoverPublicAddress: address)
+        } else if !config.stunServers.isEmpty {
+            startPublicAddressDiscovery(generation: generation)
         }
         guard isCurrentRun(generation) else { return }
 
@@ -307,6 +308,8 @@ public actor Ivy {
         }
         runGeneration &+= 1
         running = false
+        publicAddressDiscoveryTask?.cancel()
+        publicAddressDiscoveryTask = nil
         inboundAdmissionGate?.invalidate()
         inboundAdmissionGate = nil
         routingRefreshTimer?.cancel()
@@ -331,6 +334,39 @@ public actor Ivy {
         }
         reconnectTasks.removeAll()
         reconnectAttempts.removeAll()
+    }
+
+    private func startPublicAddressDiscovery(generation: UInt64) {
+        let client = stunClient
+#if DEBUG || IVY_TESTING
+        let hook = publicAddressDiscoveryHookForTesting
+#endif
+        publicAddressDiscoveryTask = Task.detached { [weak self, client] in
+#if DEBUG || IVY_TESTING
+            let address = if let hook {
+                await hook()
+            } else {
+                await client.discoverPublicAddress()
+            }
+#else
+            let address = await client.discoverPublicAddress()
+#endif
+            await self?.completePublicAddressDiscovery(
+                address,
+                generation: generation
+            )
+        }
+    }
+
+    private func completePublicAddressDiscovery(
+        _ address: ObservedAddress?,
+        generation: UInt64
+    ) {
+        guard isCurrentRun(generation) else { return }
+        publicAddressDiscoveryTask = nil
+        guard let address else { return }
+        publicAddress = address
+        delegate?.ivy(self, didDiscoverPublicAddress: address)
     }
 
     func isCurrentRun(_ generation: UInt64) -> Bool {
@@ -2216,7 +2252,7 @@ public actor Ivy {
 
         case .peerMessage(let topic, let payload):
             guard let session else { return }
-            delegate?.ivy(
+            await delegate?.ivy(
                 self,
                 didReceiveMessage: PeerMessage(topic: topic, payload: payload),
                 from: AuthenticatedPeer(
@@ -2355,6 +2391,7 @@ public actor Ivy {
     /// Safety net for an instance released with requests still in flight.
     deinit {
         lifecycleTail?.cancel()
+        publicAddressDiscoveryTask?.cancel()
         routingRefreshTimer?.cancel()
         serverChannel?.close(promise: nil)
         for reconnect in reconnectTasks.values { reconnect.task.cancel() }
@@ -2422,6 +2459,7 @@ public actor Ivy {
     var lifecycleRequestCountForTesting = 0
     var lifecycleStartHookForTesting: (@Sendable () async -> Void)?
     var listenerReadyHookForTesting: (@Sendable () async -> Void)?
+    var publicAddressDiscoveryHookForTesting: (@Sendable () async -> ObservedAddress?)?
     var lifecycleRequestHookForTesting: (@Sendable (Int) async -> Void)?
     var neighborRequestHookForTesting: (@Sendable (PeerID, [UInt8]) async -> [PeerEndpoint])?
     var networkFetchHookForTesting: (
@@ -2440,8 +2478,18 @@ public actor Ivy {
         listenerReadyHookForTesting = hook
     }
 
+    func setPublicAddressDiscoveryHookForTesting(
+        _ hook: (@Sendable () async -> ObservedAddress?)?
+    ) {
+        publicAddressDiscoveryHookForTesting = hook
+    }
+
     func setLifecycleRequestHookForTesting(_ hook: (@Sendable (Int) async -> Void)?) {
         lifecycleRequestHookForTesting = hook
+    }
+
+    func publicAddressDiscoveryTaskForTesting() -> Task<Void, Never>? {
+        publicAddressDiscoveryTask
     }
 
     func setNeighborRequestHookForTesting(
