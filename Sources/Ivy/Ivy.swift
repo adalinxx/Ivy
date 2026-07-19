@@ -786,7 +786,7 @@ public actor Ivy {
         let netgroup = connectionNetgroup(connection)
         guard isCurrentRun(generation),
               connection.isLive,
-              connectionCapacityUsed < config.maxConnections,
+              connectionCapacityUsed < config.maxInboundConnections,
               (!connection.isDirect
                 || directConnectionCount(inNetgroup: netgroup)
                     < config.maxConnectionsPerNetgroup) else {
@@ -1103,7 +1103,17 @@ public actor Ivy {
             return
         }
 
-        if !canPromote(pending.connection, peerKey: peerKey) {
+        let isInbound: Bool
+        if case .responder = pending.direction {
+            isInbound = true
+        } else {
+            isInbound = false
+        }
+        if !canPromote(
+            pending.connection,
+            peerKey: peerKey,
+            isInbound: isInbound
+        ) {
             pending.continuation?.resume(returning: false)
             removeRouteConnection(pending.connection)
             pending.connection.cancel()
@@ -1173,9 +1183,11 @@ public actor Ivy {
 
     private func canPromote(
         _ connection: PeerConnection,
-        peerKey: PeerKey
+        peerKey: PeerKey,
+        isInbound: Bool
     ) -> Bool {
-        if sessions[peerKey] == nil, sessions.count >= config.maxConnections {
+        let limit = isInbound ? config.maxInboundConnections : config.maxConnections
+        if sessions[peerKey] == nil, sessions.count >= limit {
             return false
         }
         return !connection.isDirect
@@ -2549,8 +2561,12 @@ public actor Ivy {
             carrier: carrier) != nil
     }
 
-    func canPromoteForTesting(_ connection: PeerConnection, peerKey: PeerKey) -> Bool {
-        canPromote(connection, peerKey: peerKey)
+    func canPromoteForTesting(
+        _ connection: PeerConnection,
+        peerKey: PeerKey,
+        isInbound: Bool = false
+    ) -> Bool {
+        canPromote(connection, peerKey: peerKey, isInbound: isInbound)
     }
 
     func seedOutgoingDialForTesting(
@@ -2660,7 +2676,7 @@ public actor Ivy {
         generation: UInt64
     ) async throws -> (channel: Channel, gate: InboundAdmissionGate) {
         let gate = InboundAdmissionGate(
-            maxConnections: config.maxConnections,
+            maxConnections: config.maxInboundConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
         let inboundByteBudget = self.inboundByteBudget
         let bootstrap = ServerBootstrap(group: group)

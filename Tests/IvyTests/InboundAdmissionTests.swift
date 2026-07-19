@@ -27,6 +27,74 @@ struct InboundAdmissionTests {
         #expect(gate.reserve(observedHost: "10.4.1.1") == nil)
     }
 
+    @Test("an outbound reservation survives inbound churn")
+    func outboundReservationSurvivesInboundChurn() async throws {
+        let identity = TransportTestHarness.identity("outbound-reservation-node")
+        let port = TransportTestHarness.nextPort()
+        let ivy = Ivy(config: IvyConfig(
+            signingKey: identity,
+            listenPort: port,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxConnections: 2,
+            reservedOutboundConnectionSlots: 1,
+            maxConnectionsPerNetgroup: 2,
+            externalAddress: ("127.0.0.1", port)))
+        try await ivy.start()
+
+        let first = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .connect(host: "127.0.0.1", port: Int(port)).get()
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingSessionCountForTesting == 1
+        })
+
+        let second = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .connect(host: "127.0.0.1", port: Int(port)).get()
+        #expect(try await TransportTestHarness.eventually { !second.isActive })
+
+        let parent = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("outbound-reservation-parent"),
+            host: "10.1.1.1",
+            port: 4001)
+        #expect(await ivy.reserveOutgoingDial(to: parent))
+
+        await ivy.finishOutgoingDial(
+            to: PeerID(publicKey: parent.publicKey),
+            generation: await ivy.runGeneration)
+        try? await first.close().get()
+        try? await second.close().get()
+        await ivy.stop()
+    }
+
+    @Test("inbound promotion cannot consume an outbound reservation")
+    func inboundPromotionKeepsOutboundReservation() async throws {
+        let node = Ivy(config: IvyConfig(
+            publicKey: "reserved-promotion-node",
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxConnections: 2,
+            reservedOutboundConnectionSlots: 1))
+        let existing = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("reserved-promotion-existing"),
+            host: "10.1.0.1",
+            port: 4001)
+        try await node.seedConnectedEndpointForTesting(existing, marker: 1)
+        let candidate = try PeerKey(deterministicTestPeerKey("reserved-promotion-candidate"))
+        let connection = self.connection(label: "reserved-promotion")
+
+        #expect(!(await node.canPromoteForTesting(
+            connection,
+            peerKey: candidate,
+            isInbound: true)))
+        #expect(await node.canPromoteForTesting(
+            connection,
+            peerKey: candidate,
+            isInbound: false))
+        connection.cancel()
+        await node.stop()
+    }
+
     @Test("session replacement still obeys the destination netgroup cap")
     func replacementObeysNetgroupCap() async throws {
         let node = Ivy(config: IvyConfig(

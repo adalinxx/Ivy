@@ -235,6 +235,15 @@ struct IvyTopologyTests {
             try config.validate()
         }
 
+        let excessiveReservation = IvyConfig(
+            signingKey: identity(1),
+            maxConnections: 1,
+            reservedOutboundConnectionSlots: 2)
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "reserved outbound connection slots must fit within maxConnections")) {
+            try excessiveReservation.validate()
+        }
+
         let undersizedInboundBudget = IvyConfig(
             signingKey: identity(1),
             maxInboundBufferedBytes: Int(IvyConfig.protocolMaxFrameSize))
