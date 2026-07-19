@@ -3,6 +3,8 @@ import NIOCore
 import NIOPosix
 import Tally
 
+typealias IvyTimer = Scheduled<Void>
+
 public enum IvyError: Error, Sendable, Equatable {
     case notRunning
     case invalidPeerKey
@@ -15,7 +17,7 @@ public enum IvyError: Error, Sendable, Equatable {
 struct PendingNeighborResponse: Sendable {
     let peer: PeerID
     let continuation: CheckedContinuation<[PeerEndpoint], Never>
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 private enum PendingSessionDirection {
@@ -33,7 +35,7 @@ private struct PendingSession {
     var remoteKey: PeerKey?
     var remoteMetadata: PeerMetadata?
     var continuation: CheckedContinuation<Bool, Never>? = nil
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 final class AuthenticatedSession: @unchecked Sendable {
@@ -66,7 +68,7 @@ private struct RelayRoute {
     let lifecycleID: UUID
     var ready: Bool
     var lastActivity: ContinuousClock.Instant
-    var expiryTask: Task<Void, Never>? = nil
+    var expiryTask: IvyTimer? = nil
 }
 
 private struct InstalledRoute {
@@ -74,14 +76,15 @@ private struct InstalledRoute {
     let remote: PeerKey
     let lifecycleID: UUID
     var connection: PeerConnection? = nil
-    var expiryTask: Task<Void, Never>? = nil
+    var expiryTask: IvyTimer? = nil
 }
 
 private struct PendingRelayOpen {
     let carrier: PeerKey
     let target: PeerKey
+    let timeoutToken: UUID
     let continuation: CheckedContinuation<Data?, Never>
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 private struct PendingOutgoingDial {
@@ -94,7 +97,7 @@ private struct PendingOutgoingDial {
 struct PendingReconnect {
     let generation: UInt64
     let token: UInt64
-    let task: Task<Void, Never>
+    let task: IvyTimer
 }
 
 enum ProtocolViolationEvidence {
@@ -148,7 +151,7 @@ public actor Ivy {
 
     let stunClient: STUNClient
     private(set) public var publicAddress: ObservedAddress?
-    var routingRefreshTask: Task<Void, Never>?
+    var routingRefreshTimer: RepeatedTask?
     var pendingNeighborResponses: [UInt64: PendingNeighborResponse] = [:]
     var healthMonitor: PeerHealthMonitor?
     private var outgoingDials: [PeerID: PendingOutgoingDial] = [:]
@@ -235,7 +238,7 @@ public actor Ivy {
                 }
             })
         healthMonitor = monitor
-        await monitor.startMonitoring { [weak self] peer, sessionID, nonce in
+        await monitor.startMonitoring(on: group.next()) { [weak self] peer, sessionID, nonce in
             guard let self else { return }
             await self.sendHealthPing(
                 peer,
@@ -306,8 +309,8 @@ public actor Ivy {
         running = false
         inboundAdmissionGate?.invalidate()
         inboundAdmissionGate = nil
-        routingRefreshTask?.cancel()
-        routingRefreshTask = nil
+        routingRefreshTimer?.cancel()
+        routingRefreshTimer = nil
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
@@ -337,10 +340,12 @@ public actor Ivy {
     func delayedTask(
         after delay: Duration,
         perform action: @escaping @Sendable () async -> Void
-    ) -> Task<Void, Never> {
-        Task {
-            do { try await Task.sleep(for: delay) } catch { return }
-            await action()
+    ) -> IvyTimer {
+        let eventLoop = group.next()
+        return eventLoop.scheduleTask(in: TimeAmount(delay)) {
+            _ = Task {
+                await action()
+            }
         }
     }
 
@@ -1760,12 +1765,14 @@ public actor Ivy {
                 + pendingRelayOpens.values.lazy.filter({ $0.carrier == carrier }).count
                 < Self.maxRelayRoutesPerPeer else { return nil }
         let routeID = freshRouteID()
+        let timeoutToken = UUID()
 
         let opened = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 var pending = PendingRelayOpen(
                     carrier: carrier,
                     target: target,
+                    timeoutToken: timeoutToken,
                     continuation: continuation)
                 pendingRelayOpens[routeID] = pending
                 guard sendRelayControl(
@@ -1778,21 +1785,21 @@ public actor Ivy {
                 }
                 let timeout = config.relayTimeout
                 pending.timeoutTask = delayedTask(after: timeout) { [weak self] in
-                    await self?.timeoutRelayOpen(routeID)
+                    await self?.timeoutRelayOpen(routeID, token: timeoutToken)
                 }
                 pendingRelayOpens[routeID] = pending
             }
         } onCancel: { [weak self] in
             guard let self else { return }
             Task {
-                await self.timeoutRelayOpen(routeID)
+                await self.timeoutRelayOpen(routeID, token: timeoutToken)
             }
         }
         if Task.isCancelled {
             if let opened {
                 closeInstalledRoute(opened, notifyCarrier: true)
             } else {
-                timeoutRelayOpen(routeID)
+                timeoutRelayOpen(routeID, token: timeoutToken)
             }
             return nil
         }
@@ -1803,6 +1810,11 @@ public actor Ivy {
         guard let pending = removePendingRelayOpen(routeID) else { return }
         _ = sendRelayControl(.relayClose(routeID: routeID), to: pending.carrier)
         pending.continuation.resume(returning: nil)
+    }
+
+    private func timeoutRelayOpen(_ routeID: Data, token: UUID) {
+        guard pendingRelayOpens[routeID]?.timeoutToken == token else { return }
+        timeoutRelayOpen(routeID)
     }
 
     private func handleRelayControl(_ message: Message, from sender: PeerKey) {
@@ -2343,7 +2355,7 @@ public actor Ivy {
     /// Safety net for an instance released with requests still in flight.
     deinit {
         lifecycleTail?.cancel()
-        routingRefreshTask?.cancel()
+        routingRefreshTimer?.cancel()
         serverChannel?.close(promise: nil)
         for reconnect in reconnectTasks.values { reconnect.task.cancel() }
         for route in relayRoutes.values { route.expiryTask?.cancel() }
@@ -2591,6 +2603,7 @@ public actor Ivy {
             pendingRelayOpens[routeID] = PendingRelayOpen(
                 carrier: carrier,
                 target: target,
+                timeoutToken: UUID(),
                 continuation: continuation)
         }
     }

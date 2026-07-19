@@ -38,7 +38,7 @@ struct PendingContentRequest {
     let key: ContentRequestKey
     let continuation: CheckedContinuation<AttributedContentResponse, Never>
     var candidates: Set<PeerID>
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 struct PendingFetch {
@@ -46,7 +46,7 @@ struct PendingFetch {
     let generation: UInt64
     var continuations: [CheckedContinuation<AttributedContentResponse, Never>]
     var operationTask: Task<Void, Never>? = nil
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 struct InboundContentRequest: Hashable {

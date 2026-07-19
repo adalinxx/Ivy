@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import Tally
 
 enum EndpointProvenance {
@@ -194,27 +195,26 @@ extension Ivy {
     }
 
     func startRoutingRefresh(generation: UInt64) {
-        routingRefreshTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(30))
-            } catch {
-                return
-            }
-            while !Task.isCancelled {
-                let interval: Duration
-                if let self {
-                    guard await self.isCurrentRun(generation) else { return }
-                    await self.refreshRoutingTable(generation: generation)
-                    interval = self.config.routingRefreshInterval
-                } else {
+        routingRefreshTimer?.cancel()
+        let eventLoop = group.next()
+        routingRefreshTimer = eventLoop.scheduleRepeatedAsyncTask(
+            initialDelay: .seconds(30),
+            delay: TimeAmount(config.routingRefreshInterval)
+        ) { [weak self] task in
+            let promise = eventLoop.makePromise(of: Void.self)
+            _ = Task { [weak self] in
+                guard let self, await self.isCurrentRun(generation) else {
+                    task.cancel()
+                    promise.succeed(())
                     return
                 }
-                do {
-                    try await Task.sleep(for: interval)
-                } catch {
-                    return
+                await self.refreshRoutingTable(generation: generation)
+                if !(await self.isCurrentRun(generation)) {
+                    task.cancel()
                 }
+                promise.succeed(())
             }
+            return promise.futureResult
         }
     }
 

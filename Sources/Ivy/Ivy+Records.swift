@@ -12,7 +12,7 @@ struct PendingProviderQuery {
     var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
     var expectedPeers: Set<String>
     var responsesByPeer: [String: [ProviderHint]]
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 extension Ivy {
