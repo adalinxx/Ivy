@@ -422,7 +422,7 @@ extension Ivy {
     }
 
     private func makeContentRequestID() -> UInt64 {
-        makeWireOperationID { pendingContentRequests[$0] != nil }
+        makeWireOperationID(avoiding: Set(pendingContentRequests.keys))
     }
 
     private func enqueueContentRequest(_ message: Message, to peer: PeerID) -> Bool {

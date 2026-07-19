@@ -4,6 +4,11 @@ import Testing
 import Tally
 
 private extension Ivy {
+    func makeWireOperationIDAfterWrap(avoiding inUse: Set<UInt64>) -> UInt64 {
+        nextWireOperationID = .max
+        return makeWireOperationID(avoiding: inUse)
+    }
+
     func pendingContentSnapshot() -> (requests: Int, waiters: Int) {
         (
             pendingContentRequests.count,
@@ -51,6 +56,13 @@ struct PendingRequestCapsTests {
             try? await Task.sleep(for: .milliseconds(5))
         }
         return false
+    }
+
+    @Test("wire operation IDs skip zero and live IDs after wrap")
+    func wireOperationIDWrapsWithoutCollision() async {
+        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 2))
+
+        #expect(await node.makeWireOperationIDAfterWrap(avoiding: [1]) == 2)
     }
 
     @Test("distinct selections stop at the global cap")

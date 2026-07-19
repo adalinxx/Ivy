@@ -2279,13 +2279,13 @@ public actor Ivy {
     }
 
     func makeFindNodeNonce() -> UInt64 {
-        makeWireOperationID { pendingNeighborResponses[$0] != nil }
+        makeWireOperationID(avoiding: Set(pendingNeighborResponses.keys))
     }
 
-    func makeWireOperationID(whileInUse isInUse: (UInt64) -> Bool) -> UInt64 {
+    func makeWireOperationID(avoiding inUse: Set<UInt64>) -> UInt64 {
         repeat {
             nextWireOperationID &+= 1
-        } while nextWireOperationID == 0 || isInUse(nextWireOperationID)
+        } while nextWireOperationID == 0 || inUse.contains(nextWireOperationID)
         return nextWireOperationID
     }
 
