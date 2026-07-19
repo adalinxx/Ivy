@@ -124,6 +124,10 @@ public struct IvyConfig: Sendable {
                     "externalAddress must be an IP literal with a nonzero port")
             }
         }
+        if case .privateNetwork = mode, relayEnabled || !carriers.isEmpty {
+            throw IvyModeError.invalidConfiguration(
+                "private network does not support relay transport")
+        }
 
         let pinned = try mode.pinnedKey()
         if pinned == peerKey {

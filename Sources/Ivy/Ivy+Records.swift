@@ -20,6 +20,7 @@ extension Ivy {
     static let maxProviderTTL: UInt64 = 24 * 60 * 60
 
     func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
+        guard config.mode.usesOverlayServices else { return }
         evictExpiredProviders(rootCID: rootCID)
         let records = providerRecordsForWire(providerHints[rootCID] ?? [])
         fireToPeer(
@@ -53,7 +54,8 @@ extension Ivy {
         records: [ProviderRecord],
         from peer: PeerID
     ) {
-        guard var pending = pendingProviderQueries[rootCID],
+        guard config.mode.usesOverlayServices,
+              var pending = pendingProviderQueries[rootCID],
               pending.requestID == requestID,
               pending.expectedPeers.remove(peer.publicKey) != nil else { return }
 
@@ -84,7 +86,8 @@ extension Ivy {
     }
 
     func handleAnnounceProvider(rootCID: String, expiresAt: UInt64, from peer: PeerID) {
-        guard providerExpiryIsValid(expiresAt),
+        guard config.mode.usesOverlayServices,
+              providerExpiryIsValid(expiresAt),
               shouldStoreProviderHint(rootCID: rootCID) else { return }
         storeProviderHint(
             rootCID: rootCID,
@@ -94,7 +97,9 @@ extension Ivy {
     }
 
     public func announceProvider(rootCID: String, expiresAt: UInt64) {
-        guard MessageLimits.accepts(rootCID), providerExpiryIsValid(expiresAt) else { return }
+        guard config.mode.usesOverlayServices,
+              MessageLimits.accepts(rootCID),
+              providerExpiryIsValid(expiresAt) else { return }
         if let endpoint = localProviderEndpoint() {
             storeProviderHint(
                 rootCID: rootCID,
@@ -111,7 +116,7 @@ extension Ivy {
 
     public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
         let generation = runGeneration
-        guard MessageLimits.accepts(rootCID) else { return [] }
+        guard config.mode.usesOverlayServices, MessageLimits.accepts(rootCID) else { return [] }
         let cached = cachedProviderEndpoints(rootCID: rootCID)
         return cached.isEmpty
             ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(
@@ -129,7 +134,9 @@ extension Ivy {
         rootCID: String,
         generation: UInt64
     ) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation), MessageLimits.accepts(rootCID) else { return [] }
+        guard config.mode.usesOverlayServices,
+              isCurrentRun(generation),
+              MessageLimits.accepts(rootCID) else { return [] }
         var targets = providerLookupTargets(rootCID: rootCID)
         if targets.isEmpty {
             _ = await findNode(target: rootCID, generation: generation)
@@ -264,7 +271,9 @@ extension Ivy {
     }
 
     public func rememberProvider(rootCID: String, peer: PeerID) {
-        guard MessageLimits.accepts(rootCID), hasEndpointSession(peer) else { return }
+        guard config.mode.usesOverlayServices,
+              MessageLimits.accepts(rootCID),
+              hasEndpointSession(peer) else { return }
         storeProviderHint(
             rootCID: rootCID,
             peer: peer,
@@ -379,6 +388,7 @@ extension Ivy {
     }
 
     public func providers(for rootCID: String) -> [PeerID] {
+        guard config.mode.usesOverlayServices else { return [] }
         evictExpiredProviders(rootCID: rootCID)
         var seen: Set<PeerID> = []
         return (providerHints[rootCID] ?? []).compactMap { hint in

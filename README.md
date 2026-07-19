@@ -30,10 +30,13 @@ A socket remains private until its signed session handshake completes.
 Sessions authenticate and replay-protect cleartext records; Ivy does not provide
 encryption or forward secrecy.
 
-`IvyMode.overlay` uses authenticated Kademlia discovery. `.pinned(peer:)`
-accepts one endpoint identity and disables public discovery. Configured carriers
-govern outbound relay initiation; inbound offers grant transport only and never
-turn a carrier into an endpoint peer.
+`IvyMode.overlay` uses authenticated Kademlia discovery. `.privateNetwork`
+accepts authenticated direct peers but disables discovery, routing, providers,
+content exchange, relay, and broadcast; applications use directed messages for
+their own private protocol. `.pinned(peer:)` accepts one endpoint identity and
+disables public discovery. Configured carriers govern outbound relay initiation;
+inbound offers grant transport only and never turn a carrier into an endpoint
+peer.
 
 ## Network roles
 

@@ -83,7 +83,7 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
     private var connected: [AuthenticatedPeer] = []
     private var currentConnections: Set<String> = []
     private var disconnected: [PeerID] = []
-    private var received: [(PeerMessage, PeerID)] = []
+    private var received: [(PeerMessage, AuthenticatedPeer)] = []
 
     func ivy(_ ivy: Ivy, didConnect peer: AuthenticatedPeer) {
         lock.withLock {
@@ -99,7 +99,7 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
         }
     }
 
-    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: PeerID) {
+    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: AuthenticatedPeer) {
         lock.withLock { received.append((message, peer)) }
     }
 
@@ -130,8 +130,16 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
     func receivedMessage(topic: String, payload: Data, from peer: PeerID) -> Bool {
         lock.withLock {
             received.contains { message, sender in
-                message.topic == topic && message.payload == payload && sender == peer
+                message.topic == topic && message.payload == payload && sender.id == peer
             }
+        }
+    }
+
+    func receivedPeer(topic: String, payload: Data) -> AuthenticatedPeer? {
+        lock.withLock {
+            received.first { message, _ in
+                message.topic == topic && message.payload == payload
+            }?.1
         }
     }
 }
@@ -366,12 +374,84 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             recorder.receivedMessage(topic: "node.state", payload: payload, from: clientID)
         })
+        #expect(recorder.receivedPeer(topic: "node.state", payload: payload)
+            == recorder.authenticatedPeers.first)
 
         let gossip = Data("new block".utf8)
         await client.broadcastMessage(topic: "blocks.gossip", payload: gossip)
         #expect(try await TransportTestHarness.eventually {
             recorder.receivedMessage(topic: "blocks.gossip", payload: gossip, from: clientID)
         })
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("Private network carries only explicit direct messages")
+    func privateNetworkTrafficIsolation() async throws {
+        let serverIdentity = TransportTestHarness.identity("private-network-server")
+        let clientIdentity = TransportTestHarness.identity("private-network-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            mode: .privateNetwork))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            mode: .privateNetwork))
+        let recorder = TransportTestRecorder()
+        await server.setTestDelegate(recorder)
+        await server.setContentSource(TransportTestContentSource([
+            "private-root": Data("private bytes".utf8),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
+        })
+
+        #expect(await server.knownPeerEndpoints.isEmpty)
+        #expect(await client.knownPeerEndpoints.isEmpty)
+        #expect(await client.findNode(target: "private-root").isEmpty)
+        #expect(await client.discoverProviders(rootCID: "private-root").isEmpty)
+
+        let sentBeforeOverlayAPIs = await client.tally.metrics.totalBytesSent
+        await client.broadcastMessage(topic: "not-private", payload: Data("broadcast".utf8))
+        let fetched = await client.fetchContent(rootCID: "private-root")
+        let expiry = UInt64(Date().timeIntervalSince1970) + 60
+        await client.announceProvider(rootCID: "private-root", expiresAt: expiry)
+        #expect(fetched == .empty)
+        #expect(await client.tally.metrics.totalBytesSent == sentBeforeOverlayAPIs)
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let serverSentBeforeReferrals = await server.tally.metrics.totalBytesSent
+        #expect(await client.sendAuthenticatedMessageForTesting(
+            .findNode(target: Data(repeating: 0xaa, count: 32), nonce: 1),
+            to: serverID))
+        #expect(await client.sendAuthenticatedMessageForTesting(
+            .announceProvider(rootCID: "private-root", expiresAt: expiry),
+            to: serverID))
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await server.tally.metrics.totalBytesSent == serverSentBeforeReferrals)
+        #expect(await server.providerHints.isEmpty)
+
+        let payload = Data("hierarchy fact".utf8)
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "hierarchy.fact",
+            payload: payload) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            recorder.receivedMessage(topic: "hierarchy.fact", payload: payload, from: clientID)
+        })
+        #expect(recorder.receivedPeer(topic: "hierarchy.fact", payload: payload)
+            == recorder.authenticatedPeers.first)
 
         await client.stop()
         await server.stop()

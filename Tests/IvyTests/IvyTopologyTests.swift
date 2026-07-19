@@ -13,6 +13,53 @@ struct IvyTopologyTests {
         try! PeerKey(rawRepresentation: identity.publicKey.rawRepresentation).hex
     }
 
+    @Test("private network accepts direct endpoints without public discovery")
+    func privateNetworkTopology() throws {
+        let first = key(identity(2))
+        let second = key(identity(3))
+        let mode = IvyMode.privateNetwork
+        #expect(mode.allowsEndpoint(try PeerKey(first)))
+        #expect(mode.allowsEndpoint(try PeerKey(second)))
+        #expect(!mode.participatesInPublicDiscovery)
+        #expect(!mode.usesOverlayServices)
+
+        let config = IvyConfig(
+            signingKey: identity(1),
+            bootstrapPeers: [
+                PeerEndpoint(publicKey: first, host: "127.0.0.1", port: 4001),
+                PeerEndpoint(publicKey: second, host: "127.0.0.1", port: 4002),
+            ],
+            stunServers: [("stun.example", 3478)],
+            minPeerKeyBits: 0,
+            mode: mode
+        )
+        try config.validate()
+        #expect(config.stunServers.isEmpty)
+    }
+
+    @Test("private network rejects relay configuration")
+    func privateNetworkRelayRejected() {
+        let remote = key(identity(2))
+        let carrier = PeerEndpoint(publicKey: remote, host: "127.0.0.1", port: 4001)
+        let relayServer = IvyConfig(
+            signingKey: identity(1),
+            relayEnabled: true,
+            mode: .privateNetwork)
+        let relayClient = IvyConfig(
+            signingKey: identity(1),
+            carriers: [carrier],
+            mode: .privateNetwork)
+
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "private network does not support relay transport")) {
+            try relayServer.validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "private network does not support relay transport")) {
+            try relayClient.validate()
+        }
+    }
+
     @Test("pinned identity canonicalizes raw and ed01 spellings")
     func pinnedCanonicalization() throws {
         let remote = key(identity(2))
@@ -20,6 +67,7 @@ struct IvyTopologyTests {
         #expect(mode.allowsEndpoint(try PeerKey(remote)))
         #expect(!mode.allowsEndpoint(try PeerKey(key(identity(3)))))
         #expect(!mode.participatesInPublicDiscovery)
+        #expect(mode.usesOverlayServices)
     }
 
     @Test("pinned mode keeps public discovery off and listener configuration intact")

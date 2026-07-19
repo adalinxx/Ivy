@@ -75,7 +75,9 @@ Overlay mode uses correlated `findNode` responses from authenticated Kademlia
 peers. Address scope, mode, identity work, connection capacity, and netgroup
 policy apply before admission. Referrals are lookup candidates, not routing
 entries; only a successful authenticated session promotes an endpoint into
-routing. A referral must use a globally routable IP. A private or loopback
+routing. Private-network mode exposes only authenticated direct messages; it
+does not run discovery, routing, provider, content, relay, or broadcast services.
+A referral must use a globally routable IP. A private or loopback
 self-advertisement is usable only when it exactly matches the observed socket
 address. Pinned mode admits one endpoint identity. Ivy has no peer-exchange
 protocol. STUN contributes an observed host only; configure `externalAddress`
