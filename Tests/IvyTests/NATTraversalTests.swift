@@ -270,9 +270,28 @@ struct STUNSourceAddressTests {
 
         let payload = makeSTUNResponse(ip: "198.51.100.5", port: 4001, transactionID: txnID)
         try await channel.writeInbound(AddressedEnvelope(remoteAddress: expected, data: payload))
+        handler.finishWithoutResponse()
 
         let result = await handler.waitForResponse()
         #expect(result == ObservedAddress(host: "198.51.100.5", port: 4001))
+        _ = try? await channel.finish()
+    }
+
+    @Test("Valid response after timeout is ignored")
+    func validResponseAfterTimeoutIsIgnored() async throws {
+        let txnID = Array(UInt8(1)...UInt8(12))
+        let expected = try SocketAddress(ipAddress: "203.0.113.10", port: 3478)
+        let handler = STUNResponseHandler(
+            expectedTransactionID: txnID,
+            expectedRemoteAddress: expected
+        )
+        let channel = await NIOAsyncTestingChannel(handler: handler)
+
+        handler.finishWithoutResponse()
+        let payload = makeSTUNResponse(ip: "198.51.100.5", port: 4001, transactionID: txnID)
+        try await channel.writeInbound(AddressedEnvelope(remoteAddress: expected, data: payload))
+
+        #expect(await handler.waitForResponse() == nil)
         _ = try? await channel.finish()
     }
 
@@ -306,6 +325,28 @@ struct STUNSourceAddressTests {
         #expect(result == ObservedAddress(host: "198.51.100.5", port: 4001),
                 "handler must drop the spoofed reply and accept only the expected-source reply")
         _ = try? await channel.finish()
+    }
+}
+
+@Suite("STUN response completion")
+struct STUNResponseCompletionTests {
+    @Test("timeout completes a waiter that has not received a response")
+    func timeoutCompletesPendingWaiter() async {
+        let handler = STUNResponseHandler()
+        let waiter = Task { await handler.waitForResponse() }
+        await Task.yield()
+
+        handler.finishWithoutResponse()
+
+        #expect(await waiter.value == nil)
+    }
+
+    @Test("timeout remains terminal when it wins before a waiter is installed")
+    func timeoutBeforeWaiterIsTerminal() async {
+        let handler = STUNResponseHandler()
+        handler.finishWithoutResponse()
+
+        #expect(await handler.waitForResponse() == nil)
     }
 }
 
