@@ -768,6 +768,12 @@ struct RelayIntegrationTests {
         }
         #expect(targetCarrier == carrierKey)
         #expect(targetRouteID == routeID)
+        let messagePeer = try #require(targetRecorder.receivedPeer(
+            topic: "node.state",
+            payload: payload))
+        #expect(messagePeer.key.peerID == sourceID)
+        #expect(messagePeer.role == .endpoint)
+        #expect(messagePeer.route == .relayed(carrier: carrierKey, routeID: routeID))
 
         let tooLargeForRelay = Data(
             repeating: 0xaa,

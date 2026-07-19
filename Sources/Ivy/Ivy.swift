@@ -475,6 +475,7 @@ public actor Ivy {
                 }
             }
         }
+        guard config.mode.usesOverlayServices else { throw IvyError.noRelayAvailable }
         try await connectViaRelay(to: endpoint, requiredGeneration: generation)
         return true
     }
@@ -1144,7 +1145,9 @@ public actor Ivy {
             }
             if let route {
                 pending.connection.endpoint = route
-                router.addPeer(peerKey.peerID, endpoint: route)
+                if config.mode.usesOverlayServices {
+                    router.addPeer(peerKey.peerID, endpoint: route)
+                }
             }
         }
         pending.connection.releaseInboundAdmission()
@@ -1359,6 +1362,7 @@ public actor Ivy {
     }
 
     public func broadcastMessage(topic: String, payload: Data) {
+        guard config.mode.usesOverlayServices else { return }
         let message = Message.peerMessage(topic: topic, payload: payload)
         for session in sessions.values where session.role == .endpoint {
             _ = enqueue(message, on: session, bypassAdmission: false)
@@ -1542,6 +1546,7 @@ public actor Ivy {
         }
 
         if isRelayControl(message) {
+            guard config.mode.usesOverlayServices else { return }
             if case .relayClose(let routeID) = message,
                relayCloseMatches(routeID, sender: session.peerKey) {
                 // A valid close releases bounded state and must remain available under load.
@@ -1654,6 +1659,7 @@ public actor Ivy {
         to endpoint: PeerEndpoint,
         requiredGeneration generation: UInt64
     ) async throws {
+        guard config.mode.usesOverlayServices else { throw IvyError.noRelayAvailable }
         guard let target = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
         guard config.allowsEndpoint(target) else { throw IvyError.peerOutsideMode }
         guard isCurrentRun(generation),
@@ -2113,6 +2119,14 @@ public actor Ivy {
 #endif
             guard isCurrent(session) else { return }
         }
+        if !config.mode.usesOverlayServices {
+            switch message {
+            case .ping, .pong, .peerMessage:
+                break
+            default:
+                return
+            }
+        }
         if !exactPong && !tally.shouldAllow(peer: peer) {
             return
         }
@@ -2177,10 +2191,15 @@ public actor Ivy {
             handleAnnounceProvider(rootCID: rootCID, expiresAt: expiresAt, from: peer)
 
         case .peerMessage(let topic, let payload):
+            guard let session else { return }
             delegate?.ivy(
                 self,
                 didReceiveMessage: PeerMessage(topic: topic, payload: payload),
-                from: peer)
+                from: AuthenticatedPeer(
+                    key: session.peerKey,
+                    role: session.role,
+                    route: session.connection.route,
+                    metadata: session.metadata))
         }
     }
 
@@ -2190,7 +2209,9 @@ public actor Ivy {
         generation: UInt64,
         timeout: Duration
     ) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation), !Task.isCancelled else { return [] }
+        guard config.mode.usesOverlayServices,
+              isCurrentRun(generation),
+              !Task.isCancelled else { return [] }
 #if DEBUG || IVY_TESTING
         if let hook = neighborRequestHookForTesting {
             let endpoints = await hook(peer, targetHash)

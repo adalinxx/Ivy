@@ -40,7 +40,9 @@ extension Ivy {
     }
 
     func findNode(target: String, generation: UInt64) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation), !Task.isCancelled else { return [] }
+        guard config.mode.usesOverlayServices,
+              isCurrentRun(generation),
+              !Task.isCancelled else { return [] }
         let targetHash = Router.hash(target)
         let lookupParallelism = min(Self.kademliaLookupParallelism, max(1, config.kBucketSize))
         let maxLookupRounds = max(1, config.kBucketSize)

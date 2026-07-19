@@ -293,7 +293,9 @@ extension Ivy {
         let response: AttributedContentResponse
         if !Task.isCancelled, let local = await localContent(for: key) {
             response = AttributedContentResponse(entries: local, servedBy: nil)
-        } else if !Task.isCancelled, isCurrentRun(generation) {
+        } else if config.mode.usesOverlayServices,
+                  !Task.isCancelled,
+                  isCurrentRun(generation) {
 #if DEBUG || IVY_TESTING
             if let hook = networkFetchHookForTesting {
                 response = await hook(key, generation, token)
