@@ -179,6 +179,7 @@ public actor Ivy {
     static let deficiencySuppressionWindow: Duration = .seconds(30)
 
     var pendingContentRequests: [UInt64: PendingContentRequest] = [:]
+    var pendingVolumeRequests: [UInt64: PendingVolumeRequest] = [:]
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
@@ -2378,7 +2379,8 @@ public actor Ivy {
             switch message {
             case .ping, .pong, .peerMessage:
                 break
-            case .contentRequest, .contentResponse, .contentUnavailable:
+            case .contentRequest, .contentResponse, .contentUnavailable,
+                 .volumeRequest, .volumeResponse:
                 guard config.privateContentExchangeEnabled else { return }
             default:
                 return
@@ -2442,6 +2444,23 @@ public actor Ivy {
         case .contentUnavailable(let requestID):
             handleContentUnavailable(
                 requestID: requestID,
+                from: peer,
+                sessionID: session?.sessionID.bytes
+            )
+
+        case .volumeRequest(let requestID, let rootCID):
+            await handleVolumeRequest(
+                requestID: requestID,
+                rootCID: rootCID,
+                from: peer,
+                session: session
+            )
+
+        case .volumeResponse(let requestID, let rootCID, let entries):
+            handleVolumeResponse(
+                requestID: requestID,
+                rootCID: rootCID,
+                entries: entries,
                 from: peer,
                 sessionID: session?.sessionID.bytes
             )
@@ -2555,6 +2574,13 @@ public actor Ivy {
             markContentCandidateDone(requestID: requestID, peer: peer)
         }
 
+        let volumeRequestIDs = pendingVolumeRequests.compactMap { requestID, request in
+            request.candidates.contains(peer) ? requestID : nil
+        }
+        for requestID in volumeRequestIDs {
+            markVolumeCandidateDone(requestID: requestID, peer: peer)
+        }
+
         let neighborNonces = pendingNeighborResponses.compactMap { nonce, pending in
             pending.peer == peer ? nonce : nil
         }
@@ -2582,6 +2608,7 @@ public actor Ivy {
     private static func drainAllPending(
         pendingSessions: [UUID: PendingSession],
         pendingContentRequests: [UInt64: PendingContentRequest],
+        pendingVolumeRequests: [UInt64: PendingVolumeRequest],
         pendingNeighborResponses: [UInt64: PendingNeighborResponse],
         pendingProviderQueries: [String: PendingProviderQuery],
         pendingRelayOpens: [Data: PendingRelayOpen]
@@ -2591,6 +2618,10 @@ public actor Ivy {
             pending.continuation?.resume(returning: false)
         }
         for (_, request) in pendingContentRequests {
+            request.timeoutTask?.cancel()
+            request.continuation.resume(returning: .empty)
+        }
+        for (_, request) in pendingVolumeRequests {
             request.timeoutTask?.cancel()
             request.continuation.resume(returning: .empty)
         }
@@ -2632,6 +2663,7 @@ public actor Ivy {
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingContentRequests: pendingContentRequests,
+            pendingVolumeRequests: pendingVolumeRequests,
             pendingNeighborResponses: pendingNeighborResponses,
             pendingProviderQueries: pendingProviderQueries,
             pendingRelayOpens: pendingRelayOpens
@@ -2642,6 +2674,7 @@ public actor Ivy {
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingContentRequests: pendingContentRequests,
+            pendingVolumeRequests: pendingVolumeRequests,
             pendingNeighborResponses: pendingNeighborResponses,
             pendingProviderQueries: pendingProviderQueries,
             pendingRelayOpens: pendingRelayOpens
@@ -2649,6 +2682,7 @@ public actor Ivy {
         for pending in pendingSessions.values { pending.connection.cancel() }
         pendingSessions.removeAll()
         pendingContentRequests.removeAll()
+        pendingVolumeRequests.removeAll()
         for pending in pendingFetches.values {
             pending.operationTask?.cancel()
             pending.timeoutTask?.cancel()

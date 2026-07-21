@@ -13,6 +13,11 @@ private extension Ivy {
         servingContentRequests.count
     }
 
+    func pendingVolumeState() -> (requestID: UInt64?, candidates: Set<PeerID>) {
+        guard let request = pendingVolumeRequests.first else { return (nil, []) }
+        return (request.key, request.value.candidates)
+    }
+
     func networkFetchWaiterCount(for key: ContentRequestKey) -> Int {
         max(0, (pendingFetches[key]?.continuations.count ?? 0) - 1)
     }
@@ -173,6 +178,18 @@ private struct RawContentSource: IvyContentSource {
     }
 }
 
+private struct TestVolumeSource: IvyContentSource {
+    let entries: [ContentEntry]
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        entries
+    }
+}
+
 @Suite("Targeted content exchange")
 struct ContentExchangeTests {
     private func node(_ key: String) -> Ivy {
@@ -180,6 +197,83 @@ struct ContentExchangeTests {
             publicKey: key,
             listenPort: 0,
             requestTimeout: .seconds(1)))
+    }
+
+    @Test("a complete Volume is fetched as one boundary")
+    func completeLocalVolume() async {
+        let ivy = node("local-volume")
+        let source = TestVolumeSource(entries: [
+            ContentEntry(cid: "child", data: Data("child".utf8)),
+            ContentEntry(cid: "root", data: Data("root".utf8)),
+        ])
+        await ivy.setContentSource(source)
+
+        #expect(await ivy.fetchVolume(rootCID: "root") == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: [
+                "root": Data("root".utf8),
+                "child": Data("child".utf8),
+            ],
+            servedBy: nil
+        ))
+    }
+
+    @Test("an advertised Volume is fenced to the exact authenticated session")
+    func exactVolumeSessionIsFenced() async throws {
+        let ivy = node("exact-volume-session-requester")
+        let identity = deterministicTestPeerKey("exact-volume-session-peer")
+        let endpoint = PeerEndpoint(
+            publicKey: identity,
+            host: "127.0.0.1",
+            port: 4101
+        )
+        let key = try PeerKey(identity)
+        let oldSessionID = Data(repeating: 1, count: 32)
+        let currentSessionID = Data(repeating: 2, count: 32)
+        let currentPeer = AuthenticatedPeer(
+            key: key,
+            role: .endpoint,
+            route: .direct,
+            metadata: PeerMetadata(),
+            sessionID: currentSessionID
+        )
+        try await ivy.seedConnectedEndpointForTesting(endpoint, marker: 2)
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
+
+        let fetch = Task { await ivy.fetchVolume(rootCID: "root", from: currentPeer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingVolumeState().requestID != nil
+        })
+        let requestID = try #require(await ivy.pendingVolumeState().requestID)
+        let entries = [
+            ContentEntry(cid: "root", data: Data("root".utf8)),
+            ContentEntry(cid: "child", data: Data("child".utf8)),
+        ]
+
+        await ivy.handleVolumeResponse(
+            requestID: requestID,
+            rootCID: "root",
+            entries: entries,
+            from: key.peerID,
+            sessionID: oldSessionID
+        )
+        #expect(await ivy.pendingVolumeState().requestID == requestID)
+
+        await ivy.handleVolumeResponse(
+            requestID: requestID,
+            rootCID: "root",
+            entries: entries,
+            from: key.peerID,
+            sessionID: currentSessionID
+        )
+        #expect(await fetch.value == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: [
+                "root": Data("root".utf8),
+                "child": Data("child".utf8),
+            ],
+            servedBy: key.peerID
+        ))
     }
 
     @Test("public network fetch leaders stop at the pending-request cap")
