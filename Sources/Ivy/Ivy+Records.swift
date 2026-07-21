@@ -9,7 +9,7 @@ struct ProviderHint: Sendable, Equatable {
 
 struct PendingProviderQuery {
     let requestID: UInt64
-    var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
+    var continuations: [UUID: CheckedContinuation<[PeerEndpoint], Never>]
     var expectedPeers: Set<String>
     var responsesByPeer: [String: [ProviderHint]]
     var timeoutTask: IvyTimer? = nil
@@ -136,13 +136,15 @@ extension Ivy {
     ) async -> [PeerEndpoint] {
         guard config.mode.usesOverlayServices,
               isCurrentRun(generation),
+              !Task.isCancelled,
               MessageLimits.accepts(rootCID) else { return [] }
         var targets = providerLookupTargets(rootCID: rootCID)
         if targets.isEmpty {
             _ = await findNode(target: rootCID, generation: generation)
-            guard isCurrentRun(generation) else { return [] }
+            guard isCurrentRun(generation), !Task.isCancelled else { return [] }
             targets = providerLookupTargets(rootCID: rootCID)
         }
+        guard !Task.isCancelled else { return [] }
         return await queryProviders(
             rootCID: rootCID,
             targets: targets,
@@ -159,7 +161,7 @@ extension Ivy {
         targets: [Router.BucketEntry],
         generation: UInt64? = nil
     ) async -> [PeerEndpoint] {
-        if let generation, !isCurrentRun(generation) { return [] }
+        if Task.isCancelled || generation.map({ !isCurrentRun($0) }) == true { return [] }
         var seenTargets: Set<String> = []
         let boundedTargets = targets.filter {
             seenTargets.insert($0.id.publicKey).inserted
@@ -172,37 +174,48 @@ extension Ivy {
             return []
         }
 
-        let endpoints = await withCheckedContinuation { continuation in
-            if var pending = pendingProviderQueries[rootCID] {
-                pending.continuations.append(continuation)
-                pendingProviderQueries[rootCID] = pending
-                return
-            }
-
-            let requestID = makeProviderRequestID()
-            var pending = PendingProviderQuery(
-                requestID: requestID,
-                continuations: [continuation],
-                expectedPeers: [],
-                responsesByPeer: [:])
-            for target in boundedTargets {
-                if case .enqueued = fireToPeer(
-                    target.id,
-                    .findProviders(rootCID: rootCID, requestID: requestID)) {
-                    pending.expectedPeers.insert(target.id.publicKey)
+        let waiterID = UUID()
+        let endpoints = await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return [PeerEndpoint]() }
+            return await withCheckedContinuation {
+                (continuation: CheckedContinuation<[PeerEndpoint], Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: [])
+                    return
                 }
+                if var pending = pendingProviderQueries[rootCID] {
+                    pending.continuations[waiterID] = continuation
+                    pendingProviderQueries[rootCID] = pending
+                    return
+                }
+
+                let requestID = makeProviderRequestID()
+                var pending = PendingProviderQuery(
+                    requestID: requestID,
+                    continuations: [waiterID: continuation],
+                    expectedPeers: [],
+                    responsesByPeer: [:])
+                for target in boundedTargets {
+                    if case .enqueued = fireToPeer(
+                        target.id,
+                        .findProviders(rootCID: rootCID, requestID: requestID)) {
+                        pending.expectedPeers.insert(target.id.publicKey)
+                    }
+                }
+                guard !pending.expectedPeers.isEmpty else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                pendingProviderQueries[rootCID] = pending
+                let timeoutTask = delayedTask(after: .milliseconds(500)) { [weak self] in
+                    await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
+                }
+                pendingProviderQueries[rootCID]?.timeoutTask = timeoutTask
             }
-            guard !pending.expectedPeers.isEmpty else {
-                continuation.resume(returning: [])
-                return
-            }
-            pendingProviderQueries[rootCID] = pending
-            let timeoutTask = delayedTask(after: .milliseconds(500)) { [weak self] in
-                await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
-            }
-            pendingProviderQueries[rootCID]?.timeoutTask = timeoutTask
+        } onCancel: {
+            Task { await self.cancelProviderQueryWaiter(rootCID, waiterID: waiterID) }
         }
-        if let generation, !isCurrentRun(generation) { return [] }
+        if Task.isCancelled || generation.map({ !isCurrentRun($0) }) == true { return [] }
         return endpoints
     }
 
@@ -224,9 +237,22 @@ extension Ivy {
                 expiresAt: hint.expiresAt)
         }
         let endpoints = hints.compactMap(\.endpoint)
-        for continuation in pending.continuations {
+        for continuation in pending.continuations.values {
             continuation.resume(returning: endpoints)
         }
+    }
+
+    private func cancelProviderQueryWaiter(_ rootCID: String, waiterID: UUID) {
+        guard var pending = pendingProviderQueries[rootCID],
+              let continuation = pending.continuations.removeValue(forKey: waiterID)
+        else { return }
+        continuation.resume(returning: [])
+        guard pending.continuations.isEmpty else {
+            pendingProviderQueries[rootCID] = pending
+            return
+        }
+        pendingProviderQueries.removeValue(forKey: rootCID)
+        pending.timeoutTask?.cancel()
     }
 
     func providerLookupTargets(rootCID: String) -> [Router.BucketEntry] {

@@ -41,13 +41,14 @@ struct ResilienceTests {
         #expect(Message.deserialize(malformed) == nil)
     }
 
-    @Test("inbound queue overflow preserves order and closes the connection")
-    func inboundQueue() async {
-        let channel = EmbeddedChannel()
+    @Test("relayed inbound queue overflow preserves order and closes the connection")
+    func inboundQueue() async throws {
         let budget = InboundByteBudget(limit: PeerConnection.maxInboundBufferedRecords + 1)
+        let carrier = try PeerKey(deterministicTestPeerKey("relayed-inbound-queue"))
         let connection = PeerConnection(
-            endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 1),
-            channel: channel,
+            endpoint: PeerEndpoint(publicKey: "", host: "relay", port: 0),
+            routeID: Data(repeating: 1, count: 32),
+            carrier: carrier,
             inboundByteBudget: budget)
 
         for value in 0..<connection.inboundBufferLimit {
@@ -68,25 +69,75 @@ struct ResilienceTests {
         #expect(budget.currentUsage == 0)
     }
 
-    @Test("outbound backpressure and cancellation reject writes without buffering")
-    func outboundBackpressure() throws {
-        let channel = EmbeddedChannel()
-        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
+    @Test("outbound backpressure waits for recovery and distinguishes closure")
+    func outboundBackpressure() async throws {
+        let loopback = try await TestLoopback.open()
+        defer { Task { await loopback.close() } }
         let connection = PeerConnection(
-            endpoint: PeerEndpoint(publicKey: "", host: "127.0.0.1", port: 4001),
-            channel: channel)
+            endpoint: PeerEndpoint(
+                publicKey: "",
+                host: "127.0.0.1",
+                port: loopback.port
+            ),
+            channel: loopback.client)
 
-        channel.isWritable = false
-        #expect(!connection.sendSerializedRecord(Data([1, 2, 3])))
-        #expect(try channel.readOutbound(as: ByteBuffer.self) == nil)
+        connection.channelWritabilityChanged(isWritable: false)
+        #expect(connection.sendSerializedRecord(Data([1, 2, 3])) == .backpressured)
+        #expect(loopback.sink.byteCount == 0)
 
-        channel.isWritable = true
-        #expect(connection.sendSerializedRecord(Data([1, 2, 3])))
-        #expect(try channel.readOutbound(as: ByteBuffer.self) != nil)
+        let writable = Task { await connection.waitUntilWritable() }
+        connection.channelWritabilityChanged(isWritable: true)
+        #expect(await writable.value)
+        #expect(connection.sendSerializedRecord(Data([1, 2, 3])) == .sent)
+        try await TestSynchronization.wait(for: "writable loopback send") {
+            loopback.sink.byteCount > 0
+        }
+
+        connection.channelWritabilityChanged(isWritable: false)
+        let closed = Task { await connection.waitUntilWritable() }
+        connection.cancel()
+        #expect(!(await closed.value))
+        #expect(connection.sendSerializedRecord(Data([4])) == .notConnected)
+        await loopback.close()
+    }
+
+    @Test("Ivy exposes live transport backpressure without advancing the session")
+    func ivyBackpressureResult() async throws {
+        let local = deterministicTestSigningKey("outbound-local")
+        let remote = try PeerKey(deterministicTestPeerKey("outbound-remote"))
+        let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
+        let loopback = try await TestLoopback.open()
+        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let ivy = Ivy(config: IvyConfig(
+            signingKey: local,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 1,
+                perPeerRequestRefillPerSecond: 0
+            ),
+            stunServers: []))
+        try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
+
+        connection.channelWritabilityChanged(isWritable: false)
+        #expect(await ivy.sendMessage(
+            to: remote.peerID,
+            topic: "state",
+            payload: Data()) == .backpressured)
+
+        let writable = Task { await ivy.waitUntilWritable(to: remote.peerID) }
+        connection.channelWritabilityChanged(isWritable: true)
+        #expect(await writable.value)
+        #expect(await ivy.sendMessage(
+            to: remote.peerID,
+            topic: "state",
+            payload: Data()) == .enqueued(endpoint: remote.peerID, route: .direct))
+        #expect(await ivy.sendMessage(
+            to: remote.peerID,
+            topic: "state",
+            payload: Data()) == .locallyRejected)
 
         connection.cancel()
-        #expect(!connection.sendSerializedRecord(Data([4])))
-        _ = try? channel.finish()
+        #expect(!(await ivy.waitUntilWritable(to: remote.peerID)))
+        await loopback.close()
     }
 
     @Test("relayed queues share one inbound byte budget")

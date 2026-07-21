@@ -60,6 +60,57 @@ struct IvyTopologyTests {
         }
     }
 
+    @Test("inbound admission bypass is pinned to a private bootstrap peer")
+    func inboundAdmissionBypassValidation() throws {
+        let local = identity(1)
+        let parent = try PeerKey(key(identity(2)))
+        let other = try PeerKey(key(identity(3)))
+        let parentEndpoint = PeerEndpoint(
+            publicKey: parent.hex,
+            host: "127.0.0.1",
+            port: 4001
+        )
+        let valid = IvyConfig(
+            signingKey: local,
+            bootstrapPeers: [parentEndpoint],
+            inboundAdmissionBypassPeerKeys: [parent],
+            mode: .privateNetwork
+        )
+        try valid.validate()
+
+        let overlay = IvyConfig(
+            signingKey: local,
+            bootstrapPeers: [parentEndpoint],
+            inboundAdmissionBypassPeerKeys: [parent]
+        )
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "inbound admission bypass is private-network only")) {
+            try overlay.validate()
+        }
+
+        let localKey = try PeerKey(rawRepresentation: local.publicKey.rawRepresentation)
+        let selfBypass = IvyConfig(
+            signingKey: local,
+            bootstrapPeers: [parentEndpoint],
+            inboundAdmissionBypassPeerKeys: [localKey],
+            mode: .privateNetwork
+        )
+        #expect(throws: IvyModeError.identityRoleCollision(localKey.hex)) {
+            try selfBypass.validate()
+        }
+
+        let unconfigured = IvyConfig(
+            signingKey: local,
+            bootstrapPeers: [parentEndpoint],
+            inboundAdmissionBypassPeerKeys: [other],
+            mode: .privateNetwork
+        )
+        #expect(throws: IvyModeError.invalidConfiguration(
+            "inbound admission bypass peers must be configured bootstrap peers")) {
+            try unconfigured.validate()
+        }
+    }
+
     @Test("pinned identity canonicalizes raw and ed01 spellings")
     func pinnedCanonicalization() throws {
         let remote = key(identity(2))

@@ -32,11 +32,13 @@ encryption or forward secrecy.
 
 `IvyMode.overlay` uses authenticated Kademlia discovery. `.privateNetwork`
 accepts authenticated direct peers but disables discovery, routing, providers,
-content exchange, relay, and broadcast; applications use directed messages for
-their own private protocol. `.pinned(peer:)` accepts one endpoint identity and
-disables public discovery. Configured carriers govern outbound relay initiation;
-inbound offers grant transport only and never turn a carrier into an endpoint
-peer.
+relay, and broadcast; applications use directed messages for their own private
+protocol. Exact-CID content exchange is also disabled unless
+`privateContentExchangeEnabled` is explicitly set. A private source should use
+`authorizesContentRequest` when only some authenticated peers may read it.
+`.pinned(peer:)` accepts one endpoint identity and disables public discovery.
+Configured carriers govern outbound relay initiation; inbound offers grant
+transport only and never turn a carrier into an endpoint peer.
 
 ## Network roles
 
