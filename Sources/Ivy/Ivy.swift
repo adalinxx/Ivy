@@ -1518,6 +1518,23 @@ public actor Ivy {
         )
     }
 
+    func enqueueContentRequestOnCurrentSession(
+        _ message: Message,
+        to peer: AuthenticatedPeer
+    ) -> Bool {
+        guard let session = endpointSession(for: peer.key),
+              session.sessionID.bytes == peer.sessionID else { return false }
+#if DEBUG || IVY_TESTING
+        if let hook = contentRequestEnqueueHookForTesting {
+            return hook(peer.id)
+        }
+#endif
+        if case .enqueued = enqueue(message, on: session, bypassAdmission: false) {
+            return true
+        }
+        return false
+    }
+
     /// Wait until the live route to `peer` can accept another outbound record.
     /// Returns false when that route closes before it becomes writable.
     public func waitUntilWritable(to peer: PeerID) async -> Bool {
@@ -2415,10 +2432,19 @@ public actor Ivy {
             )
 
         case .contentResponse(let requestID, let entries):
-            handleContentResponse(requestID: requestID, entries: entries, from: peer)
+            handleContentResponse(
+                requestID: requestID,
+                entries: entries,
+                from: peer,
+                sessionID: session?.sessionID.bytes
+            )
 
         case .contentUnavailable(let requestID):
-            handleContentUnavailable(requestID: requestID, from: peer)
+            handleContentUnavailable(
+                requestID: requestID,
+                from: peer,
+                sessionID: session?.sessionID.bytes
+            )
 
         case .findProviders(let rootCID, let requestID):
             handleFindProviders(rootCID: rootCID, requestID: requestID, from: peer)

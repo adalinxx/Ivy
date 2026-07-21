@@ -746,6 +746,77 @@ struct ContentExchangeTests {
         #expect(await ivy.pendingContentState().requestID == nil)
     }
 
+    @Test("an exact content fetch is fenced to one authenticated session")
+    func exactSessionFetchIsFenced() async throws {
+        let ivy = node("exact-session-requester")
+        let identity = deterministicTestPeerKey("exact-session-peer")
+        let endpoint = PeerEndpoint(
+            publicKey: identity,
+            host: "127.0.0.1",
+            port: 4100
+        )
+        let key = try PeerKey(identity)
+        let oldSessionID = Data(repeating: 1, count: 32)
+        let currentSessionID = Data(repeating: 2, count: 32)
+        let oldPeer = AuthenticatedPeer(
+            key: key,
+            role: .endpoint,
+            route: .direct,
+            metadata: PeerMetadata(),
+            sessionID: oldSessionID
+        )
+        let currentPeer = AuthenticatedPeer(
+            key: key,
+            role: .endpoint,
+            route: .direct,
+            metadata: PeerMetadata(),
+            sessionID: currentSessionID
+        )
+        try await ivy.seedConnectedEndpointForTesting(endpoint, marker: 2)
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
+
+        #expect(await ivy.fetchContent(rootCID: "root", from: oldPeer) == .empty)
+        #expect(await ivy.pendingContentState().requestID == nil)
+
+        let fetch = Task {
+            await ivy.fetchContent(
+                rootCID: "root",
+                cids: ["child"],
+                from: currentPeer
+            )
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingContentState().requestID != nil
+        })
+        let requestID = try #require(await ivy.pendingContentState().requestID)
+        let entries = [
+            ContentEntry(cid: "root", data: Data("root".utf8)),
+            ContentEntry(cid: "child", data: Data("child".utf8)),
+        ]
+
+        await ivy.handleContentResponse(
+            requestID: requestID,
+            entries: entries,
+            from: key.peerID,
+            sessionID: oldSessionID
+        )
+        #expect(await ivy.pendingContentState().requestID == requestID)
+
+        await ivy.handleContentResponse(
+            requestID: requestID,
+            entries: entries,
+            from: key.peerID,
+            sessionID: currentSessionID
+        )
+        #expect(await fetch.value == AttributedContentResponse(
+            entries: [
+                "root": Data("root".utf8),
+                "child": Data("child".utf8),
+            ],
+            servedBy: key.peerID
+        ))
+    }
+
     @Test("a request rejected before enqueue does not wait for its network timeout")
     func locallyRejectedRequestCompletesImmediately() async {
         let ivy = Ivy(config: IvyConfig(
