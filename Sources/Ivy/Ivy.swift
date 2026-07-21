@@ -108,7 +108,14 @@ enum ProtocolViolationEvidence {
 
 private enum SessionRecordSendResult {
     case sent
+    case backpressured
     case locallyRejected
+    case notConnected
+}
+
+private enum SessionRecordReadiness {
+    case ready
+    case backpressured
     case notConnected
 }
 
@@ -700,6 +707,19 @@ public actor Ivy {
         }
     }
 
+    /// Restart a configured peer without turning off its automatic reconnect.
+    /// This is for a higher layer that detected a transient application failure
+    /// after Ivy accepted an authenticated message.
+    public func restartConfiguredSession(with peer: PeerID) {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = sessions[key],
+              !configuredEndpoints(for: key, role: session.role).isEmpty else {
+            return
+        }
+        teardownAuthenticatedSession(session, reconnect: true)
+        session.connection.cancel()
+    }
+
     private func disconnectStale(
         _ peer: PeerID,
         sessionID: SessionID,
@@ -931,12 +951,49 @@ public actor Ivy {
     }
 
     private func startInboundTask(_ connection: PeerConnection) {
-        let records = connection.records
-        let task = Task { [weak self, weak connection] in
-            for await frame in records {
-                guard let self, let connection else { return }
-                await self.handleSessionRecord(frame.bytes, on: connection)
-                withExtendedLifetime(frame) {}
+        let task: Task<Void, Never>
+        if let directInbound = connection.directInboundStream {
+            task = Task { [weak self, weak connection] in
+                guard let connection else { return }
+                let decoder = connection.makeFrameAccumulator()
+                defer { decoder.reset() }
+
+                do {
+                    try await directInbound.executeThenClose { inbound in
+                        for try await bytes in inbound {
+                            guard let self,
+                                  !Task.isCancelled,
+                                  connection.isLive else { return }
+                            var incoming = bytes
+
+                            decode: while incoming.readableBytes > 0 {
+                                switch decoder.nextFrame(from: &incoming) {
+                                case .frame(let frame):
+                                    await self.handleSessionRecord(frame.bytes, on: connection)
+                                    withExtendedLifetime(frame) {}
+                                    guard !Task.isCancelled, connection.isLive else { return }
+                                case .incomplete:
+                                    break decode
+                                case .invalid:
+                                    connection.cancel()
+                                    return
+                                }
+                            }
+                        }
+                    }
+                    if connection.isLive { connection.cancel() }
+                } catch {
+                    connection.cancel()
+                }
+            }
+        } else {
+            let records = connection.records
+            task = Task { [weak self, weak connection] in
+                for await frame in records {
+                    guard let self, let connection else { return }
+                    await self.handleSessionRecord(frame.bytes, on: connection)
+                    withExtendedLifetime(frame) {}
+                }
             }
         }
         connection.installCloseHandler { [weak self, weak connection] in
@@ -1162,7 +1219,6 @@ public actor Ivy {
         }
 
         if let existing {
-            session.didNotifyConnect = existing.didNotifyConnect
             if existing.role == .endpoint {
                 router.removePeer(peerKey.peerID)
                 cleanupPendingForPeer(peerKey.peerID)
@@ -1209,11 +1265,12 @@ public actor Ivy {
         await healthMonitor?.trackPeer(peerKey.peerID, sessionID: session.sessionID)
         if isCurrent(session), session.connection.isLive, !session.didNotifyConnect {
             session.didNotifyConnect = true
-            delegate?.ivy(self, didConnect: AuthenticatedPeer(
+            await delegate?.ivy(self, didConnect: AuthenticatedPeer(
                 key: peerKey,
                 role: role,
                 route: pending.connection.route,
-                metadata: metadata))
+                metadata: metadata,
+                sessionID: session.sessionID.bytes))
         }
         if isCurrent(session), !session.connection.isLive {
             teardownAuthenticatedSession(session, reconnect: true)
@@ -1414,6 +1471,54 @@ public actor Ivy {
         enqueueEndpoint(.peerMessage(topic: topic, payload: payload), to: peer)
     }
 
+    /// Sends only if `peer` still names the selected authenticated session.
+    public func sendMessage(
+        to peer: AuthenticatedPeer,
+        topic: String,
+        payload: Data
+    ) -> SendMessageResult {
+        guard let session = endpointSession(for: peer.key),
+              session.sessionID.bytes == peer.sessionID else {
+            return .notConnected
+        }
+        return enqueue(
+            .peerMessage(topic: topic, payload: payload),
+            on: session,
+            bypassAdmission: false
+        )
+    }
+
+    /// Wait until the live route to `peer` can accept another outbound record.
+    /// Returns false when that route closes before it becomes writable.
+    public func waitUntilWritable(to peer: PeerID) async -> Bool {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = endpointSession(for: key) else {
+            return false
+        }
+        switch session.connection.transport {
+        case .direct:
+            return await session.connection.waitUntilWritable()
+        case .relayed(_, let carrier):
+            guard let carrier = carrierSession(for: carrier) else { return false }
+            return await carrier.connection.waitUntilWritable()
+        }
+    }
+
+    /// Waits only on the transport represented by `peer`, never a replacement.
+    public func waitUntilWritable(to peer: AuthenticatedPeer) async -> Bool {
+        guard let session = endpointSession(for: peer.key),
+              session.sessionID.bytes == peer.sessionID else {
+            return false
+        }
+        switch session.connection.transport {
+        case .direct:
+            return await session.connection.waitUntilWritable()
+        case .relayed(_, let carrier):
+            guard let carrier = carrierSession(for: carrier) else { return false }
+            return await carrier.connection.waitUntilWritable()
+        }
+    }
+
     public func broadcastMessage(topic: String, payload: Data) {
         guard config.mode.usesOverlayServices else { return }
         let message = Message.peerMessage(topic: topic, payload: payload)
@@ -1465,6 +1570,14 @@ public actor Ivy {
         bypassAdmission: Bool
     ) -> SendMessageResult {
         guard isCurrent(session) else { return .notConnected }
+        switch sessionRecordReadiness(on: session.connection) {
+        case .ready:
+            break
+        case .backpressured:
+            return .backpressured
+        case .notConnected:
+            return .notConnected
+        }
         guard bypassAdmission || tally.shouldAllow(peer: session.peerKey.peerID) else {
             return .locallyRejected
         }
@@ -1481,6 +1594,8 @@ public actor Ivy {
         switch sendResult {
         case .sent:
             session.sequenceState = sequenceState
+        case .backpressured:
+            return .backpressured
         case .locallyRejected:
             return .locallyRejected
         case .notConnected:
@@ -1524,6 +1639,8 @@ public actor Ivy {
         switch enqueue(message, on: session, bypassAdmission: true) {
         case .enqueued:
             return .sent
+        case .backpressured:
+            return .backpressured
         case .locallyRejected:
             return .locallyRejected
         case .notConnected:
@@ -1548,13 +1665,44 @@ public actor Ivy {
         guard !payload.isEmpty else { return .locallyRejected }
         switch connection.transport {
         case .direct:
-            return connection.sendSerializedRecord(payload) ? .sent : .notConnected
+            switch connection.sendSerializedRecord(payload) {
+            case .sent:
+                return .sent
+            case .backpressured:
+                return .backpressured
+            case .locallyRejected:
+                return .locallyRejected
+            case .notConnected:
+                return .notConnected
+            }
         case .relayed(let routeID, let carrier):
             guard connection.isLive,
                   installedRoutes[routeID]?.carrier == carrier else { return .notConnected }
             return sendRelayControlResult(
                 .relayPacket(routeID: routeID, opaqueEndpointRecord: payload),
                 to: carrier)
+        }
+    }
+
+    private func sessionRecordReadiness(on connection: PeerConnection) -> SessionRecordReadiness {
+        switch connection.transport {
+        case .direct:
+            switch connection.sendReadiness() {
+            case .ready:
+                return .ready
+            case .backpressured:
+                return .backpressured
+            case .notConnected:
+                return .notConnected
+            }
+        case .relayed(let routeID, let carrier):
+            guard connection.isLive,
+                  installedRoutes[routeID]?.carrier == carrier,
+                  let carrierSession = carrierSession(for: carrier),
+                  carrierSession.connection.isDirect else {
+                return .notConnected
+            }
+            return sessionRecordReadiness(on: carrierSession.connection)
         }
     }
 
@@ -2183,11 +2331,16 @@ public actor Ivy {
             switch message {
             case .ping, .pong, .peerMessage:
                 break
+            case .contentRequest, .contentResponse, .contentUnavailable:
+                guard config.privateContentExchangeEnabled else { return }
             default:
                 return
             }
         }
-        if !exactPong && !tally.shouldAllow(peer: peer) {
+        let bypassesInboundAdmission = session.map {
+            config.inboundAdmissionBypassPeerKeys.contains($0.peerKey)
+        } ?? false
+        if !exactPong && !bypassesInboundAdmission && !tally.shouldAllow(peer: peer) {
             return
         }
         switch message {
@@ -2259,7 +2412,8 @@ public actor Ivy {
                     key: session.peerKey,
                     role: session.role,
                     route: session.connection.route,
-                    metadata: session.metadata))
+                    metadata: session.metadata,
+                    sessionID: session.sessionID.bytes))
         }
     }
 
@@ -2281,20 +2435,30 @@ public actor Ivy {
         guard hasEndpointSession(peer),
               pendingNeighborResponses.count < config.maxPendingRequests else { return [] }
         let nonce = makeFindNodeNonce()
-        let endpoints = await withCheckedContinuation { cont in
-            pendingNeighborResponses[nonce] = PendingNeighborResponse(
-                peer: peer,
-                continuation: cont)
-            guard case .enqueued = fireToPeer(
-                peer,
-                .findNode(target: Data(targetHash), nonce: nonce)) else {
-                resolveNeighborResponse(nonce: nonce, endpoints: [])
-                return
+        let endpoints = await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return [PeerEndpoint]() }
+            return await withCheckedContinuation {
+                (cont: CheckedContinuation<[PeerEndpoint], Never>) in
+                guard !Task.isCancelled else {
+                    cont.resume(returning: [])
+                    return
+                }
+                pendingNeighborResponses[nonce] = PendingNeighborResponse(
+                    peer: peer,
+                    continuation: cont)
+                guard case .enqueued = fireToPeer(
+                    peer,
+                    .findNode(target: Data(targetHash), nonce: nonce)) else {
+                    resolveNeighborResponse(nonce: nonce, endpoints: [])
+                    return
+                }
+                let timeoutTask = delayedTask(after: timeout) { [weak self] in
+                    await self?.resolveNeighborResponse(nonce: nonce, endpoints: [])
+                }
+                pendingNeighborResponses[nonce]?.timeoutTask = timeoutTask
             }
-            let timeoutTask = delayedTask(after: timeout) { [weak self] in
-                await self?.resolveNeighborResponse(nonce: nonce, endpoints: [])
-            }
-            pendingNeighborResponses[nonce]?.timeoutTask = timeoutTask
+        } onCancel: {
+            Task { await self.resolveNeighborResponse(nonce: nonce, endpoints: []) }
         }
         return isCurrentRun(generation) && !Task.isCancelled ? endpoints : []
     }
@@ -2380,7 +2544,7 @@ public actor Ivy {
         }
         for (_, pending) in pendingProviderQueries {
             pending.timeoutTask?.cancel()
-            for cont in pending.continuations { cont.resume(returning: []) }
+            for cont in pending.continuations.values { cont.resume(returning: []) }
         }
         for (_, request) in pendingRelayOpens {
             request.timeoutTask?.cancel()
@@ -2405,7 +2569,9 @@ public actor Ivy {
         for pending in pendingFetches.values {
             pending.operationTask?.cancel()
             pending.timeoutTask?.cancel()
-            for continuation in pending.continuations { continuation.resume(returning: .empty) }
+            for continuation in pending.continuations.values {
+                continuation.resume(returning: .empty)
+            }
         }
         Self.drainAllPending(
             pendingSessions: pendingSessions,
@@ -2430,7 +2596,9 @@ public actor Ivy {
         for pending in pendingFetches.values {
             pending.operationTask?.cancel()
             pending.timeoutTask?.cancel()
-            for continuation in pending.continuations { continuation.resume(returning: .empty) }
+            for continuation in pending.continuations.values {
+                continuation.resume(returning: .empty)
+            }
         }
         pendingFetches.removeAll()
         pendingNeighborResponses.removeAll()
@@ -2744,21 +2912,32 @@ public actor Ivy {
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
+            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
+            .childChannelOption(
+                ChannelOptions.recvAllocator,
+                value: FixedSizeRecvByteBufferAllocator(
+                    capacity: PeerConnection.directInboundReadBufferBytes))
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
                 let connectionBudget = InboundByteBudget(
                     limit: PeerConnection.maxInboundBufferedBytes)
-                let decoder = SessionFrameDecoder(
-                    budget: inboundByteBudget,
-                    connectionBudget: connectionBudget)
-                let acceptor = InboundConnectionAcceptor(
-                    ivy: self,
-                    generation: generation,
-                    admissionGate: gate,
-                    inboundByteBudget: inboundByteBudget,
-                    connectionInboundByteBudget: connectionBudget
-                )
-                return channel.pipeline.addHandlers([decoder, acceptor])
+                do {
+                    let directInbound = try NIOAsyncChannel<ByteBuffer, Never>(
+                        wrappingChannelSynchronously: channel,
+                        configuration: .init(backPressureStrategy: .init(
+                            lowWatermark: 1,
+                            highWatermark: 1)))
+                    let acceptor = InboundConnectionAcceptor(
+                        ivy: self,
+                        generation: generation,
+                        admissionGate: gate,
+                        inboundByteBudget: inboundByteBudget,
+                        connectionInboundByteBudget: connectionBudget,
+                        directInbound: directInbound)
+                    return channel.pipeline.addHandler(acceptor)
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
             }
 
         let channel = try await bootstrap

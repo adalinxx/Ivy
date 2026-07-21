@@ -1,74 +1,83 @@
 import Foundation
 import NIOCore
-import NIOEmbedded
 import Testing
 @testable import Ivy
-
-private final class SessionFrameCollector: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = InboundFrame
-    private(set) var records: [Data] = []
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        records.append(unwrapInboundIn(data).bytes)
-    }
-}
 
 @Suite("Session frame bounds")
 struct MessageFrameDecoderBoundTests {
     private static let limit: UInt32 = 1024
 
-    private func channel(
+    private func accumulator(
         budget: InboundByteBudget = InboundByteBudget(limit: Int(Self.limit) + 4),
         connectionBudget: InboundByteBudget? = nil
-    ) throws -> (EmbeddedChannel, SessionFrameCollector) {
-        let collector = SessionFrameCollector()
-        let channel = EmbeddedChannel()
-        try channel.pipeline.addHandler(SessionFrameDecoder(
+    ) -> SessionFrameAccumulator {
+        SessionFrameAccumulator(
             maxFrameSize: Self.limit,
             budget: budget,
             connectionBudget: connectionBudget
-                ?? InboundByteBudget(limit: 2 * Int(Self.limit) + 4))).wait()
-        try channel.pipeline.addHandler(collector).wait()
-        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).wait()
-        return (channel, collector)
+                ?? InboundByteBudget(limit: 2 * Int(Self.limit) + 4))
+    }
+
+    @discardableResult
+    private func decode(
+        _ bytes: [UInt8],
+        with accumulator: SessionFrameAccumulator,
+        into records: inout [Data]
+    ) -> Bool {
+        var input = ByteBufferAllocator().buffer(capacity: bytes.count)
+        input.writeBytes(bytes)
+        while input.readableBytes > 0 {
+            switch accumulator.nextFrame(from: &input) {
+            case .frame(let frame):
+                records.append(frame.bytes)
+            case .incomplete:
+                return true
+            case .invalid:
+                return false
+            }
+        }
+        return true
+    }
+
+    private func lengthPrefix(_ length: UInt32) -> [UInt8] {
+        [
+            UInt8(truncatingIfNeeded: length >> 24),
+            UInt8(truncatingIfNeeded: length >> 16),
+            UInt8(truncatingIfNeeded: length >> 8),
+            UInt8(truncatingIfNeeded: length),
+        ]
     }
 
     private func framed(_ records: [Data]) -> [UInt8] {
         records.flatMap { record in
-            let count = UInt32(record.count)
-            return [
-                UInt8(truncatingIfNeeded: count >> 24),
-                UInt8(truncatingIfNeeded: count >> 16),
-                UInt8(truncatingIfNeeded: count >> 8),
-                UInt8(truncatingIfNeeded: count),
-            ] + record
+            lengthPrefix(UInt32(record.count)) + record
         }
     }
 
     @Test("oversized declared record closes before body allocation")
-    func oversizedLength() throws {
-        let (channel, collector) = try channel()
-        var header = channel.allocator.buffer(capacity: 4)
-        header.writeInteger(Self.limit + 1, endianness: .big, as: UInt32.self)
-        _ = try? channel.writeInbound(header)
-        #expect(!channel.isActive)
-        #expect(collector.records.isEmpty)
+    func oversizedLength() {
+        let accumulator = accumulator()
+        var records: [Data] = []
+        #expect(!decode(
+            lengthPrefix(Self.limit + 1),
+            with: accumulator,
+            into: &records
+        ))
+        #expect(records.isEmpty)
     }
 
     @Test("bounded records are delivered unchanged")
-    func boundedRecord() throws {
-        let (channel, collector) = try channel()
+    func boundedRecord() {
+        let accumulator = accumulator()
         let record = Data([0x49, 0x56, 0x59, 0x08, 0x01])
-        var frame = channel.allocator.buffer(capacity: 4 + record.count)
-        frame.writeInteger(UInt32(record.count), endianness: .big, as: UInt32.self)
-        frame.writeBytes(record)
-        try channel.writeInbound(frame)
-        #expect(collector.records == [record])
-        _ = try channel.finish()
+        var records: [Data] = []
+        #expect(decode(framed([record]), with: accumulator, into: &records))
+        #expect(records == [record])
+        accumulator.reset()
     }
 
     @Test("every stream split delivers the same records")
-    func everySplit() throws {
+    func everySplit() {
         let records = [
             Data([0x49, 0x56, 0x59, 0x08, 0x01]),
             Data([0xaa, 0xbb, 0xcc]),
@@ -77,125 +86,179 @@ struct MessageFrameDecoderBoundTests {
 
         for split in 0...stream.count {
             let budget = InboundByteBudget(limit: Int(Self.limit) + 4)
-            let (channel, collector) = try channel(budget: budget)
+            let accumulator = accumulator(budget: budget)
+            var decoded: [Data] = []
             if split > 0 {
-                var first = channel.allocator.buffer(capacity: split)
-                first.writeBytes(stream[..<split])
-                try channel.writeInbound(first)
+                #expect(decode(
+                    Array(stream[..<split]),
+                    with: accumulator,
+                    into: &decoded
+                ))
             }
             if split < stream.count {
-                var second = channel.allocator.buffer(capacity: stream.count - split)
-                second.writeBytes(stream[split...])
-                try channel.writeInbound(second)
+                #expect(decode(
+                    Array(stream[split...]),
+                    with: accumulator,
+                    into: &decoded
+                ))
             }
-            #expect(collector.records == records, "split \(split)")
-            _ = try channel.finish()
+            #expect(decoded == records, "split \(split)")
+            accumulator.reset()
             #expect(budget.currentUsage == 0, "split \(split)")
         }
     }
 
     @Test("coalesced frames preserve record boundaries")
-    func coalescedFrames() throws {
+    func coalescedFrames() {
         let records = [Data([1]), Data([2, 3]), Data([4, 5, 6])]
-        let (channel, collector) = try channel()
-        var stream = channel.allocator.buffer(capacity: 18)
+        let accumulator = accumulator()
+        var decoded: [Data] = []
+        #expect(decode(framed(records), with: accumulator, into: &decoded))
+        #expect(decoded == records)
+        accumulator.reset()
+    }
+
+    @Test("raw accumulator drains coalesced frames one at a time")
+    func rawAccumulatorCoalescedFrames() {
+        let records = [Data([1]), Data([2, 3]), Data([4, 5, 6])]
+        let budget = InboundByteBudget(limit: 64)
+        let accumulator = SessionFrameAccumulator(
+            maxFrameSize: Self.limit,
+            budget: budget,
+            connectionBudget: InboundByteBudget(limit: 64))
+        var stream = ByteBufferAllocator().buffer(capacity: 18)
         stream.writeBytes(framed(records))
 
-        try channel.writeInbound(stream)
+        for expected in records {
+            switch accumulator.nextFrame(from: &stream) {
+            case .frame(let frame):
+                #expect(frame.bytes == expected)
+            case .incomplete:
+                Issue.record("coalesced frame was not available")
+                return
+            case .invalid:
+                Issue.record("valid coalesced frame was rejected")
+                return
+            }
+        }
 
-        #expect(collector.records == records)
-        _ = try channel.finish()
+        #expect(stream.readableBytes == 0)
+        accumulator.reset()
+    }
+
+    @Test("raw accumulator releases partial frame reservations on reset")
+    func rawAccumulatorResetReleasesReservations() {
+        let budget = InboundByteBudget(limit: 64)
+        let accumulator = SessionFrameAccumulator(
+            maxFrameSize: Self.limit,
+            budget: budget,
+            connectionBudget: InboundByteBudget(limit: 64))
+        var partial = ByteBufferAllocator().buffer(capacity: 1)
+        partial.writeInteger(UInt8(0))
+
+        switch accumulator.nextFrame(from: &partial) {
+        case .incomplete:
+            break
+        case .frame, .invalid:
+            Issue.record("partial header did not wait for more bytes")
+            return
+        }
+        #expect(budget.currentUsage == 4)
+        accumulator.reset()
+        #expect(budget.currentUsage == 0)
     }
 
     @Test("zero-length records close as malformed wire")
-    func zeroLength() throws {
-        let (channel, collector) = try channel()
-        var frame = channel.allocator.buffer(capacity: 4)
-        frame.writeInteger(UInt32(0), endianness: .big, as: UInt32.self)
-        _ = try? channel.writeInbound(frame)
-        #expect(!channel.isActive)
-        #expect(collector.records.isEmpty)
+    func zeroLength() {
+        let accumulator = accumulator()
+        var records: [Data] = []
+        #expect(!decode(
+            lengthPrefix(0),
+            with: accumulator,
+            into: &records
+        ))
+        #expect(records.isEmpty)
     }
 
     @Test("declared lengths do not reserve unseen bytes or evict another connection")
-    func slowlorisIsolation() throws {
+    func slowlorisIsolation() {
         let budget = InboundByteBudget(limit: 16)
-        let (bodyChannel, _) = try channel(budget: budget)
-        var partialBody = bodyChannel.allocator.buffer(capacity: 5)
-        partialBody.writeInteger(Self.limit, endianness: .big, as: UInt32.self)
-        partialBody.writeInteger(UInt8(1))
-        try bodyChannel.writeInbound(partialBody)
+        let bodyAccumulator = accumulator(budget: budget)
+        var bodyRecords: [Data] = []
+        #expect(decode(
+            lengthPrefix(Self.limit) + [1],
+            with: bodyAccumulator,
+            into: &bodyRecords
+        ))
         #expect(budget.currentUsage == 1)
 
-        let (competingChannel, collector) = try channel(budget: budget)
-        var competing = competingChannel.allocator.buffer(capacity: 5)
-        competing.writeBytes(framed([Data([2])]))
-        try competingChannel.writeInbound(competing)
-        #expect(competingChannel.isActive)
-        #expect(collector.records == [Data([2])])
+        let competingAccumulator = accumulator(budget: budget)
+        var competingRecords: [Data] = []
+        #expect(decode(
+            framed([Data([2])]),
+            with: competingAccumulator,
+            into: &competingRecords
+        ))
+        #expect(competingRecords == [Data([2])])
         #expect(budget.currentUsage == 1)
 
-        _ = try competingChannel.finish()
-        _ = try bodyChannel.finish()
+        competingAccumulator.reset()
+        bodyAccumulator.reset()
         #expect(budget.currentUsage == 0)
     }
 
     @Test("one connection cannot exceed its byte reservation")
-    func perConnectionBudget() throws {
+    func perConnectionBudget() {
         let budget = InboundByteBudget(limit: 64)
         let connectionBudget = InboundByteBudget(limit: 8)
-        let (channel, collector) = try channel(
+        let accumulator = accumulator(
             budget: budget,
             connectionBudget: connectionBudget)
-        var partial = channel.allocator.buffer(capacity: 12)
-        partial.writeInteger(UInt32(9), endianness: .big, as: UInt32.self)
-        partial.writeBytes(Array(repeating: UInt8(0xaa), count: 8))
-        try channel.writeInbound(partial)
-        #expect(channel.isActive)
+        var records: [Data] = []
+        #expect(decode(
+            lengthPrefix(9) + Array(repeating: UInt8(0xaa), count: 8),
+            with: accumulator,
+            into: &records
+        ))
         #expect(budget.currentUsage == 8)
         #expect(connectionBudget.currentUsage == 8)
 
-        var finalByte = channel.allocator.buffer(capacity: 1)
-        finalByte.writeInteger(UInt8(0xaa))
-        _ = try? channel.writeInbound(finalByte)
-        #expect(!channel.isActive)
-        #expect(collector.records.isEmpty)
+        #expect(!decode([0xaa], with: accumulator, into: &records))
+        #expect(records.isEmpty)
         #expect(budget.currentUsage == 0)
         #expect(connectionBudget.currentUsage == 0)
     }
 
     @Test("closing a partial header releases its reservation")
-    func partialHeaderClose() throws {
+    func partialHeaderClose() {
         let budget = InboundByteBudget(limit: 4)
-        let (channel, _) = try channel(budget: budget)
-        var byte = channel.allocator.buffer(capacity: 1)
-        byte.writeInteger(UInt8(0))
-        try channel.writeInbound(byte)
+        let accumulator = accumulator(budget: budget)
+        var records: [Data] = []
+        #expect(decode([0], with: accumulator, into: &records))
         #expect(budget.currentUsage == 4)
-        _ = try channel.finish()
+        accumulator.reset()
         #expect(budget.currentUsage == 0)
     }
 
     @Test("byte-at-a-time slowloris input releases its reservation on close")
-    func slowlorisClose() throws {
+    func slowlorisClose() {
         let budget = InboundByteBudget(limit: Int(Self.limit) + 4)
-        let (channel, collector) = try channel(budget: budget)
+        let accumulator = accumulator(budget: budget)
+        var records: [Data] = []
         let partial = framed([Data(repeating: 0xaa, count: Int(Self.limit))]).prefix(12)
 
         for byte in partial {
-            var input = channel.allocator.buffer(capacity: 1)
-            input.writeInteger(byte)
-            try channel.writeInbound(input)
+            #expect(decode([byte], with: accumulator, into: &records))
         }
-        #expect(collector.records.isEmpty)
+        #expect(records.isEmpty)
         #expect(budget.currentUsage == partial.count - 4)
 
-        _ = try channel.finish()
+        accumulator.reset()
         #expect(budget.currentUsage == 0)
     }
 
     @Test("seeded hostile mutations never leak frame budget")
-    func seededHostileMutations() throws {
+    func seededHostileMutations() {
         var generator = TestSeededGenerator(seed: 0x4956_5908)
         let corpus = [
             Message.ping(nonce: 1).serialize(),
@@ -223,20 +286,19 @@ struct MessageFrameDecoderBoundTests {
             }
 
             let budget = InboundByteBudget(limit: Int(Self.limit) + 4)
-            let (channel, collector) = try channel(budget: budget)
+            let accumulator = accumulator(budget: budget)
             var bytes = framed([body.isEmpty ? Data([0]) : body])
             if generator.next() & 1 == 1, !bytes.isEmpty {
                 bytes[Int(generator.next() % UInt64(bytes.count))] ^= 1
             }
-            var input = channel.allocator.buffer(capacity: bytes.count)
-            input.writeBytes(bytes)
-            _ = try? channel.writeInbound(input)
-            for record in collector.records {
+            var records: [Data] = []
+            _ = decode(bytes, with: accumulator, into: &records)
+            for record in records {
                 if let accepted = Message.deserialize(record) {
                     #expect(accepted.serialize() == record, "iteration \(iteration)")
                 }
             }
-            _ = try? channel.finish()
+            accumulator.reset()
             #expect(budget.currentUsage == 0, "iteration \(iteration)")
         }
     }

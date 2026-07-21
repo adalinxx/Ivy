@@ -43,6 +43,41 @@ private actor BlockingContentSource: IvyContentSource {
     }
 }
 
+private actor BlockingAuthorizationContentSource: IvyContentSource {
+    private var authorizationStarts = 0
+    private var contentRequests = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func authorizesContentRequest(
+        from peer: AuthenticatedPeer,
+        rootCID: String,
+        cids: [String]
+    ) async -> Bool {
+        authorizationStarts += 1
+        await withCheckedContinuation { waiters.append($0) }
+        return true
+    }
+
+    func content(
+        rootCID: String,
+        cids: [String],
+        maxDataBytes: Int
+    ) -> [ContentEntry] {
+        contentRequests += 1
+        return []
+    }
+
+    func counts() -> (authorizationStarts: Int, contentRequests: Int) {
+        (authorizationStarts, contentRequests)
+    }
+
+    func releaseAll() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+}
+
 private actor ControlledNetworkFetch {
     private var invocationCount = 0
     private var completions: [Int: AttributedContentResponse] = [:]
@@ -103,6 +138,33 @@ private actor TestContentSource: IvyContentSource {
     }
 }
 
+private actor DenyingContentSource: IvyContentSource {
+    private var authorizationChecks = 0
+    private var contentRequests = 0
+
+    func authorizesContentRequest(
+        from peer: AuthenticatedPeer,
+        rootCID: String,
+        cids: [String]
+    ) -> Bool {
+        authorizationChecks += 1
+        return false
+    }
+
+    func content(
+        rootCID: String,
+        cids: [String],
+        maxDataBytes: Int
+    ) -> [ContentEntry] {
+        contentRequests += 1
+        return []
+    }
+
+    func counts() -> (authorizationChecks: Int, contentRequests: Int) {
+        (authorizationChecks, contentRequests)
+    }
+}
+
 private struct RawContentSource: IvyContentSource {
     let entries: [ContentEntry]
 
@@ -147,6 +209,202 @@ struct ContentExchangeTests {
         #expect(try await first.value(waitingFor: "first capped fetch") == .empty)
         #expect(try await second.value(waitingFor: "second capped fetch") == .empty)
         await ivy.stop()
+    }
+
+    @Test("cancelling coalesced waiters releases only their owned work")
+    func coalescedFetchCancellation() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-cancellation",
+            listenPort: 0,
+            requestTimeout: .seconds(5),
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxPendingRequests: 1))
+        let controlled = ControlledNetworkFetch()
+        await ivy.setNetworkFetchHookForTesting { _, _, _ in
+            await controlled.run()
+        }
+        try await ivy.start()
+
+        let leader = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        try await controlled.waitForInvocations(1)
+        let follower = BoundedTestTask { await ivy.fetchContent(rootCID: "root") }
+        let key = ContentRequestKey(rootCID: "root", cids: [])
+        try await TestSynchronization.wait(for: "coalesced cancellation follower") {
+            await ivy.networkFetchWaiterCount(for: key) == 1
+        }
+
+        follower.cancel()
+        #expect(try await follower.value(waitingFor: "cancelled follower") == .empty)
+        #expect(await ivy.networkFetchWaiterCount(for: key) == 0)
+        #expect(await ivy.activeFetchCountForTesting == 1)
+
+        leader.cancel()
+        #expect(try await leader.value(waitingFor: "cancelled leader") == .empty)
+        try await TestSynchronization.wait(for: "cancelled leader slot release") {
+            await ivy.activeFetchCountForTesting == 0
+        }
+
+        let replacement = BoundedTestTask {
+            await ivy.fetchContent(rootCID: "replacement")
+        }
+        try await controlled.waitForInvocations(2)
+        await controlled.complete(1, with: .empty)
+        #expect(try await replacement.value(waitingFor: "replacement fetch") == .empty)
+        await ivy.stop()
+    }
+
+    @Test("cancelling a wire fetch removes its pending request immediately")
+    func wireFetchCancellation() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "wire-content-cancellation",
+            listenPort: 0,
+            requestTimeout: .seconds(5),
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxPendingRequests: 1))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("silent-content-peer"))
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
+
+        let request = BoundedTestTask {
+            await ivy.fetchContent(
+                ContentRequestKey(rootCID: "root", cids: []),
+                from: [peer]
+            )
+        }
+        try await TestSynchronization.wait(for: "pending wire content request") {
+            await ivy.pendingContentState().requestID != nil
+        }
+        request.cancel()
+        #expect(try await request.value(waitingFor: "cancelled wire fetch") == .empty)
+        #expect(await ivy.pendingContentState().requestID == nil)
+
+        let replacement = BoundedTestTask {
+            await ivy.fetchContent(
+                ContentRequestKey(rootCID: "replacement", cids: []),
+                from: [peer]
+            )
+        }
+        try await TestSynchronization.wait(for: "replacement wire content request") {
+            await ivy.pendingContentState().requestID != nil
+        }
+        await ivy.cleanupAllPending()
+        #expect(try await replacement.value(waitingFor: "replacement wire cleanup") == .empty)
+    }
+
+    @Test("remote content authorization runs before storage")
+    func contentAuthorizationPrecedesStorage() async {
+        let ivy = node("content-authorization")
+        let source = DenyingContentSource()
+        await ivy.setContentSource(source)
+
+        await ivy.handleContentRequest(
+            requestID: 1,
+            rootCID: "root",
+            cids: [],
+            from: PeerID(publicKey: deterministicTestPeerKey("unauthorized-content-peer"))
+        )
+
+        let counts = await source.counts()
+        #expect(counts.authorizationChecks == 1)
+        #expect(counts.contentRequests == 0)
+    }
+
+    @Test("authorization and storage use one captured source")
+    func authorizationCannotSwapStorageSource() async throws {
+        let ivy = node("content-source-swap")
+        let original = BlockingAuthorizationContentSource()
+        let replacement = TestContentSource(entries: [:])
+        await ivy.setContentSource(original)
+        let peer = PeerID(publicKey: deterministicTestPeerKey("content-source-swap-peer"))
+
+        let request = Task {
+            await ivy.handleContentRequest(
+                requestID: 1,
+                rootCID: "root",
+                cids: [],
+                from: peer
+            )
+        }
+        try await TestSynchronization.wait(for: "blocked content authorization") {
+            await original.counts().authorizationStarts == 1
+        }
+        await ivy.setContentSource(replacement)
+        await original.releaseAll()
+        await request.value
+
+        #expect(await original.counts().contentRequests == 1)
+        #expect(await replacement.requests().isEmpty)
+    }
+
+    @Test("authorization work obeys the inbound content cap")
+    func authorizationObeysContentCap() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "content-authorization-cap",
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxConcurrentContentRequests: 1
+        ))
+        let source = BlockingAuthorizationContentSource()
+        await ivy.setContentSource(source)
+        let peer = PeerID(publicKey: deterministicTestPeerKey("content-authorization-cap-peer"))
+
+        let first = Task {
+            await ivy.handleContentRequest(
+                requestID: 1,
+                rootCID: "one",
+                cids: [],
+                from: peer
+            )
+        }
+        try await TestSynchronization.wait(for: "first content authorization") {
+            await source.counts().authorizationStarts == 1
+        }
+        await ivy.handleContentRequest(
+            requestID: 2,
+            rootCID: "two",
+            cids: [],
+            from: peer
+        )
+        #expect(await source.counts().authorizationStarts == 1)
+        await source.releaseAll()
+        await first.value
+    }
+
+    @Test("private content exchange requires explicit opt-in")
+    func privateContentExchangeRequiresOptIn() async {
+        let peer = PeerID(publicKey: deterministicTestPeerKey("private-content-peer"))
+        let disabledSource = DenyingContentSource()
+        let disabled = Ivy(config: IvyConfig(
+            publicKey: "private-content-disabled",
+            listenPort: 0,
+            mode: .privateNetwork
+        ))
+        await disabled.setContentSource(disabledSource)
+        await disabled.handleMessage(
+            .contentRequest(requestID: 1, rootCID: "root", cids: []),
+            from: peer
+        )
+        let disabledCounts = await disabledSource.counts()
+        #expect(disabledCounts.authorizationChecks == 0)
+        #expect(disabledCounts.contentRequests == 0)
+
+        let enabledSource = DenyingContentSource()
+        let enabled = Ivy(config: IvyConfig(
+            publicKey: "private-content-enabled",
+            listenPort: 0,
+            privateContentExchangeEnabled: true,
+            mode: .privateNetwork
+        ))
+        await enabled.setContentSource(enabledSource)
+        await enabled.handleMessage(
+            .contentRequest(requestID: 2, rootCID: "root", cids: []),
+            from: peer
+        )
+        let enabledCounts = await enabledSource.counts()
+        #expect(enabledCounts.authorizationChecks == 1)
+        #expect(enabledCounts.contentRequests == 0)
     }
 
     @Test("local fetches coalesce and retain their concurrency slots across restart")

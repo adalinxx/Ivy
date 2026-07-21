@@ -6,6 +6,25 @@ public protocol IvyContentSource: Sendable {
     /// `cids` is canonical and includes `rootCID`. Ivy treats identifiers and
     /// bytes as opaque.
     func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry]
+
+    /// Admission hook for authenticated remote requests. Public content
+    /// sources accept every peer by default; private users can narrow access
+    /// without changing the opaque content contract.
+    func authorizesContentRequest(
+        from peer: AuthenticatedPeer,
+        rootCID: String,
+        cids: [String]
+    ) async -> Bool
+}
+
+public extension IvyContentSource {
+    func authorizesContentRequest(
+        from peer: AuthenticatedPeer,
+        rootCID: String,
+        cids: [String]
+    ) async -> Bool {
+        true
+    }
 }
 
 public struct AttributedContentResponse: Sendable, Equatable {
@@ -44,7 +63,7 @@ struct PendingContentRequest {
 struct PendingFetch {
     let token: UInt64
     let generation: UInt64
-    var continuations: [CheckedContinuation<AttributedContentResponse, Never>]
+    var continuations: [UUID: CheckedContinuation<AttributedContentResponse, Never>]
     var operationTask: Task<Void, Never>? = nil
     var timeoutTask: IvyTimer? = nil
 }
@@ -94,7 +113,24 @@ extension Ivy {
         }
         defer { endServingContent(inbound) }
 
-        let available = await contentSource?.content(
+        let source = contentSource
+        if let source {
+            guard let requester = authenticatedPeer(for: peer, session: session),
+                  await source.authorizesContentRequest(
+                    from: requester,
+                    rootCID: rootCID,
+                    cids: key.requestedCIDs
+                  ) else {
+                sendContentReply(
+                    .contentUnavailable(requestID: requestID),
+                    to: peer,
+                    session: session,
+                    bypassAdmission: true)
+                return
+            }
+        }
+        guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
+        let available = await source?.content(
             rootCID: rootCID,
             cids: key.requestedCIDs,
             maxDataBytes: maxDataBytes
@@ -126,6 +162,26 @@ extension Ivy {
                 bypassAdmission: true)
             return
         }
+    }
+
+    private func authenticatedPeer(
+        for peer: PeerID,
+        session: AuthenticatedSession?
+    ) -> AuthenticatedPeer? {
+        if let session {
+            return AuthenticatedPeer(
+                key: session.peerKey,
+                role: session.role,
+                route: session.connection.route,
+                metadata: session.metadata,
+                sessionID: session.sessionID.bytes)
+        }
+        guard let key = try? PeerKey(peer.publicKey) else { return nil }
+        return AuthenticatedPeer(
+            key: key,
+            role: .endpoint,
+            route: .direct,
+            metadata: PeerMetadata())
     }
 
     @discardableResult
@@ -250,38 +306,63 @@ extension Ivy {
         _ key: ContentRequestKey,
         generation: UInt64
     ) async -> AttributedContentResponse {
-        await withCheckedContinuation { continuation in
-            if var pending = pendingFetches[key] {
-                guard pending.generation == generation,
-                      pending.continuations.count < config.maxWaitersPerRequest else {
+        let waiterID = UUID()
+        let response: AttributedContentResponse = await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return AttributedContentResponse.empty }
+            return await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
                     continuation.resume(returning: .empty)
                     return
                 }
-                pending.continuations.append(continuation)
+                if var pending = pendingFetches[key] {
+                    guard pending.generation == generation,
+                          pending.continuations.count < config.maxWaitersPerRequest else {
+                        continuation.resume(returning: .empty)
+                        return
+                    }
+                    pending.continuations[waiterID] = continuation
+                    pendingFetches[key] = pending
+                    return
+                }
+                guard activeFetchCount < config.maxPendingRequests else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+                nextFetchToken &+= 1
+                let token = nextFetchToken
+                var pending = PendingFetch(
+                    token: token,
+                    generation: generation,
+                    continuations: [waiterID: continuation])
+                activeFetchCount += 1
                 pendingFetches[key] = pending
-                return
+                pending.operationTask = Task { [weak self] in
+                    await self?.runFetch(key, generation: generation, token: token)
+                }
+                let timeout = config.requestTimeout
+                pending.timeoutTask = delayedTask(after: timeout) { [weak self] in
+                    await self?.timeoutFetch(key, token: token)
+                }
+                pendingFetches[key] = pending
             }
-            guard activeFetchCount < config.maxPendingRequests else {
-                continuation.resume(returning: .empty)
-                return
-            }
-            nextFetchToken &+= 1
-            let token = nextFetchToken
-            var pending = PendingFetch(
-                token: token,
-                generation: generation,
-                continuations: [continuation])
-            activeFetchCount += 1
-            pendingFetches[key] = pending
-            pending.operationTask = Task { [weak self] in
-                await self?.runFetch(key, generation: generation, token: token)
-            }
-            let timeout = config.requestTimeout
-            pending.timeoutTask = delayedTask(after: timeout) { [weak self] in
-                await self?.timeoutFetch(key, token: token)
-            }
-            pendingFetches[key] = pending
+        } onCancel: {
+            Task { await self.cancelFetchWaiter(key, waiterID: waiterID) }
         }
+        return Task.isCancelled ? .empty : response
+    }
+
+    private func cancelFetchWaiter(_ key: ContentRequestKey, waiterID: UUID) {
+        guard var pending = pendingFetches[key],
+              let continuation = pending.continuations.removeValue(forKey: waiterID)
+        else { return }
+        continuation.resume(returning: .empty)
+        guard pending.continuations.isEmpty else {
+            pendingFetches[key] = pending
+            return
+        }
+        pendingFetches.removeValue(forKey: key)
+        pending.timeoutTask?.cancel()
+        pending.operationTask?.cancel()
     }
 
     private func runFetch(
@@ -293,8 +374,7 @@ extension Ivy {
         let response: AttributedContentResponse
         if !Task.isCancelled, let local = await localContent(for: key) {
             response = AttributedContentResponse(entries: local, servedBy: nil)
-        } else if config.mode.usesOverlayServices,
-                  !Task.isCancelled,
+        } else if !Task.isCancelled,
                   isCurrentRun(generation) {
 #if DEBUG || IVY_TESTING
             if let hook = networkFetchHookForTesting {
@@ -312,32 +392,38 @@ extension Ivy {
               let pending = pendingFetches.removeValue(forKey: key) else { return }
         pending.timeoutTask?.cancel()
         let result = generation == runGeneration ? response : .empty
-        for continuation in pending.continuations { continuation.resume(returning: result) }
+        for continuation in pending.continuations.values {
+            continuation.resume(returning: result)
+        }
     }
 
     private func timeoutFetch(_ key: ContentRequestKey, token: UInt64) {
         guard pendingFetches[key]?.token == token,
               let pending = pendingFetches.removeValue(forKey: key) else { return }
         pending.operationTask?.cancel()
-        for continuation in pending.continuations { continuation.resume(returning: .empty) }
+        for continuation in pending.continuations.values {
+            continuation.resume(returning: .empty)
+        }
     }
 
     private func performNetworkFetch(
         _ key: ContentRequestKey,
         generation: UInt64
     ) async -> AttributedContentResponse {
-        guard isCurrentRun(generation) else { return .empty }
+        guard isCurrentRun(generation), !Task.isCancelled,
+              config.mode.usesOverlayServices || config.privateContentExchangeEnabled
+        else { return .empty }
         var attemptedSessions: [PeerID: UUID] = [:]
         let cached = cachedProviderEndpoints(rootCID: key.rootCID)
         await connectToProviderEndpoints(cached, generation: generation)
-        guard isCurrentRun(generation) else { return .empty }
+        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
 
         var candidates = Array(connectedProviderIDs(for: key.rootCID)
             .prefix(config.maxContentCandidates))
         if !candidates.isEmpty {
             let sessions = liveConnectionIDs(for: candidates)
             let response = await fetchContent(key, from: candidates, generation: generation)
-            guard isCurrentRun(generation) else { return .empty }
+            guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
             if !response.entries.isEmpty { return response }
             attemptedSessions.merge(sessions) { _, latest in latest }
         }
@@ -345,9 +431,9 @@ extension Ivy {
         let fresh = await queryFreshProviderEndpoints(
             rootCID: key.rootCID,
             generation: generation)
-        guard isCurrentRun(generation) else { return .empty }
+        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
         await connectToProviderEndpoints(fresh + cached, generation: generation)
-        guard isCurrentRun(generation) else { return .empty }
+        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
         candidates = Array(connectedProviderIDs(for: key.rootCID)
             .filter {
                 attemptedSessions[$0] != endpointConnection(for: $0)?.connectionID
@@ -356,7 +442,7 @@ extension Ivy {
         if !candidates.isEmpty {
             let sessions = liveConnectionIDs(for: candidates)
             let response = await fetchContent(key, from: candidates, generation: generation)
-            guard isCurrentRun(generation) else { return .empty }
+            guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
             if !response.entries.isEmpty { return response }
             attemptedSessions.merge(sessions) { _, latest in latest }
         }
@@ -364,9 +450,9 @@ extension Ivy {
         candidates = connectedFallbackCandidates(
             rootCID: key.rootCID,
             excluding: attemptedSessions)
-        guard !candidates.isEmpty else { return .empty }
+        guard !Task.isCancelled, !candidates.isEmpty else { return .empty }
         let response = await fetchContent(key, from: candidates, generation: generation)
-        return isCurrentRun(generation) ? response : .empty
+        return isCurrentRun(generation) && !Task.isCancelled ? response : .empty
     }
 
     private func liveConnectionIDs(for peers: [PeerID]) -> [PeerID: UUID] {
@@ -384,40 +470,48 @@ extension Ivy {
         generation: UInt64? = nil
     ) async -> AttributedContentResponse {
         if let generation, !isCurrentRun(generation) { return .empty }
-        let response: AttributedContentResponse = await withCheckedContinuation { continuation in
-            guard pendingContentRequests.count < config.maxPendingRequests else {
-                continuation.resume(returning: .empty)
-                return
-            }
-
-            let requestID = makeContentRequestID()
-            let message = Message.contentRequest(
-                requestID: requestID,
-                rootCID: key.rootCID,
-                cids: key.cids
-            )
-            var enqueued: Set<PeerID> = []
-            for peer in candidates {
-                if enqueueContentRequest(message, to: peer) {
-                    enqueued.insert(peer)
+        let requestID = makeContentRequestID()
+        let response: AttributedContentResponse = await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return .empty }
+            return await withCheckedContinuation { continuation in
+                guard !Task.isCancelled,
+                      pendingContentRequests.count < config.maxPendingRequests else {
+                    continuation.resume(returning: .empty)
+                    return
                 }
-            }
-            guard !enqueued.isEmpty else {
-                continuation.resume(returning: .empty)
-                return
-            }
-            pendingContentRequests[requestID] = PendingContentRequest(
-                key: key,
-                continuation: continuation,
-                candidates: enqueued)
 
-            let timeout = config.requestTimeout
-            let timeoutTask = delayedTask(after: timeout) { [weak self] in
-                await self?.resolveContentRequest(requestID: requestID)
+                let message = Message.contentRequest(
+                    requestID: requestID,
+                    rootCID: key.rootCID,
+                    cids: key.cids
+                )
+                var enqueued: Set<PeerID> = []
+                for peer in candidates {
+                    if enqueueContentRequest(message, to: peer) {
+                        enqueued.insert(peer)
+                    }
+                }
+                guard !enqueued.isEmpty else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+                pendingContentRequests[requestID] = PendingContentRequest(
+                    key: key,
+                    continuation: continuation,
+                    candidates: enqueued)
+
+                let timeout = config.requestTimeout
+                let timeoutTask = delayedTask(after: timeout) { [weak self] in
+                    await self?.resolveContentRequest(requestID: requestID)
+                }
+                pendingContentRequests[requestID]?.timeoutTask = timeoutTask
             }
-            pendingContentRequests[requestID]?.timeoutTask = timeoutTask
+        } onCancel: {
+            Task { await self.resolveContentRequest(requestID: requestID) }
         }
-        if let generation, !isCurrentRun(generation) { return .empty }
+        if Task.isCancelled || generation.map({ !isCurrentRun($0) }) == true {
+            return .empty
+        }
         return response
     }
 
