@@ -732,7 +732,9 @@ struct TCPIntegrationTests {
             mode: .privateNetwork,
             privateContentExchangeEnabled: true))
         let recorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
         await server.setTestDelegate(recorder)
+        await client.setTestDelegate(clientRecorder)
         let root = "private-root"
         let child = "private-child"
         await server.setContentSource(TransportTestContentSource([
@@ -760,9 +762,11 @@ struct TCPIntegrationTests {
         await client.announceProvider(rootCID: root, expiresAt: expiry)
         #expect(await client.tally.metrics.totalBytesSent == sentBeforeOverlayAPIs)
 
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
         let fetched = await client.fetchContent(
             rootCID: root,
-            cids: [child])
+            cids: [child],
+            from: serverPeer)
         #expect(fetched.entries == [
             root: Data("root bytes".utf8),
             child: Data("child bytes".utf8),

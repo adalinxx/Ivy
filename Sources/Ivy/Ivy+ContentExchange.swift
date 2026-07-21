@@ -57,6 +57,7 @@ struct PendingContentRequest {
     let key: ContentRequestKey
     let continuation: CheckedContinuation<AttributedContentResponse, Never>
     var candidates: Set<PeerID>
+    let exactSessionID: Data?
     var timeoutTask: IvyTimer? = nil
 }
 
@@ -218,10 +219,12 @@ extension Ivy {
     func handleContentResponse(
         requestID: UInt64,
         entries: [ContentEntry],
-        from peer: PeerID
+        from peer: PeerID,
+        sessionID: Data? = nil
     ) {
         guard let pending = pendingContentRequests[requestID],
-              pending.candidates.contains(peer) else { return }
+              pending.candidates.contains(peer),
+              pending.exactSessionID.map({ $0 == sessionID }) ?? true else { return }
         let key = pending.key
 
         var result: [String: Data] = [:]
@@ -242,7 +245,13 @@ extension Ivy {
         resolveContentRequest(requestID: requestID, entries: result, servedBy: peer)
     }
 
-    func handleContentUnavailable(requestID: UInt64, from peer: PeerID) {
+    func handleContentUnavailable(
+        requestID: UInt64,
+        from peer: PeerID,
+        sessionID: Data? = nil
+    ) {
+        guard let pending = pendingContentRequests[requestID],
+              pending.exactSessionID.map({ $0 == sessionID }) ?? true else { return }
         markContentCandidateDone(requestID: requestID, peer: peer)
     }
 
@@ -263,6 +272,32 @@ extension Ivy {
             relayed: false
         ) != nil else { return .empty }
         return await fetchContentCoalesced(key, generation: generation)
+    }
+
+    /// Fetches one exact selection from the specified authenticated endpoint
+    /// session. A replacement connection for the same key cannot receive or
+    /// satisfy the request.
+    public func fetchContent(
+        rootCID: String,
+        cids: [String] = [],
+        from peer: AuthenticatedPeer
+    ) async -> AttributedContentResponse {
+        let generation = runGeneration
+        guard MessageLimits.accepts(rootCID),
+              cids.count <= Int(MessageLimits.maxContentCIDCount),
+              cids.allSatisfy(MessageLimits.accepts) else { return .empty }
+        let key = ContentRequestKey(rootCID: rootCID, cids: cids)
+        guard Message.contentResponseDataBudget(
+            for: key.requestedCIDs,
+            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            relayed: peer.route != .direct
+        ) != nil else { return .empty }
+        return await fetchContent(
+            key,
+            from: [peer.id],
+            generation: generation,
+            exactPeer: peer
+        )
     }
 
     private func localContent(for key: ContentRequestKey) async -> [String: Data]? {
@@ -467,7 +502,8 @@ extension Ivy {
     func fetchContent(
         _ key: ContentRequestKey,
         from candidates: [PeerID],
-        generation: UInt64? = nil
+        generation: UInt64? = nil,
+        exactPeer: AuthenticatedPeer? = nil
     ) async -> AttributedContentResponse {
         if let generation, !isCurrentRun(generation) { return .empty }
         let requestID = makeContentRequestID()
@@ -486,9 +522,21 @@ extension Ivy {
                     cids: key.cids
                 )
                 var enqueued: Set<PeerID> = []
-                for peer in candidates {
-                    if enqueueContentRequest(message, to: peer) {
-                        enqueued.insert(peer)
+                if let exactPeer {
+                    guard candidates == [exactPeer.id],
+                          enqueueContentRequestOnCurrentSession(
+                            message,
+                            to: exactPeer
+                          ) else {
+                        continuation.resume(returning: .empty)
+                        return
+                    }
+                    enqueued.insert(exactPeer.id)
+                } else {
+                    for peer in candidates {
+                        if enqueueContentRequest(message, to: peer) {
+                            enqueued.insert(peer)
+                        }
                     }
                 }
                 guard !enqueued.isEmpty else {
@@ -498,7 +546,8 @@ extension Ivy {
                 pendingContentRequests[requestID] = PendingContentRequest(
                     key: key,
                     continuation: continuation,
-                    candidates: enqueued)
+                    candidates: enqueued,
+                    exactSessionID: exactPeer?.sessionID)
 
                 let timeout = config.requestTimeout
                 let timeoutTask = delayedTask(after: timeout) { [weak self] in
