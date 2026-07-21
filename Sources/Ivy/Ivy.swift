@@ -708,8 +708,8 @@ public actor Ivy {
     }
 
     /// Restart a configured peer without turning off its automatic reconnect.
-    /// This is for a higher layer that detected a transient application failure
-    /// after Ivy accepted an authenticated message.
+    /// Prefer the exact-session overload when handling an authenticated callback.
+    @available(*, deprecated, message: "Use recycleSession(ifCurrent:)")
     public func restartConfiguredSession(with peer: PeerID) {
         guard let key = try? PeerKey(peer.publicKey),
               let session = sessions[key],
@@ -718,6 +718,36 @@ public actor Ivy {
         }
         teardownAuthenticatedSession(session, reconnect: true)
         session.connection.cancel()
+    }
+
+    /// Close only the represented authenticated session. Configured peers
+    /// reconnect automatically; unconfigured peers may reconnect themselves.
+    /// A stale callback cannot close a replacement session for the same key.
+    @discardableResult
+    public func recycleSession(ifCurrent peer: AuthenticatedPeer) -> Bool {
+        guard let session = sessions[peer.key],
+              session.sessionID.bytes == peer.sessionID else { return false }
+        let reconnect = !configuredEndpoints(
+            for: peer.key,
+            role: session.role
+        ).isEmpty
+        teardownAuthenticatedSession(session, reconnect: reconnect)
+        session.connection.cancel()
+        return true
+    }
+
+    /// Permanently close only the represented authenticated session. A stale
+    /// callback cannot suppress or close its replacement for the same key.
+    @discardableResult
+    public func disconnectSession(ifCurrent peer: AuthenticatedPeer) -> Bool {
+        guard let session = sessions[peer.key],
+              session.sessionID.bytes == peer.sessionID else { return false }
+        reconnectSuppressed.insert(peer.id)
+        reconnectTasks.removeValue(forKey: peer.id)?.task.cancel()
+        reconnectAttempts.removeValue(forKey: peer.id)
+        teardownAuthenticatedSession(session, reconnect: false)
+        session.connection.cancel()
+        return true
     }
 
     private func disconnectStale(

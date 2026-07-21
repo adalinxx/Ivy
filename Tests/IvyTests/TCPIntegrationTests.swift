@@ -504,8 +504,8 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
-    @Test("restarting a configured session preserves automatic reconnect")
-    func restartConfiguredSessionReconnects() async throws {
+    @Test("exact-session recovery is configured, suppressible, and stale-safe")
+    func exactSessionRecoveryIsConfiguredAndStaleSafe() async throws {
         let serverIdentity = TransportTestHarness.identity("restart-server")
         let clientIdentity = TransportTestHarness.identity("restart-client")
         let serverPort = TransportTestHarness.nextPort()
@@ -526,17 +526,66 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             await client.peerConnectionCount == 1
         })
-        let initialSession = await client.selectedSessionIDForTesting(serverID)
-        #expect(initialSession != nil)
+        let initialPeer = try #require(clientRecorder.authenticatedPeers.last)
 
-        await client.restartConfiguredSession(with: serverID)
+        #expect(await client.recycleSession(ifCurrent: initialPeer))
         #expect(try await TransportTestHarness.eventually {
             let currentSession = await client.selectedSessionIDForTesting(serverID)
             let connectionCount = await client.peerConnectionCount
             return connectionCount == 1
                 && currentSession != nil
-                && currentSession != initialSession
+                && currentSession != initialPeer.sessionID
                 && clientRecorder.authenticatedPeers.count >= 2
+        })
+        let replacementSession = await client.selectedSessionIDForTesting(serverID)
+        #expect(!(await client.recycleSession(ifCurrent: initialPeer)))
+        #expect(await client.selectedSessionIDForTesting(serverID) == replacementSession)
+        #expect(!(await client.disconnectSession(ifCurrent: initialPeer)))
+        #expect(await client.selectedSessionIDForTesting(serverID) == replacementSession)
+
+        let replacementPeer = try #require(clientRecorder.authenticatedPeers.last)
+        #expect(await client.disconnectSession(ifCurrent: replacementPeer))
+        #expect(try await TransportTestHarness.eventually {
+            await client.peerConnectionCount == 0
+        })
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(await client.peerConnectionCount == 0)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("exact-session recycle closes an unconfigured peer")
+    func exactSessionRecycleClosesUnconfiguredPeer() async throws {
+        let serverIdentity = TransportTestHarness.identity("recycle-server")
+        let clientIdentity = TransportTestHarness.identity("recycle-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let serverRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.authenticatedPeers.count == 1
+        })
+        let inboundPeer = try #require(serverRecorder.authenticatedPeers.first)
+
+        #expect(await server.recycleSession(ifCurrent: inboundPeer))
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 0
         })
 
         await client.stop()
