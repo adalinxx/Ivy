@@ -156,7 +156,6 @@ private final class WritabilityWaiter: @unchecked Sendable {
 final class PeerConnection: @unchecked Sendable {
     static let maxInboundBufferedRecords = 4
     static let maxInboundBufferedBytes = 2 * Int(IvyConfig.protocolMaxFrameSize) + 4
-    static let directInboundReadBufferBytes = 64 * 1024
 
     let connectionID = UUID()
     var endpoint: PeerEndpoint
@@ -190,7 +189,7 @@ final class PeerConnection: @unchecked Sendable {
     private var inboundAdmission: InboundAdmissionLease?
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
-    private let directInbound: NIOAsyncChannel<ByteBuffer, Never>?
+    private let directInbound: NIOAsyncChannel<InboundFrame, Never>?
     private let inbound: AsyncStream<InboundFrame>
     private let inboundContinuation: AsyncStream<InboundFrame>.Continuation
 
@@ -211,7 +210,7 @@ final class PeerConnection: @unchecked Sendable {
     init(
         endpoint: PeerEndpoint,
         channel: Channel,
-        directInbound: NIOAsyncChannel<ByteBuffer, Never>? = nil,
+        directInbound: NIOAsyncChannel<InboundFrame, Never>? = nil,
         inboundAdmission: InboundAdmissionLease? = nil,
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
@@ -258,17 +257,15 @@ final class PeerConnection: @unchecked Sendable {
         let connectionInboundByteBudget = InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(5))
-            .channelOption(ChannelOptions.maxMessagesPerRead, value: 1)
-            .channelOption(
-                ChannelOptions.recvAllocator,
-                value: FixedSizeRecvByteBufferAllocator(capacity: directInboundReadBufferBytes))
         let connection: PeerConnection = try await bootstrap.connect(
             host: endpoint.host,
             port: Int(endpoint.port)
         ) { channel in
             do {
-                try channel.pipeline.syncOperations.addHandler(InboundBufferCopyHandler())
-                let inbound = try NIOAsyncChannel<ByteBuffer, Never>(
+                try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
+                    budget: inboundByteBudget,
+                    connectionBudget: connectionInboundByteBudget))
+                let inbound = try NIOAsyncChannel<InboundFrame, Never>(
                     wrappingChannelSynchronously: channel,
                     configuration: .init(backPressureStrategy: .init(
                         lowWatermark: 1,
@@ -359,12 +356,7 @@ final class PeerConnection: @unchecked Sendable {
     }
 
     var records: AsyncStream<InboundFrame> { inbound }
-    var directInboundStream: NIOAsyncChannel<ByteBuffer, Never>? { directInbound }
-    func makeFrameAccumulator() -> SessionFrameAccumulator {
-        SessionFrameAccumulator(
-            budget: inboundByteBudget,
-            connectionBudget: connectionInboundByteBudget)
-    }
+    var directInboundStream: NIOAsyncChannel<InboundFrame, Never>? { directInbound }
     var isDirect: Bool { if case .direct = transport { return true }; return false }
     var isLive: Bool { !isClosed && (channel?.isActive ?? true) }
 
@@ -464,13 +456,10 @@ final class PeerConnection: @unchecked Sendable {
     }
 }
 
-enum SessionFrameDecodeResult {
-    case frame(InboundFrame)
-    case incomplete
-    case invalid
-}
+final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias InboundOut = InboundFrame
 
-final class SessionFrameAccumulator {
     private let maxFrameSize: UInt32
     private let budget: InboundByteBudget
     private let connectionBudget: InboundByteBudget
@@ -491,58 +480,74 @@ final class SessionFrameAccumulator {
         header.reserveCapacity(4)
     }
 
-    func nextFrame(from incoming: inout ByteBuffer) -> SessionFrameDecodeResult {
-        guard incoming.readableBytes > 0 else { return .incomplete }
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
 
-        if expectedBodyLength == nil {
-            if header.isEmpty {
-                let reservation = InboundByteReservation(
-                    budgets: [connectionBudget, budget])
-                guard reservation.acquire(4) else {
-                    reset()
-                    return .invalid
+        while incoming.readableBytes > 0 {
+            if expectedBodyLength == nil {
+                if header.isEmpty {
+                    let reservation = InboundByteReservation(
+                        budgets: [connectionBudget, budget])
+                    guard reservation.acquire(4) else {
+                        close(context)
+                        return
+                    }
+                    headerReservation = reservation
                 }
-                headerReservation = reservation
+                let count = min(4 - header.count, incoming.readableBytes)
+                guard let bytes = incoming.readBytes(length: count) else { return }
+                header.append(contentsOf: bytes)
+                guard header.count == 4 else { return }
+
+                let length = UInt32(header[0]) << 24
+                    | UInt32(header[1]) << 16
+                    | UInt32(header[2]) << 8
+                    | UInt32(header[3])
+                guard length > 0, length <= maxFrameSize else {
+                    close(context)
+                    return
+                }
+                expectedBodyLength = Int(length)
+                bodyReservation = InboundByteReservation(
+                    budgets: [connectionBudget, budget])
+                header.removeAll(keepingCapacity: true)
+                headerReservation = nil
             }
-            let count = min(4 - header.count, incoming.readableBytes)
-            guard let bytes = incoming.readBytes(length: count) else { return .incomplete }
-            header.append(contentsOf: bytes)
-            guard header.count == 4 else { return .incomplete }
 
-            let length = UInt32(header[0]) << 24
-                | UInt32(header[1]) << 16
-                | UInt32(header[2]) << 8
-                | UInt32(header[3])
-            guard length > 0, length <= maxFrameSize else {
-                reset()
-                return .invalid
+            guard let expectedBodyLength,
+                  let bodyReservation else { continue }
+            let count = min(expectedBodyLength - body.count, incoming.readableBytes)
+            guard bodyReservation.acquire(count) else {
+                close(context)
+                return
             }
-            expectedBodyLength = Int(length)
-            bodyReservation = InboundByteReservation(
-                budgets: [connectionBudget, budget])
-            header.removeAll(keepingCapacity: true)
-            headerReservation = nil
-        }
+            guard let bytes = incoming.readData(length: count) else { return }
+            body.append(bytes)
+            guard body.count == expectedBodyLength else { return }
 
-        guard let expectedBodyLength,
-              let bodyReservation else { return .invalid }
-        let count = min(expectedBodyLength - body.count, incoming.readableBytes)
-        guard bodyReservation.acquire(count) else {
-            reset()
-            return .invalid
+            let frame = InboundFrame(bytes: body, reservation: bodyReservation)
+            body = Data()
+            self.bodyReservation = nil
+            self.expectedBodyLength = nil
+            context.fireChannelRead(wrapInboundOut(frame))
         }
-        guard let bytes = incoming.readData(length: count) else { return .incomplete }
-        body.append(bytes)
-        guard body.count == expectedBodyLength else { return .incomplete }
-
-        let frame = InboundFrame(bytes: body, reservation: bodyReservation)
-        body = Data()
-        self.bodyReservation = nil
-        self.expectedBodyLength = nil
-        return .frame(frame)
     }
 
-    func reset() {
+    func handlerRemoved(context: ChannelHandlerContext) {
+        reset()
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        reset()
+        context.fireChannelInactive()
+    }
+
+    private func close(_ context: ChannelHandlerContext) {
+        reset()
+        context.close(promise: nil)
+    }
+
+    private func reset() {
         header.removeAll(keepingCapacity: true)
         headerReservation = nil
         expectedBodyLength = nil
@@ -551,20 +556,8 @@ final class SessionFrameAccumulator {
     }
 }
 
-final class InboundBufferCopyHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
-    typealias InboundOut = ByteBuffer
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let source = unwrapInboundIn(data)
-        var owned = context.channel.allocator.buffer(capacity: source.readableBytes)
-        owned.writeBytes(source.readableBytesView)
-        context.fireChannelRead(wrapInboundOut(owned))
-    }
-}
-
 final class PeerConnectionLifecycleHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
+    typealias InboundIn = InboundFrame
 
     let connection: PeerConnection
 
@@ -591,14 +584,14 @@ final class PeerConnectionLifecycleHandler: ChannelInboundHandler, @unchecked Se
 }
 
 final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
+    typealias InboundIn = InboundFrame
 
     weak var ivy: Ivy?
     private let generation: UInt64
     private let admissionGate: InboundAdmissionGate
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
-    private let directInbound: NIOAsyncChannel<ByteBuffer, Never>
+    private let directInbound: NIOAsyncChannel<InboundFrame, Never>
     private var connection: PeerConnection?
 
     init(
@@ -607,7 +600,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
         admissionGate: InboundAdmissionGate,
         inboundByteBudget: InboundByteBudget,
         connectionInboundByteBudget: InboundByteBudget,
-        directInbound: NIOAsyncChannel<ByteBuffer, Never>
+        directInbound: NIOAsyncChannel<InboundFrame, Never>
     ) {
         self.ivy = ivy
         self.generation = generation

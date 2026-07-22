@@ -395,9 +395,8 @@ extension Ivy {
             )
             return
         }
-        let response = Message.volumeResponse(
+        let response = Message.contentResponse(
             requestID: requestID,
-            rootCID: rootCID,
             entries: validated
         )
         guard !response.serialize().isEmpty,
@@ -651,9 +650,8 @@ extension Ivy {
             maxDataBytes: Int(IvyConfig.protocolMaxFrameSize)
         )
         guard let entries = validatedVolumeEntries(entries, rootCID: rootCID),
-              !Message.volumeResponse(
+              !Message.contentResponse(
                 requestID: 1,
-                rootCID: rootCID,
                 entries: entries
               ).serialize().isEmpty else { return nil }
         return AttributedVolumeResponse(
@@ -718,16 +716,15 @@ extension Ivy {
 
     func handleVolumeResponse(
         requestID: UInt64,
-        rootCID: String,
         entries: [ContentEntry],
         from peer: PeerID,
         sessionID: Data?
     ) {
         guard let pending = pendingVolumeRequests[requestID],
-              pending.rootCID == rootCID,
               pending.matches(peer: peer, sessionID: sessionID) else {
             return
         }
+        let rootCID = pending.rootCID
         guard let entries = validatedVolumeEntries(entries, rootCID: rootCID) else {
             markVolumeCandidateDone(requestID: requestID, peer: peer)
             return
@@ -972,12 +969,13 @@ extension Ivy {
     ) -> Bool {
         switch message {
         case .contentResponse(let requestID, _):
-            guard let pending = pendingContentRequests[requestID] else { return false }
-            return pending.matches(peer: peer, sessionID: sessionID)
-        case .volumeResponse(let requestID, let rootCID, _):
-            guard let pending = pendingVolumeRequests[requestID],
-                  pending.rootCID == rootCID else { return false }
-            return pending.matches(peer: peer, sessionID: sessionID)
+            if let pending = pendingContentRequests[requestID] {
+                return pending.matches(peer: peer, sessionID: sessionID)
+            }
+            return pendingVolumeRequests[requestID]?.matches(
+                peer: peer,
+                sessionID: sessionID
+            ) ?? false
         case .contentUnavailable(let requestID):
             if let pending = pendingContentRequests[requestID],
                pending.matches(peer: peer, sessionID: sessionID) {
