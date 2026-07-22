@@ -30,26 +30,25 @@ struct InboundAdmissionTests {
     @Test("an outbound reservation survives inbound churn")
     func outboundReservationSurvivesInboundChurn() async throws {
         let identity = TransportTestHarness.identity("outbound-reservation-node")
-        let port = TransportTestHarness.nextPort()
         let ivy = Ivy(config: IvyConfig(
             signingKey: identity,
-            listenPort: port,
+            listenPort: 0,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 2,
             reservedOutboundConnectionSlots: 1,
-            maxConnectionsPerNetgroup: 2,
-            externalAddress: ("127.0.0.1", port)))
+            maxConnectionsPerNetgroup: 2))
         try await ivy.start()
+        let port = try #require(await ivy.serverChannel?.localAddress?.port)
 
         let first = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
-            .connect(host: "127.0.0.1", port: Int(port)).get()
+            .connect(host: "127.0.0.1", port: port).get()
         #expect(try await TransportTestHarness.eventually {
             await ivy.pendingSessionCountForTesting == 1
         })
 
         let second = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
-            .connect(host: "127.0.0.1", port: Int(port)).get()
+            .connect(host: "127.0.0.1", port: port).get()
         #expect(try await TransportTestHarness.eventually { !second.isActive })
 
         let parent = PeerEndpoint(
