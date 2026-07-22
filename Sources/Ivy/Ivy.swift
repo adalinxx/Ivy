@@ -2389,7 +2389,13 @@ public actor Ivy {
         let bypassesInboundAdmission = session.map {
             config.inboundAdmissionBypassPeerKeys.contains($0.peerKey)
         } ?? false
-        if !exactPong && !bypassesInboundAdmission && !tally.shouldAllow(peer: peer) {
+        let expectedContentReply = isExpectedContentReply(
+            message,
+            from: peer,
+            sessionID: session?.sessionID.bytes
+        )
+        if !exactPong && !bypassesInboundAdmission && !expectedContentReply
+            && !tally.shouldAllow(peer: peer) {
             return
         }
         switch message {

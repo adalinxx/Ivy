@@ -276,6 +276,128 @@ struct ContentExchangeTests {
         ))
     }
 
+    @Test("solicited content replies survive admission exhaustion on the exact session")
+    func solicitedRepliesBypassAdmissionOnExactSession() async throws {
+        let tally = Tally(config: TallyConfig(
+            perPeerRequestCapacity: 1,
+            perPeerRequestRefillPerSecond: 0
+        ))
+        let ivy = Ivy(
+            config: IvyConfig(
+                publicKey: "solicited-reply-requester",
+                listenPort: 0,
+                requestTimeout: .seconds(1)
+            ),
+            tally: tally
+        )
+        let identity = deterministicTestPeerKey("solicited-reply-peer")
+        let endpoint = PeerEndpoint(publicKey: identity, host: "127.0.0.1", port: 4102)
+        let key = try PeerKey(identity)
+        let sessionID = Data(repeating: 2, count: 32)
+        let peer = AuthenticatedPeer(
+            key: key,
+            role: .endpoint,
+            route: .direct,
+            metadata: PeerMetadata(),
+            sessionID: sessionID
+        )
+        try await ivy.seedConnectedEndpointForTesting(endpoint, marker: 2)
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
+
+        let entries = [ContentEntry(cid: "root", data: Data("root".utf8))]
+        let volumeFetch = Task { await ivy.fetchVolume(rootCID: "root", from: peer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingVolumeState().requestID != nil
+        })
+        let volumeRequestID = try #require(await ivy.pendingVolumeState().requestID)
+
+        #expect(tally.shouldAllow(peer: key.peerID))
+        #expect(!tally.shouldAllow(peer: key.peerID))
+        await ivy.handleMessage(
+            .volumeResponse(requestID: volumeRequestID, rootCID: "root", entries: entries),
+            from: key.peerID
+        )
+        #expect(await ivy.pendingVolumeState().requestID == volumeRequestID)
+        let deniedAfterWrongSession = tally.metrics.denied
+
+        await ivy.handleCurrentMessageForTesting(
+            .volumeResponse(requestID: volumeRequestID, rootCID: "root", entries: entries),
+            from: key.peerID
+        )
+        #expect(await volumeFetch.value == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: ["root": Data("root".utf8)],
+            servedBy: key.peerID
+        ))
+        #expect(tally.metrics.denied == deniedAfterWrongSession)
+
+        await ivy.handleCurrentMessageForTesting(
+            .volumeResponse(requestID: .max, rootCID: "unsolicited", entries: entries),
+            from: key.peerID
+        )
+        #expect(tally.metrics.denied == deniedAfterWrongSession + 1)
+
+        let unavailableFetch = Task { await ivy.fetchVolume(rootCID: "missing", from: peer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingVolumeState().requestID != nil
+        })
+        let unavailableRequestID = try #require(await ivy.pendingVolumeState().requestID)
+        await ivy.handleCurrentMessageForTesting(
+            .contentUnavailable(requestID: unavailableRequestID),
+            from: key.peerID
+        )
+        #expect(await unavailableFetch.value == .empty)
+
+        let contentFetch = Task { await ivy.fetchContent(rootCID: "root", from: peer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingContentState().requestID != nil
+        })
+        let contentRequestID = try #require(await ivy.pendingContentState().requestID)
+        await ivy.handleCurrentMessageForTesting(
+            .contentResponse(requestID: contentRequestID, entries: entries),
+            from: key.peerID
+        )
+        #expect(await contentFetch.value == AttributedContentResponse(
+            entries: ["root": Data("root".utf8)],
+            servedBy: key.peerID
+        ))
+
+        let malformedFetch = Task { await ivy.fetchVolume(rootCID: "malformed", from: peer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingVolumeState().requestID != nil
+        })
+        let malformedRequestID = try #require(await ivy.pendingVolumeState().requestID)
+        await ivy.handleCurrentMessageForTesting(
+            .volumeResponse(
+                requestID: malformedRequestID,
+                rootCID: "malformed",
+                entries: [ContentEntry(cid: "other", data: Data())]
+            ),
+            from: key.peerID
+        )
+        #expect(await malformedFetch.value == .empty)
+
+        let oversizedFetch = Task { await ivy.fetchVolume(rootCID: "oversized", from: peer) }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.pendingVolumeState().requestID != nil
+        })
+        let oversizedRequestID = try #require(await ivy.pendingVolumeState().requestID)
+        let oversizedEntries = [ContentEntry(cid: "oversized", data: Data())]
+            + (0..<Int(MessageLimits.maxContentEntryCount)).map {
+                ContentEntry(cid: "entry-\($0)", data: Data())
+            }
+        await ivy.handleCurrentMessageForTesting(
+            .volumeResponse(
+                requestID: oversizedRequestID,
+                rootCID: "oversized",
+                entries: oversizedEntries
+            ),
+            from: key.peerID
+        )
+        #expect(await oversizedFetch.value == .empty)
+        await ivy.stop()
+    }
+
     @Test("public network fetch leaders stop at the pending-request cap")
     func publicNetworkFetchCap() async throws {
         let port = TransportTestHarness.nextPort()

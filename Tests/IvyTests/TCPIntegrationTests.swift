@@ -201,6 +201,34 @@ final class TransportRawContentSource: IvyContentSource, Sendable {
     }
 }
 
+private actor BlockingVolumeSource: IvyContentSource {
+    private let entries: [ContentEntry]
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(entries: [ContentEntry]) {
+        self.entries = entries
+    }
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) async -> [ContentEntry] {
+        started = true
+        await withCheckedContinuation { waiters.append($0) }
+        return entries
+    }
+
+    func didStart() -> Bool { started }
+
+    func release() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+}
+
 private actor CancellationAwareContentSource: IvyContentSource {
     private var started = false
     private var cancelled = false
@@ -278,6 +306,57 @@ struct TCPIntegrationTests {
             TransportTestHarness.key(serverIdentity),
         ])
 
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a solicited Volume reply survives responder admission exhaustion")
+    func solicitedVolumeReplyBypassesOutboundAdmission() async throws {
+        let serverIdentity = TransportTestHarness.identity("volume-reply-server")
+        let clientIdentity = TransportTestHarness.identity("volume-reply-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 2,
+                perPeerRequestRefillPerSecond: 0
+            )
+        ))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let clientRecorder = TransportTestRecorder()
+        await client.setTestDelegate(clientRecorder)
+        let entries = [
+            ContentEntry(cid: "root", data: Data("root".utf8)),
+            ContentEntry(cid: "child", data: Data("child".utf8)),
+        ]
+        let source = BlockingVolumeSource(entries: entries)
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            clientRecorder.authenticatedPeers.count == 1
+        })
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        let fetch = Task { await client.fetchVolume(rootCID: "root", from: serverPeer) }
+        #expect(try await TransportTestHarness.eventually { await source.didStart() })
+
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let tally = await server.tally
+        while tally.shouldAllow(peer: clientID) {}
+        await source.release()
+
+        #expect(await fetch.value == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: [
+                "root": Data("root".utf8),
+                "child": Data("child".utf8),
+            ],
+            servedBy: serverPeer.id
+        ))
         await client.stop()
         await server.stop()
     }

@@ -98,6 +98,11 @@ struct PendingContentRequest {
     var candidates: Set<PeerID>
     let exactSessionID: Data?
     var timeoutTask: IvyTimer? = nil
+
+    func matches(peer: PeerID, sessionID: Data?) -> Bool {
+        candidates.contains(peer)
+            && (exactSessionID.map { $0 == sessionID } ?? true)
+    }
 }
 
 struct PendingVolumeRequest {
@@ -106,6 +111,11 @@ struct PendingVolumeRequest {
     var candidates: Set<PeerID>
     let exactSessionID: Data?
     var timeoutTask: IvyTimer? = nil
+
+    func matches(peer: PeerID, sessionID: Data?) -> Bool {
+        candidates.contains(peer)
+            && (exactSessionID.map { $0 == sessionID } ?? true)
+    }
 }
 
 struct PendingFetch {
@@ -202,7 +212,12 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
-        guard case .enqueued = sendContentReply(response, to: peer, session: session) else {
+        guard case .enqueued = sendContentReply(
+            response,
+            to: peer,
+            session: session,
+            bypassAdmission: true
+        ) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
@@ -271,7 +286,12 @@ extension Ivy {
             entries: validated
         )
         guard !response.serialize().isEmpty,
-              case .enqueued = sendContentReply(response, to: peer, session: session) else {
+              case .enqueued = sendContentReply(
+                response,
+                to: peer,
+                session: session,
+                bypassAdmission: true
+              ) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
@@ -356,8 +376,7 @@ extension Ivy {
         sessionID: Data? = nil
     ) {
         guard let pending = pendingContentRequests[requestID],
-              pending.candidates.contains(peer),
-              pending.exactSessionID.map({ $0 == sessionID }) ?? true else { return }
+              pending.matches(peer: peer, sessionID: sessionID) else { return }
         let key = pending.key
 
         var result: [String: Data] = [:]
@@ -384,12 +403,12 @@ extension Ivy {
         sessionID: Data? = nil
     ) {
         if let pending = pendingVolumeRequests[requestID] {
-            guard pending.exactSessionID.map({ $0 == sessionID }) ?? true else { return }
+            guard pending.matches(peer: peer, sessionID: sessionID) else { return }
             markVolumeCandidateDone(requestID: requestID, peer: peer)
             return
         }
         guard let pending = pendingContentRequests[requestID],
-              pending.exactSessionID.map({ $0 == sessionID }) ?? true else { return }
+              pending.matches(peer: peer, sessionID: sessionID) else { return }
         markContentCandidateDone(requestID: requestID, peer: peer)
     }
 
@@ -590,8 +609,7 @@ extension Ivy {
     ) {
         guard let pending = pendingVolumeRequests[requestID],
               pending.rootCID == rootCID,
-              pending.candidates.contains(peer),
-              pending.exactSessionID.map({ $0 == sessionID }) ?? true else {
+              pending.matches(peer: peer, sessionID: sessionID) else {
             return
         }
         guard let entries = validatedVolumeEntries(entries, rootCID: rootCID) else {
@@ -829,6 +847,33 @@ extension Ivy {
             }
             return (peer, connection.connectionID)
         })
+    }
+
+    func isExpectedContentReply(
+        _ message: Message,
+        from peer: PeerID,
+        sessionID: Data?
+    ) -> Bool {
+        switch message {
+        case .contentResponse(let requestID, _):
+            guard let pending = pendingContentRequests[requestID] else { return false }
+            return pending.matches(peer: peer, sessionID: sessionID)
+        case .volumeResponse(let requestID, let rootCID, _):
+            guard let pending = pendingVolumeRequests[requestID],
+                  pending.rootCID == rootCID else { return false }
+            return pending.matches(peer: peer, sessionID: sessionID)
+        case .contentUnavailable(let requestID):
+            if let pending = pendingContentRequests[requestID],
+               pending.matches(peer: peer, sessionID: sessionID) {
+                return true
+            }
+            return pendingVolumeRequests[requestID]?.matches(
+                peer: peer,
+                sessionID: sessionID
+            ) ?? false
+        default:
+            return false
+        }
     }
 
     func fetchContent(
