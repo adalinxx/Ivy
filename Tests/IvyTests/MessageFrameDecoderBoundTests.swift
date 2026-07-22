@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOEmbedded
 import Testing
 @testable import Ivy
 
@@ -52,6 +53,27 @@ struct MessageFrameDecoderBoundTests {
         records.flatMap { record in
             lengthPrefix(UInt32(record.count)) + record
         }
+    }
+
+    @Test("inbound async bridge receives independently owned bytes")
+    func inboundBridgeOwnership() throws {
+        let channel = EmbeddedChannel(handlers: [InboundBufferCopyHandler()])
+        defer { _ = try? channel.finish() }
+        var source = ByteBuffer(bytes: [0, 1, 2, 3, 4])
+        source.moveReaderIndex(forwardBy: 1)
+
+        try channel.writeInbound(source)
+        let inbound = try channel.readInbound(as: ByteBuffer.self)
+        let owned = try #require(inbound)
+        let sourceAddress = source.withUnsafeReadableBytes {
+            UInt(bitPattern: $0.baseAddress!)
+        }
+        let ownedAddress = owned.withUnsafeReadableBytes {
+            UInt(bitPattern: $0.baseAddress!)
+        }
+
+        #expect(owned.getBytes(at: owned.readerIndex, length: owned.readableBytes) == [1, 2, 3, 4])
+        #expect(ownedAddress != sourceAddress)
     }
 
     @Test("oversized declared record closes before body allocation")

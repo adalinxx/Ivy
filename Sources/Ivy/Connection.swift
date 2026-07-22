@@ -267,6 +267,7 @@ final class PeerConnection: @unchecked Sendable {
             port: Int(endpoint.port)
         ) { channel in
             do {
+                try channel.pipeline.syncOperations.addHandler(InboundBufferCopyHandler())
                 let inbound = try NIOAsyncChannel<ByteBuffer, Never>(
                     wrappingChannelSynchronously: channel,
                     configuration: .init(backPressureStrategy: .init(
@@ -547,6 +548,18 @@ final class SessionFrameAccumulator {
         expectedBodyLength = nil
         body = Data()
         bodyReservation = nil
+    }
+}
+
+final class InboundBufferCopyHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias InboundOut = ByteBuffer
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let source = unwrapInboundIn(data)
+        var owned = context.channel.allocator.buffer(capacity: source.readableBytes)
+        owned.writeBytes(source.readableBytesView)
+        context.fireChannelRead(wrapInboundOut(owned))
     }
 }
 
