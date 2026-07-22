@@ -369,6 +369,98 @@ struct InboundAdmissionTests {
         await ivy.stop()
     }
 
+    @Test("a responder awaiting Finish satisfies its losing outgoing dial")
+    func pendingCompetingSessionSatisfiesOutgoingDial() async throws {
+        let (ivy, _, peer, responder) = try await pendingCrossDial("winner")
+        let completion = BoundedTestTask {
+            await ivy.resolveOutgoingDialForTesting(to: peer, generation: 2)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.peerConnectionHasWaiterForTesting(peer)
+        })
+
+        await ivy.promotePendingResponderForTesting(responder)
+
+        #expect(try await completion.value(waitingFor: "competing responder promotion"))
+        #expect(await ivy.hasEndpointSession(peer))
+        #expect(await ivy.outgoingDialCountForTesting == 0)
+        await ivy.stop()
+    }
+
+    @Test("any verified responder can satisfy a peer-level cross-dial")
+    func alternatePendingResponderSatisfiesOutgoingDial() async throws {
+        let (ivy, endpoint, peer, _) = try await pendingCrossDial("alternate")
+        let alternate = try await ivy.seedResponderAwaitingFinishForTesting(endpoint, marker: 4)
+        let completion = BoundedTestTask {
+            await ivy.resolveOutgoingDialForTesting(to: peer, generation: 2)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.peerConnectionHasWaiterForTesting(peer)
+        })
+
+        await ivy.promotePendingResponderForTesting(alternate)
+
+        #expect(try await completion.value(waitingFor: "alternate responder promotion"))
+        #expect(await ivy.hasEndpointSession(peer))
+        await ivy.stop()
+    }
+
+    @Test("cancelling a cross-dial wait preserves its responder")
+    func cancellingPendingResponderWait() async throws {
+        let (ivy, _, peer, responder) = try await pendingCrossDial("cancel")
+        let completion = BoundedTestTask {
+            await ivy.resolveOutgoingDialForTesting(to: peer, generation: 2)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.peerConnectionHasWaiterForTesting(peer)
+        })
+
+        completion.cancel()
+
+        #expect(!(try await completion.value(waitingFor: "cancelled cross-dial wait")))
+        #expect(!(await ivy.peerConnectionHasWaiterForTesting(peer)))
+        #expect(await ivy.pendingSessionCountForTesting == 1)
+        await ivy.promotePendingResponderForTesting(responder)
+        #expect(await ivy.hasEndpointSession(peer))
+        await ivy.stop()
+    }
+
+    @Test("disconnect cancels a cross-dial wait and its responder")
+    func disconnectCancelsPendingResponderWait() async throws {
+        let (ivy, _, peer, responder) = try await pendingCrossDial("disconnect")
+        let completion = BoundedTestTask {
+            await ivy.resolveOutgoingDialForTesting(to: peer, generation: 2)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.peerConnectionHasWaiterForTesting(peer)
+        })
+
+        await ivy.disconnect(peer)
+
+        #expect(!(try await completion.value(waitingFor: "disconnected cross-dial wait")))
+        #expect(await ivy.pendingSessionCountForTesting == 0)
+        await ivy.promotePendingResponderForTesting(responder)
+        #expect(!(await ivy.hasEndpointSession(peer)))
+        await ivy.stop()
+    }
+
+    @Test("stop drains a cross-dial wait")
+    func stopDrainsPendingResponderWait() async throws {
+        let (ivy, _, peer, _) = try await pendingCrossDial("stop")
+        let completion = BoundedTestTask {
+            await ivy.resolveOutgoingDialForTesting(to: peer, generation: 2)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.peerConnectionHasWaiterForTesting(peer)
+        })
+
+        await ivy.stop()
+
+        #expect(!(try await completion.value(waitingFor: "stopped cross-dial wait")))
+        #expect(!(await ivy.peerConnectionHasWaiterForTesting(peer)))
+        #expect(await ivy.pendingSessionCountForTesting == 0)
+    }
+
     @Test("dial success rejects a closed session pending actor cleanup")
     func dialSuccessRequiresLiveSession() async throws {
         let endpoint = PeerEndpoint(
@@ -625,6 +717,28 @@ struct InboundAdmissionTests {
         #expect(await ivy.outgoingDialCountForTesting == 0)
         #expect(await ivy.testReconnectToken(peer: peer) == nil)
         await ivy.stop()
+    }
+
+    private func pendingCrossDial(
+        _ label: String
+    ) async throws -> (Ivy, PeerEndpoint, PeerID, UUID) {
+        let endpoint = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("pending-cross-dial-\(label)-peer"),
+            host: "127.0.0.1",
+            port: 4001)
+        let peer = PeerID(publicKey: endpoint.publicKey)
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "pending-cross-dial-\(label)-node",
+            listenPort: 0,
+            bootstrapPeers: [endpoint],
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        await ivy.seedOutgoingDialForTesting(
+            endpoint: endpoint,
+            pendingGeneration: 2,
+            currentGeneration: 2)
+        let responder = try await ivy.seedResponderAwaitingFinishForTesting(endpoint, marker: 3)
+        return (ivy, endpoint, peer, responder)
     }
 
     private func connection(label: String) -> PeerConnection {
