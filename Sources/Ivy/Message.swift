@@ -25,7 +25,6 @@ enum Message: Sendable {
     case contentResponse(requestID: UInt64, entries: [ContentEntry])
     case contentUnavailable(requestID: UInt64)
     case volumeRequest(requestID: UInt64, rootCID: String)
-    case volumeResponse(requestID: UInt64, rootCID: String, entries: [ContentEntry])
 
     case findProviders(rootCID: String, requestID: UInt64)
     case providers(rootCID: String, requestID: UInt64, records: [ProviderRecord])
@@ -52,7 +51,6 @@ enum Message: Sendable {
         case announceProvider = 42
         case peerMessage = 49
         case contentResponse = 50
-        case volumeResponse = 51
         case contentUnavailable = 58
         case relayOpen = 60
         case relayOffer = 61
@@ -138,26 +136,6 @@ enum Message: Sendable {
             bytes.append(Tag.volumeRequest.rawValue)
             bytes.appendUInt64(requestID)
             guard bytes.appendLengthPrefixedString(rootCID) else { return false }
-        case .volumeResponse(let requestID, let rootCID, let entries):
-            guard requestID != 0,
-                  MessageLimits.accepts(rootCID),
-                  entries.contains(where: { $0.cid == rootCID }),
-                  Self.contentResponseFits(entries, maxFrameSize: maxDataPayload) else {
-                return false
-            }
-            bytes.append(Tag.volumeResponse.rawValue)
-            bytes.appendUInt64(requestID)
-            guard bytes.appendLengthPrefixedString(rootCID),
-                  bytes.appendCount(entries.count, max: MessageLimits.maxContentEntryCount) else {
-                return false
-            }
-            for entry in entries {
-                guard bytes.appendLengthPrefixedString(entry.cid),
-                      bytes.appendLengthPrefixedData(
-                        entry.data,
-                        maxDataPayload: maxDataPayload
-                      ) else { return false }
-            }
         case .findProviders(let rootCID, let requestID):
             guard MessageLimits.accepts(rootCID), requestID != 0 else { return false }
             bytes.append(Tag.findProviders.rawValue)
@@ -296,24 +274,6 @@ enum Message: Sendable {
             guard let requestID = reader.readUInt64(), requestID != 0,
                   let rootCID = reader.readString() else { return nil }
             return .volumeRequest(requestID: requestID, rootCID: rootCID)
-        case .volumeResponse:
-            guard let requestID = reader.readUInt64(), requestID != 0,
-                  let rootCID = reader.readString(),
-                  let count = reader.readUInt16(),
-                  count <= MessageLimits.maxContentEntryCount else { return nil }
-            var entries: [ContentEntry] = []
-            entries.reserveCapacity(Int(count))
-            for _ in 0..<count {
-                guard let cid = reader.readString(),
-                      let data = reader.readData() else { return nil }
-                entries.append(ContentEntry(cid: cid, data: data))
-            }
-            guard entries.contains(where: { $0.cid == rootCID }) else { return nil }
-            return .volumeResponse(
-                requestID: requestID,
-                rootCID: rootCID,
-                entries: entries
-            )
         case .findProviders:
             guard let rootCID = reader.readString(),
                   let requestID = reader.readUInt64(), requestID != 0 else { return nil }

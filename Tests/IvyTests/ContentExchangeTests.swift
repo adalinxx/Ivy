@@ -252,7 +252,6 @@ struct ContentExchangeTests {
 
         await ivy.handleVolumeResponse(
             requestID: requestID,
-            rootCID: "root",
             entries: entries,
             from: key.peerID,
             sessionID: oldSessionID
@@ -261,7 +260,6 @@ struct ContentExchangeTests {
 
         await ivy.handleVolumeResponse(
             requestID: requestID,
-            rootCID: "root",
             entries: entries,
             from: key.peerID,
             sessionID: currentSessionID
@@ -314,14 +312,14 @@ struct ContentExchangeTests {
         #expect(tally.shouldAllow(peer: key.peerID))
         #expect(!tally.shouldAllow(peer: key.peerID))
         await ivy.handleMessage(
-            .volumeResponse(requestID: volumeRequestID, rootCID: "root", entries: entries),
+            .contentResponse(requestID: volumeRequestID, entries: entries),
             from: key.peerID
         )
         #expect(await ivy.pendingVolumeState().requestID == volumeRequestID)
         let deniedAfterWrongSession = tally.metrics.denied
 
         await ivy.handleCurrentMessageForTesting(
-            .volumeResponse(requestID: volumeRequestID, rootCID: "root", entries: entries),
+            .contentResponse(requestID: volumeRequestID, entries: entries),
             from: key.peerID
         )
         #expect(await volumeFetch.value == AttributedVolumeResponse(
@@ -332,7 +330,7 @@ struct ContentExchangeTests {
         #expect(tally.metrics.denied == deniedAfterWrongSession)
 
         await ivy.handleCurrentMessageForTesting(
-            .volumeResponse(requestID: .max, rootCID: "unsolicited", entries: entries),
+            .contentResponse(requestID: .max, entries: entries),
             from: key.peerID
         )
         #expect(tally.metrics.denied == deniedAfterWrongSession + 1)
@@ -368,9 +366,8 @@ struct ContentExchangeTests {
         })
         let malformedRequestID = try #require(await ivy.pendingVolumeState().requestID)
         await ivy.handleCurrentMessageForTesting(
-            .volumeResponse(
+            .contentResponse(
                 requestID: malformedRequestID,
-                rootCID: "malformed",
                 entries: [ContentEntry(cid: "other", data: Data())]
             ),
             from: key.peerID
@@ -387,9 +384,8 @@ struct ContentExchangeTests {
                 ContentEntry(cid: "entry-\($0)", data: Data())
             }
         await ivy.handleCurrentMessageForTesting(
-            .volumeResponse(
+            .contentResponse(
                 requestID: oversizedRequestID,
-                rootCID: "oversized",
                 entries: oversizedEntries
             ),
             from: key.peerID

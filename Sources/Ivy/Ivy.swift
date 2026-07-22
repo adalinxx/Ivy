@@ -1095,30 +1095,14 @@ public actor Ivy {
         if let directInbound = connection.directInboundStream {
             task = Task { [weak self, weak connection] in
                 guard let connection else { return }
-                let decoder = connection.makeFrameAccumulator()
-                defer { decoder.reset() }
-
                 do {
                     try await directInbound.executeThenClose { inbound in
-                        for try await bytes in inbound {
+                        for try await frame in inbound {
                             guard let self,
                                   !Task.isCancelled,
                                   connection.isLive else { return }
-                            var incoming = bytes
-
-                            decode: while incoming.readableBytes > 0 {
-                                switch decoder.nextFrame(from: &incoming) {
-                                case .frame(let frame):
-                                    await self.handleSessionRecord(frame.bytes, on: connection)
-                                    withExtendedLifetime(frame) {}
-                                    guard !Task.isCancelled, connection.isLive else { return }
-                                case .incomplete:
-                                    break decode
-                                case .invalid:
-                                    connection.cancel()
-                                    return
-                                }
-                            }
+                            await self.handleSessionRecord(frame.bytes, on: connection)
+                            withExtendedLifetime(frame) {}
                         }
                     }
                     if connection.isLive { connection.cancel() }
@@ -2492,7 +2476,7 @@ public actor Ivy {
             case .ping, .pong, .peerMessage:
                 break
             case .contentRequest, .contentResponse, .contentUnavailable,
-                 .volumeRequest, .volumeResponse:
+                 .volumeRequest:
                 guard config.privateContentExchangeEnabled else { return }
             default:
                 return
@@ -2552,12 +2536,21 @@ public actor Ivy {
             )
 
         case .contentResponse(let requestID, let entries):
-            handleContentResponse(
-                requestID: requestID,
-                entries: entries,
-                from: peer,
-                sessionID: session?.sessionID.bytes
-            )
+            if pendingVolumeRequests[requestID] != nil {
+                handleVolumeResponse(
+                    requestID: requestID,
+                    entries: entries,
+                    from: peer,
+                    sessionID: session?.sessionID.bytes
+                )
+            } else {
+                handleContentResponse(
+                    requestID: requestID,
+                    entries: entries,
+                    from: peer,
+                    sessionID: session?.sessionID.bytes
+                )
+            }
 
         case .contentUnavailable(let requestID):
             handleContentUnavailable(
@@ -2572,15 +2565,6 @@ public actor Ivy {
                 rootCID: rootCID,
                 from: peer,
                 session: session
-            )
-
-        case .volumeResponse(let requestID, let rootCID, let entries):
-            handleVolumeResponse(
-                requestID: requestID,
-                rootCID: rootCID,
-                entries: entries,
-                from: peer,
-                sessionID: session?.sessionID.bytes
             )
 
         case .findProviders(let rootCID, let requestID):
@@ -3200,18 +3184,15 @@ public actor Ivy {
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
-            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
-            .childChannelOption(
-                ChannelOptions.recvAllocator,
-                value: FixedSizeRecvByteBufferAllocator(
-                    capacity: PeerConnection.directInboundReadBufferBytes))
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
                 let connectionBudget = InboundByteBudget(
                     limit: PeerConnection.maxInboundBufferedBytes)
                 do {
-                    try channel.pipeline.syncOperations.addHandler(InboundBufferCopyHandler())
-                    let directInbound = try NIOAsyncChannel<ByteBuffer, Never>(
+                    try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
+                        budget: inboundByteBudget,
+                        connectionBudget: connectionBudget))
+                    let directInbound = try NIOAsyncChannel<InboundFrame, Never>(
                         wrappingChannelSynchronously: channel,
                         configuration: .init(backPressureStrategy: .init(
                             lowWatermark: 1,
