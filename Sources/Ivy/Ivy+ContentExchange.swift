@@ -133,6 +133,29 @@ struct InboundContentRequest: Hashable {
 }
 
 extension Ivy {
+    func scheduleContentRequest(
+        requestID: UInt64,
+        rootCID: String,
+        cids: [String],
+        from peer: PeerID,
+        session: AuthenticatedSession? = nil
+    ) {
+        guard let request = beginContentRequest(
+            requestID: requestID,
+            rootCID: rootCID,
+            cids: cids,
+            from: peer,
+            session: session
+        ) else { return }
+        servingContentTasks[request.inbound] = Task { [weak self] in
+            await self?.serveContentRequest(
+                request,
+                from: peer,
+                session: session
+            )
+        }
+    }
+
     func handleContentRequest(
         requestID: UInt64,
         rootCID: String,
@@ -140,9 +163,32 @@ extension Ivy {
         from peer: PeerID,
         session: AuthenticatedSession? = nil
     ) async {
+        guard let request = beginContentRequest(
+            requestID: requestID,
+            rootCID: rootCID,
+            cids: cids,
+            from: peer,
+            session: session
+        ) else { return }
+        await serveContentRequest(request, from: peer, session: session)
+    }
+
+    private func beginContentRequest(
+        requestID: UInt64,
+        rootCID: String,
+        cids: [String],
+        from peer: PeerID,
+        session: AuthenticatedSession?
+    ) -> (
+        inbound: InboundContentRequest,
+        requestID: UInt64,
+        rootCID: String,
+        key: ContentRequestKey,
+        maxDataBytes: Int
+    )? {
         guard MessageLimits.accepts(rootCID),
               cids.count <= Int(MessageLimits.maxContentCIDCount),
-              cids.allSatisfy(MessageLimits.accepts) else { return }
+              cids.allSatisfy(MessageLimits.accepts) else { return nil }
         let key = ContentRequestKey(rootCID: rootCID, cids: cids)
         guard let maxDataBytes = Message.contentResponseDataBudget(
             for: key.requestedCIDs,
@@ -155,7 +201,7 @@ extension Ivy {
                 to: peer,
                 session: session,
                 bypassAdmission: true)
-            return
+            return nil
         }
         let inbound = InboundContentRequest(
             peer: peer,
@@ -167,8 +213,23 @@ extension Ivy {
                 to: peer,
                 session: session,
                 bypassAdmission: true)
-            return
+            return nil
         }
+        return (inbound, requestID, rootCID, key, maxDataBytes)
+    }
+
+    private func serveContentRequest(
+        _ request: (
+            inbound: InboundContentRequest,
+            requestID: UInt64,
+            rootCID: String,
+            key: ContentRequestKey,
+            maxDataBytes: Int
+        ),
+        from peer: PeerID,
+        session: AuthenticatedSession?
+    ) async {
+        let (inbound, requestID, rootCID, key, maxDataBytes) = request
         defer { endServingContent(inbound) }
 
         let source = contentSource
@@ -227,13 +288,57 @@ extension Ivy {
         }
     }
 
+    func scheduleVolumeRequest(
+        requestID: UInt64,
+        rootCID: String,
+        from peer: PeerID,
+        session: AuthenticatedSession? = nil
+    ) {
+        guard let inbound = beginVolumeRequest(
+            requestID: requestID,
+            rootCID: rootCID,
+            from: peer,
+            session: session
+        ) else { return }
+        servingContentTasks[inbound] = Task { [weak self] in
+            await self?.serveVolumeRequest(
+                inbound: inbound,
+                requestID: requestID,
+                rootCID: rootCID,
+                from: peer,
+                session: session
+            )
+        }
+    }
+
     func handleVolumeRequest(
         requestID: UInt64,
         rootCID: String,
         from peer: PeerID,
         session: AuthenticatedSession? = nil
     ) async {
-        guard MessageLimits.accepts(rootCID) else { return }
+        guard let inbound = beginVolumeRequest(
+            requestID: requestID,
+            rootCID: rootCID,
+            from: peer,
+            session: session
+        ) else { return }
+        await serveVolumeRequest(
+            inbound: inbound,
+            requestID: requestID,
+            rootCID: rootCID,
+            from: peer,
+            session: session
+        )
+    }
+
+    private func beginVolumeRequest(
+        requestID: UInt64,
+        rootCID: String,
+        from peer: PeerID,
+        session: AuthenticatedSession?
+    ) -> InboundContentRequest? {
+        guard MessageLimits.accepts(rootCID) else { return nil }
         let inbound = InboundContentRequest(
             peer: peer,
             connectionID: session?.connection.connectionID,
@@ -246,8 +351,18 @@ extension Ivy {
                 session: session,
                 bypassAdmission: true
             )
-            return
+            return nil
         }
+        return inbound
+    }
+
+    private func serveVolumeRequest(
+        inbound: InboundContentRequest,
+        requestID: UInt64,
+        rootCID: String,
+        from peer: PeerID,
+        session: AuthenticatedSession?
+    ) async {
         defer { endServingContent(inbound) }
         let source = contentSource
         if let source {
@@ -366,6 +481,7 @@ extension Ivy {
     }
 
     private func endServingContent(_ request: InboundContentRequest) {
+        servingContentTasks.removeValue(forKey: request)
         servingContentRequests.remove(request)
     }
 

@@ -326,7 +326,9 @@ struct TCPIntegrationTests {
         ))
         let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
         let clientRecorder = TransportTestRecorder()
+        let serverRecorder = TransportTestRecorder()
         await client.setTestDelegate(clientRecorder)
+        await server.setTestDelegate(serverRecorder)
         let entries = [
             ContentEntry(cid: "root", data: Data("root".utf8)),
             ContentEntry(cid: "child", data: Data("child".utf8)),
@@ -343,6 +345,20 @@ struct TCPIntegrationTests {
         let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
         let fetch = Task { await client.fetchVolume(rootCID: "root", from: serverPeer) }
         #expect(try await TransportTestHarness.eventually { await source.didStart() })
+
+        let concurrentPayload = Data("inventory".utf8)
+        #expect(await client.sendMessage(
+            to: serverPeer.id,
+            topic: "transaction.inventory",
+            payload: concurrentPayload
+        ) == .enqueued(endpoint: serverPeer.id, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.receivedMessage(
+                topic: "transaction.inventory",
+                payload: concurrentPayload,
+                from: TransportTestHarness.key(clientIdentity).peerID
+            )
+        })
 
         let clientID = TransportTestHarness.key(clientIdentity).peerID
         let tally = await server.tally
