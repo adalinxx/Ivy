@@ -11,8 +11,9 @@ private struct TransportTestTimeout: Error {
 
 enum TransportTestHarness {
     private static let lock = NSLock()
+    // Stay below the default Linux and macOS ephemeral client-port ranges.
     private nonisolated(unsafe) static var port =
-        UInt16(ProcessInfo.processInfo.processIdentifier % 10_000) + 30_000
+        UInt16(ProcessInfo.processInfo.processIdentifier % 8_000) + 20_000
 
     static func nextPort() -> UInt16 {
         lock.withLock {
