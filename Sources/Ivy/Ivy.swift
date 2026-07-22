@@ -3210,6 +3210,7 @@ public actor Ivy {
                 let connectionBudget = InboundByteBudget(
                     limit: PeerConnection.maxInboundBufferedBytes)
                 do {
+                    try channel.pipeline.syncOperations.addHandler(InboundBufferCopyHandler())
                     let directInbound = try NIOAsyncChannel<ByteBuffer, Never>(
                         wrappingChannelSynchronously: channel,
                         configuration: .init(backPressureStrategy: .init(
