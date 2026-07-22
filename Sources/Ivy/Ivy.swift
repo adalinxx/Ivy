@@ -184,6 +184,7 @@ public actor Ivy {
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
     var servingContentRequests: Set<InboundContentRequest> = []
+    var servingContentTasks: [InboundContentRequest: Task<Void, Never>] = [:]
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]
@@ -2431,7 +2432,7 @@ public actor Ivy {
             receiveNeighborResponse(nonce: nonce, endpoints: accepted, from: peer)
 
         case .contentRequest(let requestID, let rootCID, let cids):
-            await handleContentRequest(
+            scheduleContentRequest(
                 requestID: requestID,
                 rootCID: rootCID,
                 cids: cids,
@@ -2455,7 +2456,7 @@ public actor Ivy {
             )
 
         case .volumeRequest(let requestID, let rootCID):
-            await handleVolumeRequest(
+            scheduleVolumeRequest(
                 requestID: requestID,
                 rootCID: rootCID,
                 from: peer,
@@ -2573,6 +2574,12 @@ public actor Ivy {
     // MARK: - Cleanup
 
     func cleanupPendingForPeer(_ peer: PeerID) {
+        let serving = servingContentTasks.keys.filter { $0.peer == peer }
+        for request in serving {
+            servingContentTasks[request]?.cancel()
+            servingContentTasks.removeValue(forKey: request)
+            servingContentRequests.remove(request)
+        }
         let requestIDs = pendingContentRequests.compactMap { requestID, request in
             request.candidates.contains(peer) ? requestID : nil
         }
@@ -2677,6 +2684,9 @@ public actor Ivy {
     }
 
     func cleanupAllPending() {
+        for task in servingContentTasks.values { task.cancel() }
+        servingContentTasks.removeAll()
+        servingContentRequests.removeAll()
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingContentRequests: pendingContentRequests,

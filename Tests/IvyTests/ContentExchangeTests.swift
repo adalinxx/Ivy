@@ -589,7 +589,7 @@ struct ContentExchangeTests {
     }
 
     @Test("private content exchange requires explicit opt-in")
-    func privateContentExchangeRequiresOptIn() async {
+    func privateContentExchangeRequiresOptIn() async throws {
         let peer = PeerID(publicKey: deterministicTestPeerKey("private-content-peer"))
         let disabledSource = DenyingContentSource()
         let disabled = Ivy(config: IvyConfig(
@@ -618,6 +618,9 @@ struct ContentExchangeTests {
             .contentRequest(requestID: 2, rootCID: "root", cids: []),
             from: peer
         )
+        try await TestSynchronization.wait(for: "private content authorization") {
+            await enabledSource.counts().authorizationChecks == 1
+        }
         let enabledCounts = await enabledSource.counts()
         #expect(enabledCounts.authorizationChecks == 1)
         #expect(enabledCounts.contentRequests == 0)
