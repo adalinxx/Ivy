@@ -22,8 +22,8 @@ struct MessageTests {
         return .data(record)
     }
 
-    @Test("frozen v8 message vectors")
-    func frozenV8Vectors() throws {
+    @Test("frozen v9 message vectors")
+    func frozenV9Vectors() throws {
         let route = String(repeating: "11", count: 32)
         let keyBytes = String(repeating: "44", count: 32)
         let key = try PeerKey(rawRepresentation: Data(repeating: 0x44, count: 32))
@@ -47,6 +47,17 @@ struct MessageTests {
                 ContentEntry(cid: "x", data: Data()),
             ]), "320000000000000003000200017200000002010200017800000000"),
             (.contentUnavailable(requestID: 3), "3a0000000000000003"),
+            (.volumeRequest(requestID: 3, rootCID: "r"),
+             "1b0000000000000003000172"),
+            (.volumeChunk(
+                requestID: 3,
+                rootCID: "r",
+                index: 0,
+                count: 1,
+                totalEntries: 1,
+                totalBytes: 2,
+                payload: Data([0xaa, 0xbb])
+             ), "1c0000000000000003000172000000010001000000000000000200000002aabb"),
             (.findProviders(rootCID: "r", requestID: 4), "280001720000000000000004"),
             (.providers(rootCID: "r", requestID: 4, records: []),
              "2900017200000000000000000004"),
@@ -79,7 +90,7 @@ struct MessageTests {
         }
     }
 
-    @Test("every v8 message roundtrips canonically")
+    @Test("every v9 message roundtrips canonically")
     func roundtrip() throws {
         let endpoint = PeerEndpoint(publicKey: "peer", host: "192.0.2.1", port: 4001)
         let peerKey = try PeerKey(rawRepresentation: Data(repeating: 0x44, count: 32))
@@ -93,6 +104,16 @@ struct MessageTests {
             .contentRequest(requestID: 3, rootCID: "root", cids: ["child"]),
             .contentResponse(requestID: 3, entries: entries),
             .contentUnavailable(requestID: 3),
+            .volumeRequest(requestID: 3, rootCID: "root"),
+            .volumeChunk(
+                requestID: 3,
+                rootCID: "root",
+                index: 0,
+                count: 1,
+                totalEntries: 1,
+                totalBytes: 3,
+                payload: Data([1, 2, 3])
+            ),
             .findProviders(rootCID: "root", requestID: 4),
             .providers(
                 rootCID: "root",
@@ -182,6 +203,61 @@ struct MessageTests {
 
         let oversizedEndpointRecord = try signedDataRecord(response(relayedBudget + 1), keyByte: 1)
             .serialize(maxPayload: frameSize)
+        let oversizedRelayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: oversizedEndpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(oversizedRelayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).isEmpty)
+    }
+
+    @Test("Volume chunks exactly include direct and relayed framing")
+    func volumeChunkBudgets() throws {
+        let frameSize: UInt32 = 512
+        let directBudget = try #require(Message.volumeChunkDataBudget(
+            rootCID: "root",
+            maxFrameSize: frameSize,
+            relayed: false
+        ))
+        let relayedBudget = try #require(Message.volumeChunkDataBudget(
+            rootCID: "root",
+            maxFrameSize: frameSize,
+            relayed: true
+        ))
+        #expect(directBudget == 366)
+        #expect(relayedBudget == 216)
+
+        func chunk(_ payloadBytes: Int) -> Data {
+            Message.volumeChunk(
+                requestID: 1,
+                rootCID: "root",
+                index: 0,
+                count: 1,
+                totalEntries: 1,
+                totalBytes: UInt64(payloadBytes),
+                payload: Data(repeating: 0xaa, count: payloadBytes)
+            ).serialize(maxFrameSize: frameSize)
+        }
+
+        #expect(try signedDataRecord(chunk(directBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+        #expect(try signedDataRecord(chunk(directBudget + 1), keyByte: 1)
+            .serialize(maxPayload: frameSize).isEmpty)
+
+        let routeID = Data(repeating: 0x44, count: 32)
+        let endpointRecord = try signedDataRecord(chunk(relayedBudget), keyByte: 1)
+            .serialize(maxPayload: frameSize)
+        let relayPacket = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: endpointRecord
+        ).serialize(maxFrameSize: frameSize)
+        #expect(try signedDataRecord(relayPacket, keyByte: 3)
+            .serialize(maxPayload: frameSize).count == Int(frameSize))
+
+        let oversizedEndpointRecord = try signedDataRecord(
+            chunk(relayedBudget + 1),
+            keyByte: 1
+        ).serialize(maxPayload: frameSize)
         let oversizedRelayPacket = Message.relayPacket(
             routeID: routeID,
             opaqueEndpointRecord: oversizedEndpointRecord

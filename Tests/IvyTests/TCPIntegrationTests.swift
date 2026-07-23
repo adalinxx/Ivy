@@ -48,6 +48,7 @@ enum TransportTestHarness {
         mode: IvyMode = .overlay,
         relayEnabled: Bool = false,
         relayTimeout: Duration = .seconds(1),
+        requestTimeout: Duration = .seconds(1),
         tallyConfig: TallyConfig = .default,
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxContentCandidates: Int = 8,
@@ -59,7 +60,7 @@ enum TransportTestHarness {
             bootstrapPeers: bootstrapPeers,
             inboundAdmissionBypassPeerKeys: inboundAdmissionBypassPeerKeys,
             tallyConfig: tallyConfig,
-            requestTimeout: .seconds(1),
+            requestTimeout: requestTimeout,
             relayTimeout: relayTimeout,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
@@ -202,6 +203,18 @@ final class TransportRawContentSource: IvyContentSource, Sendable {
     }
 }
 
+private struct TransportVolumeSource: IvyContentSource {
+    let entries: [ContentEntry]
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        entries
+    }
+}
+
 private actor BlockingVolumeSource: IvyContentSource {
     private let entries: [ContentEntry]
     private var started = false
@@ -270,6 +283,10 @@ private actor NonCooperativeContentSource: IvyContentSource {
 extension Ivy {
     func setTestDelegate(_ delegate: IvyDelegate?) {
         self.delegate = delegate
+    }
+
+    func servingContentCountForTesting() -> Int {
+        servingContentRequests.count
     }
 }
 
@@ -374,6 +391,115 @@ struct TCPIntegrationTests {
             ],
             servedBy: serverPeer.id
         ))
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a complete Volume larger than one frame crosses authenticated TCP")
+    func multiFrameVolume() async throws {
+        let serverIdentity = TransportTestHarness.identity("large-volume-server")
+        let clientIdentity = TransportTestHarness.identity("large-volume-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let clientRecorder = TransportTestRecorder()
+        await client.setTestDelegate(clientRecorder)
+        let rootBytes = Data(
+            repeating: 0xa5,
+            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+        )
+        let childBytes = Data("child".utf8)
+        await server.setContentSource(TransportVolumeSource(entries: [
+            ContentEntry(cid: "root", data: rootBytes),
+            ContentEntry(cid: "child", data: childBytes),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            clientRecorder.authenticatedPeers.count == 1
+        })
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        let response = await client.fetchVolume(rootCID: "root", from: serverPeer)
+        #expect(response == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: ["root": rootBytes, "child": childBytes],
+            servedBy: serverPeer.id
+        ))
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a stalled authenticated Volume writer releases its reservation at the deadline")
+    func stalledVolumeWriterTimesOut() async throws {
+        let serverIdentity = TransportTestHarness.identity("stalled-volume-server")
+        let clientIdentity = TransportTestHarness.identity("stalled-volume-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            requestTimeout: .milliseconds(100)
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let serverRecorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+        await client.setTestDelegate(clientRecorder)
+        await server.setContentSource(TransportVolumeSource(entries: [
+            ContentEntry(
+                cid: "root",
+                data: Data(
+                    repeating: 0xa5,
+                    count: Int(IvyConfig.protocolMaxFrameSize) + 1
+                )
+            ),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.authenticatedPeers.count == 1
+                && clientRecorder.authenticatedPeers.count == 1
+        })
+        let clientPeer = try #require(serverRecorder.authenticatedPeers.first)
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        await server.setEndpointWritabilityForTesting(
+            clientPeer.id,
+            writable: false
+        )
+
+        let fetch = Task {
+            await client.fetchVolume(rootCID: "root", from: serverPeer)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await server.reservedServingVolumeBytesForTesting
+                == MessageLimits.maxVolumeArchiveBytes
+        })
+        #expect(try await TransportTestHarness.eventually {
+            await server.reservedServingVolumeBytesForTesting == 0
+        })
+        #expect(await fetch.value == .empty)
+
         await client.stop()
         await server.stop()
     }
@@ -1039,9 +1165,13 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             await server.peerConnectionCount == 0
         })
+        #expect(await server.servingContentCountForTesting() == 1)
 
         await source.release()
         #expect(try await request.value(waitingFor: "closed stuck content request") == .empty)
+        #expect(try await TransportTestHarness.eventually {
+            await server.servingContentCountForTesting() == 0
+        })
         await client.stop()
         await server.stop()
     }
