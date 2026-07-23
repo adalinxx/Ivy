@@ -187,6 +187,9 @@ public actor Ivy {
 
     var pendingContentRequests: [UInt64: PendingContentRequest] = [:]
     var pendingVolumeRequests: [UInt64: PendingVolumeRequest] = [:]
+    var inFlightVolumeBytes = 0
+    var reservedVolumeBytes = 0
+    var reservedServingVolumeBytes = 0
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
@@ -1632,6 +1635,24 @@ public actor Ivy {
         return false
     }
 
+    func enqueueContentRequestOnCurrentSession(
+        _ message: Message,
+        to peer: PeerID
+    ) -> Data? {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = endpointSession(for: key) else { return nil }
+#if DEBUG || IVY_TESTING
+        if let hook = contentRequestEnqueueHookForTesting,
+           !hook(peer) { return nil }
+#endif
+        guard case .enqueued = enqueue(
+            message,
+            on: session,
+            bypassAdmission: false
+        ) else { return nil }
+        return session.sessionID.bytes
+    }
+
     /// Wait until the live route to `peer` can accept another outbound record.
     /// Returns false when that route closes before it becomes writable.
     public func waitUntilWritable(to peer: PeerID) async -> Bool {
@@ -1642,8 +1663,11 @@ public actor Ivy {
         switch session.connection.transport {
         case .direct:
             return await session.connection.waitUntilWritable()
-        case .relayed(_, let carrier):
-            guard let carrier = carrierSession(for: carrier) else { return false }
+        case .relayed(let routeID, let carrier):
+            guard installedRoutes[routeID]?.carrier == carrier,
+                  let carrier = directRelayCarrierSession(for: carrier) else {
+                return false
+            }
             return await carrier.connection.waitUntilWritable()
         }
     }
@@ -1657,8 +1681,11 @@ public actor Ivy {
         switch session.connection.transport {
         case .direct:
             return await session.connection.waitUntilWritable()
-        case .relayed(_, let carrier):
-            guard let carrier = carrierSession(for: carrier) else { return false }
+        case .relayed(let routeID, let carrier):
+            guard installedRoutes[routeID]?.carrier == carrier,
+                  let carrier = directRelayCarrierSession(for: carrier) else {
+                return false
+            }
             return await carrier.connection.waitUntilWritable()
         }
     }
@@ -1842,12 +1869,25 @@ public actor Ivy {
         case .relayed(let routeID, let carrier):
             guard connection.isLive,
                   installedRoutes[routeID]?.carrier == carrier,
-                  let carrierSession = carrierSession(for: carrier),
-                  carrierSession.connection.isDirect else {
+                  let carrierSession = directRelayCarrierSession(for: carrier) else {
                 return .notConnected
             }
             return sessionRecordReadiness(on: carrierSession.connection)
         }
+    }
+
+    private func directRelayCarrierSession(
+        for carrier: PeerKey
+    ) -> AuthenticatedSession? {
+        if let session = carrierSession(for: carrier),
+           session.connection.isDirect {
+            return session
+        }
+        if let session = endpointSession(for: carrier),
+           session.connection.isDirect {
+            return session
+        }
+        return nil
     }
 
     // MARK: - Signed Receiving
@@ -1902,7 +1942,7 @@ public actor Ivy {
                 rejectAuthenticatedSession(session, attributedTo: session.peerKey)
                 return
             }
-            handleRelayControl(message, from: session.peerKey)
+            await handleRelayControl(message, from: session.peerKey)
             return
         }
 
@@ -2145,7 +2185,7 @@ public actor Ivy {
         timeoutRelayOpen(routeID)
     }
 
-    private func handleRelayControl(_ message: Message, from sender: PeerKey) {
+    private func handleRelayControl(_ message: Message, from sender: PeerKey) async {
         switch message {
         case .relayOpen(let routeID, let target):
             guard routeID.count == 32,
@@ -2301,12 +2341,12 @@ public actor Ivy {
                     closeRelayRoute(routeID)
                     return
                 }
-                guard sendRelayControl(
-                        .relayPacket(routeID: routeID, opaqueEndpointRecord: opaqueRecord),
-                        to: destination) else {
-                    closeRelayRoute(routeID)
-                    return
-                }
+                await forwardRelayPacket(
+                    opaqueRecord,
+                    routeID: routeID,
+                    lifecycleID: route.lifecycleID,
+                    destination: destinationSession
+                )
                 return
             }
 
@@ -2355,6 +2395,65 @@ public actor Ivy {
 
         default:
             return
+        }
+    }
+
+    private func forwardRelayPacket(
+        _ opaqueRecord: Data,
+        routeID: Data,
+        lifecycleID: UUID,
+        destination: AuthenticatedSession
+    ) async {
+        let message = Message.relayPacket(
+            routeID: routeID,
+            opaqueEndpointRecord: opaqueRecord
+        )
+        let deadline = ContinuousClock.now.advanced(by: config.requestTimeout)
+        while relayRoutes[routeID]?.lifecycleID == lifecycleID,
+              isCurrent(destination) {
+            switch enqueue(message, on: destination, bypassAdmission: true) {
+            case .enqueued:
+                return
+            case .backpressured:
+                guard await waitUntilWritable(
+                    destination.connection,
+                    deadline: deadline
+                ) else {
+                    if relayRoutes[routeID]?.lifecycleID == lifecycleID {
+                        closeRelayRoute(routeID)
+                    }
+                    return
+                }
+            case .notConnected, .locallyRejected:
+                if relayRoutes[routeID]?.lifecycleID == lifecycleID {
+                    closeRelayRoute(routeID)
+                }
+                return
+            }
+        }
+    }
+
+    private func waitUntilWritable(
+        _ connection: PeerConnection,
+        deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        guard remaining > .zero else { return false }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await connection.waitUntilWritable()
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: remaining)
+                } catch {
+                    return false
+                }
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
         }
     }
 
@@ -2476,7 +2575,7 @@ public actor Ivy {
             case .ping, .pong, .peerMessage:
                 break
             case .contentRequest, .contentResponse, .contentUnavailable,
-                 .volumeRequest:
+                 .volumeRequest, .volumeChunk:
                 guard config.privateContentExchangeEnabled else { return }
             default:
                 return
@@ -2536,21 +2635,12 @@ public actor Ivy {
             )
 
         case .contentResponse(let requestID, let entries):
-            if pendingVolumeRequests[requestID] != nil {
-                handleVolumeResponse(
-                    requestID: requestID,
-                    entries: entries,
-                    from: peer,
-                    sessionID: session?.sessionID.bytes
-                )
-            } else {
-                handleContentResponse(
-                    requestID: requestID,
-                    entries: entries,
-                    from: peer,
-                    sessionID: session?.sessionID.bytes
-                )
-            }
+            handleContentResponse(
+                requestID: requestID,
+                entries: entries,
+                from: peer,
+                sessionID: session?.sessionID.bytes
+            )
 
         case .contentUnavailable(let requestID):
             handleContentUnavailable(
@@ -2565,6 +2655,28 @@ public actor Ivy {
                 rootCID: rootCID,
                 from: peer,
                 session: session
+            )
+
+        case let .volumeChunk(
+            requestID,
+            rootCID,
+            index,
+            count,
+            totalEntries,
+            totalBytes,
+            payload
+        ):
+            handleVolumeChunk(
+                requestID: requestID,
+                rootCID: rootCID,
+                index: index,
+                count: count,
+                totalEntries: totalEntries,
+                totalBytes: totalBytes,
+                payload: payload,
+                from: peer,
+                sessionID: session?.sessionID.bytes,
+                relayed: session?.connection.isDirect == false
             )
 
         case .findProviders(let rootCID, let requestID):
@@ -2672,8 +2784,6 @@ public actor Ivy {
         let serving = servingContentTasks.keys.filter { $0.peer == peer }
         for request in serving {
             servingContentTasks[request]?.cancel()
-            servingContentTasks.removeValue(forKey: request)
-            servingContentRequests.remove(request)
         }
         let requestIDs = pendingContentRequests.compactMap { requestID, request in
             request.candidates.contains(peer) ? requestID : nil
@@ -2683,7 +2793,7 @@ public actor Ivy {
         }
 
         let volumeRequestIDs = pendingVolumeRequests.compactMap { requestID, request in
-            request.candidates.contains(peer) ? requestID : nil
+            request.candidateSessions[peer] != nil ? requestID : nil
         }
         for requestID in volumeRequestIDs {
             markVolumeCandidateDone(requestID: requestID, peer: peer)
@@ -2785,8 +2895,6 @@ public actor Ivy {
 
     func cleanupAllPending() {
         for task in servingContentTasks.values { task.cancel() }
-        servingContentTasks.removeAll()
-        servingContentRequests.removeAll()
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingPeerConnectionWaiters: pendingPeerConnectionWaiters,
@@ -2801,6 +2909,8 @@ public actor Ivy {
         pendingPeerConnectionWaiters.removeAll()
         pendingContentRequests.removeAll()
         pendingVolumeRequests.removeAll()
+        inFlightVolumeBytes = 0
+        reservedVolumeBytes = 0
         for pending in pendingFetches.values {
             pending.operationTask?.cancel()
             pending.timeoutTask?.cancel()
@@ -2902,6 +3012,16 @@ public actor Ivy {
         contentRequestEnqueueHookForTesting = hook
     }
 
+    func setEndpointWritabilityForTesting(_ peer: PeerID, writable: Bool) {
+        guard let key = try? PeerKey(peer.publicKey),
+              let session = endpointSession(for: key) else { return }
+        session.connection.channelWritabilityChanged(isWritable: writable)
+    }
+
+    var reservedServingVolumeBytesForTesting: Int {
+        reservedServingVolumeBytes
+    }
+
     func seedConnectedEndpointForTesting(
         _ endpoint: PeerEndpoint,
         connection suppliedConnection: PeerConnection? = nil,
@@ -2933,11 +3053,12 @@ public actor Ivy {
         return false
     }
 
-    func handleRelayControlForTesting(_ message: Message, from sender: PeerKey) {
-        handleRelayControl(message, from: sender)
+    func handleRelayControlForTesting(_ message: Message, from sender: PeerKey) async {
+        await handleRelayControl(message, from: sender)
     }
 
     var installedRouteCountForTesting: Int { installedRoutes.count }
+    var relayRouteCountForTesting: Int { relayRoutes.count }
     var activeFetchCountForTesting: Int { activeFetchCount }
     var pendingRelayOpenCountForTesting: Int { pendingRelayOpens.count }
     var pendingRelayRouteForTesting: Data? { pendingRelayOpens.keys.first }

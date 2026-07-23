@@ -28,6 +28,10 @@ Receive sequences strictly increase. Simultaneous sessions for one peer and
 role converge on the smaller session ID. Records are signed but not encrypted;
 confidentiality and forward secrecy belong above or below Ivy.
 
+Wire/session protocol v9 rejects v8 during authentication. V9 introduces
+multi-frame complete-Volume replies, which cannot safely share the older
+one-frame Volume contract.
+
 Treat every authenticated endpoint connection as an independent availability
 zone, not a verdict about the peer. Application timeouts, unavailable content,
 and caller-reported deficiency leave the session open. Only transport safety
@@ -45,6 +49,11 @@ bound exhaustion close it.
 - Strings, collections, connections, netgroups, pending requests, waiters,
   candidates, routing entries, provider hints, and relay routes are bounded.
 - Content framing overhead is subtracted before storage materializes bytes.
+- A complete Volume is at most 64 MiB and 65,535 members. Its ordered chunks
+  share one request, root, authenticated endpoint session, and node run; partial
+  assemblies reserve their declared size from a 128 MiB node-wide receive cap.
+  Source materializations pessimistically reserve the same bounded capacity, so
+  concurrent serving cannot multiply the per-Volume limit.
 - Each connection owns its inbound reader task, so close cancels cooperative
   work. Local and remote content callbacks share one concurrency cap; a
   callback that ignores cancellation keeps its slot until it actually exits.
@@ -95,6 +104,17 @@ assigning them semantics. The source must return that set exactly once within th
 budget. Duplicate, extra, missing, oversized, unsolicited, and unexpected-peer
 responses are unavailable, never partial.
 
+A Volume request names only its root. The source returns one complete bounded
+Volume, which Ivy canonically orders and streams in sequential frames. Each
+frame still obeys the same 4 MiB route cap. Competing providers assemble
+independently, and replacement sessions, gaps, duplicates, conflicting stream
+metadata, and malformed archives discard only that provider's attempt. Ivy
+returns no `AttributedVolumeResponse` until one archive is complete and contains
+the requested root. Identifiers and bytes remain opaque: Ivy neither validates
+content addressing nor interprets or traverses a DAG. Ivy cancels serving at
+`requestTimeout`; blocked writers release their reservation, while a storage
+callback that ignores cancellation remains counted until it actually exits.
+
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
 the wire request. `requestTimeout` bounds that whole fetch for its callers;
 timed-out backend or network work remains counted until it exits. Provider hints are bounded and expiring. A failed local dial
@@ -113,7 +133,9 @@ Outbound relay initiation uses configured carriers. A target may accept an
 inbound route offered by another authenticated direct peer without configuring
 that peer as its carrier. The route grants transport only: endpoint records
 remain signed end to end, so the offer cannot change either endpoint identity
-or place the carrier in endpoint routing.
+or place the carrier in endpoint routing. A carrier forwards each route in
+arrival order to its exact destination session, waits only until
+`requestTimeout` for writability, and then retires that route.
 
 Ivy attributes a violation only after verifying the charged peer's signature.
 Signed malformed endpoint payloads remain attributable through relay. Unsigned

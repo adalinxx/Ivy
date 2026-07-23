@@ -64,7 +64,7 @@ public struct PeerMetadata: Sendable, Equatable {
 }
 
 struct SessionHelloInitiator: Sendable, Equatable {
-    static let version: UInt16 = 8
+    static let version: UInt16 = 9
     static let encodedOverhead = 2 + (4 * PeerKey.byteCount) + 4
 
     let routeBinding: Data
@@ -357,7 +357,7 @@ struct SessionSequenceState: Sendable, Equatable {
 }
 
 enum SessionWireRecord: Sendable, Equatable {
-    private static let magic = Data([0x49, 0x56, 0x59, 0x08])
+    private static let magic = Data([0x49, 0x56, 0x59, 0x09])
     static let dataRecordOverhead = magic.count + 1 + 32 + 8 + 4 + 64
 
     case helloInitiator(SignedSessionHelloInitiator)

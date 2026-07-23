@@ -4,7 +4,7 @@ import NIOEmbedded
 import Testing
 @testable import Ivy
 
-@Suite("Ivy v8 session protocol")
+@Suite("Ivy v9 session protocol")
 struct SessionProtocolTests {
     private func identity(_ byte: UInt8) -> Curve25519.Signing.PrivateKey {
         try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: byte, count: 32))
@@ -45,8 +45,8 @@ struct SessionProtocolTests {
         return (signedI, signedR, try SessionID(initiator: signedI, responder: signedR), initiator, responder)
     }
 
-    @Test("frozen v8 session vectors")
-    func frozenV8Vectors() throws {
+    @Test("frozen v9 session vectors")
+    func frozenV9Vectors() throws {
         let route = Data(repeating: 0x11, count: 32)
         let initiatorIdentity = identity(1)
         let responderIdentity = identity(2)
@@ -62,7 +62,7 @@ struct SessionProtocolTests {
         let signedI = SignedSessionHelloInitiator(
             hello: helloI,
             signature: try #require(Data(hexString:
-                "99c40b7a3da299dafa3539ed6d85c0bdda040ee33adaddcd18e9d0096ebca4c9d2ed215b91f411f2575f4639a8b82b4a9be63956dadd2fb077f72872f6a80303")))
+                "f08acddddd05639166b5d5b106c1892482eab8d5809b91e52af7cf98e6b0e6b34be2895d6ec8a25a0d8ad36f77a392e40d2979977c51eb164fb3d03d0de61c08")))
 
         let helloR = SessionHelloResponder(
             routeBinding: route,
@@ -74,20 +74,20 @@ struct SessionProtocolTests {
         let signedR = SignedSessionHelloResponder(
             hello: helloR,
             signature: try #require(Data(hexString:
-                "b7d300bb3c59e703eac6e5ea8e0f65981167ebe87aa6c43e45def09bf42a74e07e87ff78cb13338640656933c3452d4825043ae1e2d3897a686ba4f5e33cc40e")))
+                "b0a8eff2c26e765dbc08e2688cc1adb58e5419ea8cfc34e412a00dd638324c99d133fdaa46a424de0032fb3fd68264b1fe2614414e58852b1b4f66df91ed1809")))
         let sessionID = try SessionID(initiator: signedI, responder: signedR)
         let finish = SessionFinish(
             sessionID: sessionID,
             sender: initiator,
             receiver: responder,
             signature: try #require(Data(hexString:
-                "9e2aafd4918190a994d30e1de04616085c51a14dc7a5d3734f1044aaf119dbe816f1ed32cd216990b279de6e128e90b50a1c358f0ef540692e9e4221f2c5290a")))
+                "02d5f2ed6b4ba1cb8b5e1691be1bc38a855c5098152eda591b48118793acf3f46781f4c12d16e5bad2f857cfa9273df000dbb7d0034f5a58c51a6e78c900bd07")))
         let dataRecord = SessionDataRecord(
             sessionID: sessionID,
             sequence: 1,
             payload: Data([0xaa, 0xbb]),
             signature: try #require(Data(hexString:
-                "4ca4211e2d5b55f84ff71769e9c872530f5641b871a32854c2b8372453c8b3cb7eb057d7a7df591ae4c7ecd184d506618cef8e296b2a3b2a3910ecc5bd78da03")))
+                "a48a8036da2e5655b4e36f126de51a37ab46ce1fca193b5ca094b3524703e7c4a321cf5859c375297ef800ec76e01496c3484bcfdca0bc1d58bcb62f2efb7306")))
 
         let vectors = [
             SessionWireRecord.helloInitiator(signedI).serialize(),
@@ -97,11 +97,11 @@ struct SessionProtocolTests {
             SessionWireRecord.data(dataRecord).serialize(),
         ]
         let expectedHex = [
-            "495659080100000088000811111111111111111111111111111111111111111111111111111111111111118a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394444444444444444444444444444444444444444444444444444444444444444400000002000099c40b7a3da299dafa3539ed6d85c0bdda040ee33adaddcd18e9d0096ebca4c9d2ed215b91f411f2575f4639a8b82b4a9be63956dadd2fb077f72872f6a80303",
-            "4956590802000000a8000811111111111111111111111111111111111111111111111111111111111111118139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c44444444444444444444444444444444444444444444444444444444444444446666666666666666666666666666666666666666666666666666666666666666000000020000b7d300bb3c59e703eac6e5ea8e0f65981167ebe87aa6c43e45def09bf42a74e07e87ff78cb13338640656933c3452d4825043ae1e2d3897a686ba4f5e33cc40e",
-            "167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f7415",
-            "4956590803167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f74158a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3949e2aafd4918190a994d30e1de04616085c51a14dc7a5d3734f1044aaf119dbe816f1ed32cd216990b279de6e128e90b50a1c358f0ef540692e9e4221f2c5290a",
-            "4956590804167967fcd034a2194156d555c6b7896f8c0892e690a84ee591a89cff2f8f7415000000000000000100000002aabb4ca4211e2d5b55f84ff71769e9c872530f5641b871a32854c2b8372453c8b3cb7eb057d7a7df591ae4c7ecd184d506618cef8e296b2a3b2a3910ecc5bd78da03",
+            "495659090100000088000911111111111111111111111111111111111111111111111111111111111111118a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3944444444444444444444444444444444444444444444444444444444444444444000000020000f08acddddd05639166b5d5b106c1892482eab8d5809b91e52af7cf98e6b0e6b34be2895d6ec8a25a0d8ad36f77a392e40d2979977c51eb164fb3d03d0de61c08",
+            "4956590902000000a8000911111111111111111111111111111111111111111111111111111111111111118139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c44444444444444444444444444444444444444444444444444444444444444446666666666666666666666666666666666666666666666666666666666666666000000020000b0a8eff2c26e765dbc08e2688cc1adb58e5419ea8cfc34e412a00dd638324c99d133fdaa46a424de0032fb3fd68264b1fe2614414e58852b1b4f66df91ed1809",
+            "590f18273722558b37b755b4c0d1786c992673392f3d8359d17a93519da9ccbd",
+            "4956590903590f18273722558b37b755b4c0d1786c992673392f3d8359d17a93519da9ccbd8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39402d5f2ed6b4ba1cb8b5e1691be1bc38a855c5098152eda591b48118793acf3f46781f4c12d16e5bad2f857cfa9273df000dbb7d0034f5a58c51a6e78c900bd07",
+            "4956590904590f18273722558b37b755b4c0d1786c992673392f3d8359d17a93519da9ccbd000000000000000100000002aabba48a8036da2e5655b4e36f126de51a37ab46ce1fca193b5ca094b3524703e7c4a321cf5859c375297ef800ec76e01496c3484bcfdca0bc1d58bcb62f2efb7306",
         ]
         for (vector, hex) in zip(vectors, expectedHex) {
             let actual = vector.map { String(format: "%02x", $0) }.joined()
@@ -114,7 +114,7 @@ struct SessionProtocolTests {
         #expect(dataRecord.isValid(sender: initiator, receiver: responder))
 
         var legacyWire = vectors[0]
-        legacyWire[legacyWire.startIndex + 3] = 0x07
+        legacyWire[legacyWire.startIndex + 3] = 0x08
         #expect(throws: (any Error).self) {
             try SessionWireRecord.deserialize(legacyWire)
         }

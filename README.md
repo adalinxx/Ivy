@@ -47,6 +47,7 @@ Ivy supplies three small primitives that applications compose:
 - `broadcastMessage` announces gossip to the currently connected peers.
 - `sendMessage` carries directed sync requests and responses.
 - `fetchContent` retrieves one exact content selection from available providers.
+- `fetchVolume` retrieves one complete bounded Volume from one provider.
 
 The caller defines gossip IDs, deduplication, forwarding, sync order, and CID
 validation. Ivy authenticates the sender, bounds each operation, and keeps these
@@ -89,6 +90,11 @@ storage.
 
 Selections must fit one fixed 4 MiB frame body. Larger application objects must
 be split by caller-defined boundaries.
+
+`fetchVolume(rootCID:)` is the complete-boundary counterpart. Ivy streams one
+Volume across ordered 4 MiB frames, up to 64 MiB and 65,535 entries, and returns
+only after the whole archive is present. This does not make Ivy a DAG layer:
+the caller still validates every identifier and byte before storage.
 
 Provider records are expiring routing hints, not proof of possession, validity,
 pinning, or authority.
