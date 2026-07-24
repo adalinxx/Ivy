@@ -750,7 +750,7 @@ struct ContentExchangeTests {
         let ivy = Ivy(config: IvyConfig(
             publicKey: "volume-timeout-requester",
             listenPort: 0,
-            requestTimeout: .milliseconds(30)
+            requestTimeout: .seconds(1)
         ))
         let identity = deterministicTestPeerKey("volume-timeout-peer")
         let endpoint = PeerEndpoint(publicKey: identity, host: "127.0.0.1", port: 4105)

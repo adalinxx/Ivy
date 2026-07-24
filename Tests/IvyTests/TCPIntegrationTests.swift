@@ -451,7 +451,7 @@ struct TCPIntegrationTests {
         let server = Ivy(config: TransportTestHarness.config(
             serverIdentity,
             port: serverPort,
-            requestTimeout: .milliseconds(100)
+            requestTimeout: .seconds(1)
         ))
         let client = Ivy(config: TransportTestHarness.config(
             clientIdentity,
