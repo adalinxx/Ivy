@@ -760,8 +760,34 @@ extension Ivy {
     /// Fetches one complete Volume. Provider selection may use any connected
     /// endpoint advertising the root.
     public func fetchVolume(rootCID: String) async -> AttributedVolumeResponse {
+        await fetchVolume(
+            rootCID: rootCID,
+            maximumArchiveBytes: MessageLimits.maxVolumeArchiveBytes,
+            maximumEntries: Int(MessageLimits.maxVolumeEntryCount)
+        )
+    }
+
+    /// Fetches one complete Volume without accepting a response whose declared
+    /// archive or entry count exceeds the caller's local capacity.
+    public func fetchVolume(
+        rootCID: String,
+        maximumArchiveBytes: Int,
+        maximumEntries: Int
+    ) async -> AttributedVolumeResponse {
         let generation = runGeneration
-        guard MessageLimits.accepts(rootCID) else { return .empty }
+        guard MessageLimits.accepts(rootCID),
+              maximumArchiveBytes > 0,
+              maximumEntries > 0 else {
+            return .empty
+        }
+        let maximumArchiveBytes = min(
+            maximumArchiveBytes,
+            MessageLimits.maxVolumeArchiveBytes
+        )
+        let maximumEntries = min(
+            maximumEntries,
+            Int(MessageLimits.maxVolumeEntryCount)
+        )
         if let local = await localVolume(rootCID: rootCID) { return local }
         guard isCurrentRun(generation), !Task.isCancelled,
               config.mode.usesOverlayServices || config.privateContentExchangeEnabled else {
@@ -779,8 +805,8 @@ extension Ivy {
                 rootCID: rootCID,
                 from: candidates,
                 generation: generation,
-                maximumArchiveBytes: MessageLimits.maxVolumeArchiveBytes,
-                maximumEntries: Int(MessageLimits.maxVolumeEntryCount)
+                maximumArchiveBytes: maximumArchiveBytes,
+                maximumEntries: maximumEntries
             )
             if !response.entries.isEmpty { return response }
         }
@@ -799,8 +825,8 @@ extension Ivy {
                 rootCID: rootCID,
                 from: candidates,
                 generation: generation,
-                maximumArchiveBytes: MessageLimits.maxVolumeArchiveBytes,
-                maximumEntries: Int(MessageLimits.maxVolumeEntryCount)
+                maximumArchiveBytes: maximumArchiveBytes,
+                maximumEntries: maximumEntries
             )
             if !response.entries.isEmpty { return response }
         }
@@ -810,8 +836,8 @@ extension Ivy {
             rootCID: rootCID,
             from: candidates,
             generation: generation,
-            maximumArchiveBytes: MessageLimits.maxVolumeArchiveBytes,
-            maximumEntries: Int(MessageLimits.maxVolumeEntryCount)
+            maximumArchiveBytes: maximumArchiveBytes,
+            maximumEntries: maximumEntries
         )
     }
 
@@ -840,17 +866,21 @@ extension Ivy {
     ) async -> AttributedVolumeResponse {
         guard MessageLimits.accepts(rootCID) else { return .empty }
         guard maximumArchiveBytes > 0,
-              maximumArchiveBytes <= MessageLimits.maxVolumeArchiveBytes,
-              maximumEntries > 0,
-              maximumEntries <= Int(MessageLimits.maxVolumeEntryCount) else {
+              maximumEntries > 0 else {
             return .empty
         }
         return await fetchVolume(
             rootCID: rootCID,
             from: [peer.id],
             generation: runGeneration,
-            maximumArchiveBytes: maximumArchiveBytes,
-            maximumEntries: maximumEntries,
+            maximumArchiveBytes: min(
+                maximumArchiveBytes,
+                MessageLimits.maxVolumeArchiveBytes
+            ),
+            maximumEntries: min(
+                maximumEntries,
+                Int(MessageLimits.maxVolumeEntryCount)
+            ),
             exactPeer: peer
         )
     }
