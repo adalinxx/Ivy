@@ -11,8 +11,9 @@ private struct TransportTestTimeout: Error {
 
 enum TransportTestHarness {
     private static let lock = NSLock()
+    // Stay below the default Linux and macOS ephemeral client-port ranges.
     private nonisolated(unsafe) static var port =
-        UInt16(ProcessInfo.processInfo.processIdentifier % 10_000) + 30_000
+        UInt16(ProcessInfo.processInfo.processIdentifier % 8_000) + 20_000
 
     static func nextPort() -> UInt16 {
         lock.withLock {
@@ -42,18 +43,24 @@ enum TransportTestHarness {
         port: UInt16,
         advertisedHost: String = "127.0.0.1",
         bootstrapPeers: [PeerEndpoint] = [],
+        inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay,
         relayEnabled: Bool = false,
         relayTimeout: Duration = .seconds(1),
+        requestTimeout: Duration = .seconds(1),
+        tallyConfig: TallyConfig = .default,
         maxConnections: Int = IvyConfig.defaultMaxConnections,
-        maxContentCandidates: Int = 8
+        maxContentCandidates: Int = 8,
+        privateContentExchangeEnabled: Bool = false
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
             listenPort: port,
             bootstrapPeers: bootstrapPeers,
-            requestTimeout: .seconds(1),
+            inboundAdmissionBypassPeerKeys: inboundAdmissionBypassPeerKeys,
+            tallyConfig: tallyConfig,
+            requestTimeout: requestTimeout,
             relayTimeout: relayTimeout,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
@@ -62,6 +69,7 @@ enum TransportTestHarness {
             maxContentCandidates: maxContentCandidates,
             externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
+            privateContentExchangeEnabled: privateContentExchangeEnabled,
             carriers: carriers,
             mode: mode)
     }
@@ -83,9 +91,9 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
     private var connected: [AuthenticatedPeer] = []
     private var currentConnections: Set<String> = []
     private var disconnected: [PeerID] = []
-    private var received: [(PeerMessage, PeerID)] = []
+    private var received: [(PeerMessage, AuthenticatedPeer)] = []
 
-    func ivy(_ ivy: Ivy, didConnect peer: AuthenticatedPeer) {
+    func ivy(_ ivy: Ivy, didConnect peer: AuthenticatedPeer) async {
         lock.withLock {
             connected.append(peer)
             currentConnections.insert(peer.key.hex)
@@ -99,7 +107,7 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
         }
     }
 
-    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: PeerID) {
+    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: AuthenticatedPeer) {
         lock.withLock { received.append((message, peer)) }
     }
 
@@ -130,10 +138,43 @@ final class TransportTestRecorder: IvyDelegate, @unchecked Sendable {
     func receivedMessage(topic: String, payload: Data, from peer: PeerID) -> Bool {
         lock.withLock {
             received.contains { message, sender in
-                message.topic == topic && message.payload == payload && sender == peer
+                message.topic == topic && message.payload == payload && sender.id == peer
             }
         }
     }
+
+    func receivedPeer(topic: String, payload: Data) -> AuthenticatedPeer? {
+        lock.withLock {
+            received.first { message, _ in
+                message.topic == topic && message.payload == payload
+            }?.1
+        }
+    }
+}
+
+private actor BlockingAsyncMessageRecorder: IvyDelegate {
+    let firstMessage = TestBarrier("first async delegate message")
+    private var received: [PeerMessage] = []
+
+    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: AuthenticatedPeer) async {
+        received.append(message)
+        if received.count == 1 {
+            try? await firstMessage.arriveAndWait()
+        }
+    }
+
+    func receivedCount() -> Int { received.count }
+    func receivedTopics() -> [String] { received.map(\.topic) }
+}
+
+private actor AsyncMessageRecorder: IvyDelegate {
+    private var received: [PeerMessage] = []
+
+    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: AuthenticatedPeer) async {
+        received.append(message)
+    }
+
+    func receivedCount() -> Int { received.count }
 }
 
 final class TransportTestContentSource: IvyContentSource, Sendable {
@@ -159,6 +200,46 @@ final class TransportRawContentSource: IvyContentSource, Sendable {
 
     func content(rootCID: String, cids: [String], maxDataBytes: Int) async -> [ContentEntry] {
         selections[rootCID] ?? []
+    }
+}
+
+private struct TransportVolumeSource: IvyContentSource {
+    let entries: [ContentEntry]
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        entries
+    }
+}
+
+private actor BlockingVolumeSource: IvyContentSource {
+    private let entries: [ContentEntry]
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(entries: [ContentEntry]) {
+        self.entries = entries
+    }
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) async -> [ContentEntry] {
+        started = true
+        await withCheckedContinuation { waiters.append($0) }
+        return entries
+    }
+
+    func didStart() -> Bool { started }
+
+    func release() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
     }
 }
 
@@ -203,6 +284,10 @@ extension Ivy {
     func setTestDelegate(_ delegate: IvyDelegate?) {
         self.delegate = delegate
     }
+
+    func servingContentCountForTesting() -> Int {
+        servingContentRequests.count
+    }
 }
 
 @Suite("TCP transport", .serialized)
@@ -238,6 +323,182 @@ struct TCPIntegrationTests {
         #expect(clientRecorder.authenticatedPeers.map(\.key) == [
             TransportTestHarness.key(serverIdentity),
         ])
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a solicited Volume reply survives responder admission exhaustion")
+    func solicitedVolumeReplyBypassesOutboundAdmission() async throws {
+        let serverIdentity = TransportTestHarness.identity("volume-reply-server")
+        let clientIdentity = TransportTestHarness.identity("volume-reply-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 2,
+                perPeerRequestRefillPerSecond: 0
+            )
+        ))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let clientRecorder = TransportTestRecorder()
+        let serverRecorder = TransportTestRecorder()
+        await client.setTestDelegate(clientRecorder)
+        await server.setTestDelegate(serverRecorder)
+        let entries = [
+            ContentEntry(cid: "root", data: Data("root".utf8)),
+            ContentEntry(cid: "child", data: Data("child".utf8)),
+        ]
+        let source = BlockingVolumeSource(entries: entries)
+        await server.setContentSource(source)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            clientRecorder.authenticatedPeers.count == 1
+        })
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        let fetch = Task { await client.fetchVolume(rootCID: "root", from: serverPeer) }
+        #expect(try await TransportTestHarness.eventually { await source.didStart() })
+
+        let concurrentPayload = Data("inventory".utf8)
+        #expect(await client.sendMessage(
+            to: serverPeer.id,
+            topic: "transaction.inventory",
+            payload: concurrentPayload
+        ) == .enqueued(endpoint: serverPeer.id, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.receivedMessage(
+                topic: "transaction.inventory",
+                payload: concurrentPayload,
+                from: TransportTestHarness.key(clientIdentity).peerID
+            )
+        })
+
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let tally = await server.tally
+        while tally.shouldAllow(peer: clientID) {}
+        await source.release()
+
+        #expect(await fetch.value == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: [
+                "root": Data("root".utf8),
+                "child": Data("child".utf8),
+            ],
+            servedBy: serverPeer.id
+        ))
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a complete Volume larger than one frame crosses authenticated TCP")
+    func multiFrameVolume() async throws {
+        let serverIdentity = TransportTestHarness.identity("large-volume-server")
+        let clientIdentity = TransportTestHarness.identity("large-volume-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let clientRecorder = TransportTestRecorder()
+        await client.setTestDelegate(clientRecorder)
+        let rootBytes = Data(
+            repeating: 0xa5,
+            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+        )
+        let childBytes = Data("child".utf8)
+        await server.setContentSource(TransportVolumeSource(entries: [
+            ContentEntry(cid: "root", data: rootBytes),
+            ContentEntry(cid: "child", data: childBytes),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            clientRecorder.authenticatedPeers.count == 1
+        })
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        let response = await client.fetchVolume(rootCID: "root", from: serverPeer)
+        #expect(response == AttributedVolumeResponse(
+            rootCID: "root",
+            entries: ["root": rootBytes, "child": childBytes],
+            servedBy: serverPeer.id
+        ))
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a stalled authenticated Volume writer releases its reservation at the deadline")
+    func stalledVolumeWriterTimesOut() async throws {
+        let serverIdentity = TransportTestHarness.identity("stalled-volume-server")
+        let clientIdentity = TransportTestHarness.identity("stalled-volume-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            requestTimeout: .seconds(1)
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let serverRecorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+        await client.setTestDelegate(clientRecorder)
+        await server.setContentSource(TransportVolumeSource(entries: [
+            ContentEntry(
+                cid: "root",
+                data: Data(
+                    repeating: 0xa5,
+                    count: Int(IvyConfig.protocolMaxFrameSize) + 1
+                )
+            ),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.authenticatedPeers.count == 1
+                && clientRecorder.authenticatedPeers.count == 1
+        })
+        let clientPeer = try #require(serverRecorder.authenticatedPeers.first)
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        await server.setEndpointWritabilityForTesting(
+            clientPeer.id,
+            writable: false
+        )
+
+        let fetch = Task {
+            await client.fetchVolume(rootCID: "root", from: serverPeer)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await server.reservedServingVolumeBytesForTesting
+                == MessageLimits.maxVolumeArchiveBytes
+        })
+        #expect(try await TransportTestHarness.eventually {
+            await server.reservedServingVolumeBytesForTesting == 0
+        })
+        #expect(await fetch.value == .empty)
 
         await client.stop()
         await server.stop()
@@ -366,12 +627,398 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             recorder.receivedMessage(topic: "node.state", payload: payload, from: clientID)
         })
+        #expect(recorder.receivedPeer(topic: "node.state", payload: payload)
+            == recorder.authenticatedPeers.first)
 
         let gossip = Data("new block".utf8)
         await client.broadcastMessage(topic: "blocks.gossip", payload: gossip)
         #expect(try await TransportTestHarness.eventually {
             recorder.receivedMessage(topic: "blocks.gossip", payload: gossip, from: clientID)
         })
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a blocked async delegate preserves a burst beyond the old inbound queue")
+    func asyncDelegateBackpressure() async throws {
+        let serverIdentity = TransportTestHarness.identity("async-delegate-server")
+        let clientIdentity = TransportTestHarness.identity("async-delegate-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let recorder = BlockingAsyncMessageRecorder()
+        await server.setTestDelegate(recorder)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 1
+        })
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let topics = (0..<12).map { "burst-\($0)" }
+        let payload = Data(repeating: 0xab, count: 4 * 1024)
+        for topic in topics {
+            #expect(await client.sendMessage(
+                to: serverID,
+                topic: topic,
+                payload: payload) == .enqueued(endpoint: serverID, route: .direct))
+        }
+
+        try await recorder.firstMessage.waitForArrivals()
+        #expect(await recorder.receivedCount() == 1)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await server.peerConnectionCount == 1)
+        await recorder.firstMessage.release()
+        #expect(try await TransportTestHarness.eventually {
+            await recorder.receivedCount() == topics.count
+        })
+        #expect(await recorder.receivedTopics() == topics)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("Tally denies peer messages before an async delegate runs")
+    func tallyPrecedesAsyncDelegate() async throws {
+        let serverIdentity = TransportTestHarness.identity("async-tally-server")
+        let clientIdentity = TransportTestHarness.identity("async-tally-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 1,
+                perPeerRequestRefillPerSecond: 0
+            )
+        ))
+        let client = Ivy(config: TransportTestHarness.config(clientIdentity, port: clientPort))
+        let recorder = AsyncMessageRecorder()
+        await server.setTestDelegate(recorder)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 1
+        })
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "allowed",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "denied",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+
+        #expect(try await TransportTestHarness.eventually {
+            await server.tally.metrics.denied == 1
+        })
+        #expect(await recorder.receivedCount() == 1)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("exact-session recovery is configured, suppressible, and stale-safe")
+    func exactSessionRecoveryIsConfiguredAndStaleSafe() async throws {
+        let serverIdentity = TransportTestHarness.identity("restart-server")
+        let clientIdentity = TransportTestHarness.identity("restart-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let serverEndpoint = TransportTestHarness.endpoint(serverIdentity, port: serverPort)
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            bootstrapPeers: [serverEndpoint]
+        ))
+        let clientRecorder = TransportTestRecorder()
+        await client.setTestDelegate(clientRecorder)
+
+        try await server.start()
+        try await client.start()
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await client.peerConnectionCount == 1
+        })
+        let initialPeer = try #require(clientRecorder.authenticatedPeers.last)
+
+        #expect(await client.recycleSession(ifCurrent: initialPeer))
+        #expect(try await TransportTestHarness.eventually {
+            let currentSession = await client.selectedSessionIDForTesting(serverID)
+            let connectionCount = await client.peerConnectionCount
+            return connectionCount == 1
+                && currentSession != nil
+                && currentSession != initialPeer.sessionID
+                && clientRecorder.authenticatedPeers.count >= 2
+        })
+        let replacementSession = await client.selectedSessionIDForTesting(serverID)
+        #expect(!(await client.recycleSession(ifCurrent: initialPeer)))
+        #expect(await client.selectedSessionIDForTesting(serverID) == replacementSession)
+        #expect(!(await client.disconnectSession(ifCurrent: initialPeer)))
+        #expect(await client.selectedSessionIDForTesting(serverID) == replacementSession)
+
+        let replacementPeer = try #require(clientRecorder.authenticatedPeers.last)
+        #expect(await client.disconnectSession(ifCurrent: replacementPeer))
+        #expect(try await TransportTestHarness.eventually {
+            await client.peerConnectionCount == 0
+        })
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(await client.peerConnectionCount == 0)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("exact-session recycle closes an unconfigured peer")
+    func exactSessionRecycleClosesUnconfiguredPeer() async throws {
+        let serverIdentity = TransportTestHarness.identity("recycle-server")
+        let clientIdentity = TransportTestHarness.identity("recycle-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort
+        ))
+        let serverRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.authenticatedPeers.count == 1
+        })
+        let inboundPeer = try #require(serverRecorder.authenticatedPeers.first)
+
+        #expect(await server.recycleSession(ifCurrent: inboundPeer))
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 0
+        })
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("configured private parent bypasses receiver Tally admission")
+    func configuredParentBypassesInboundAdmission() async throws {
+        let serverIdentity = TransportTestHarness.identity("bypass-server")
+        let clientIdentity = TransportTestHarness.identity("bypass-parent")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let clientEndpoint = TransportTestHarness.endpoint(clientIdentity, port: clientPort)
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            bootstrapPeers: [clientEndpoint],
+            inboundAdmissionBypassPeerKeys: [TransportTestHarness.key(clientIdentity)],
+            mode: .privateNetwork,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 1,
+                perPeerRequestRefillPerSecond: 0
+            )
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            mode: .privateNetwork
+        ))
+        let recorder = AsyncMessageRecorder()
+        await server.setTestDelegate(recorder)
+
+        try await client.start()
+        try await server.start()
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
+        })
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "first",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "second",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            await recorder.receivedCount() == 2
+        })
+        #expect(await server.tally.metrics.denied == 0)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("private admission bypass remains scoped to configured parents")
+    func inboundAdmissionBypassDoesNotApplyToOtherPeers() async throws {
+        let serverIdentity = TransportTestHarness.identity("bypass-scope-server")
+        let parentIdentity = TransportTestHarness.identity("bypass-scope-parent")
+        let otherIdentity = TransportTestHarness.identity("bypass-scope-other")
+        let serverPort = TransportTestHarness.nextPort()
+        let parentPort = TransportTestHarness.nextPort()
+        let otherPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            bootstrapPeers: [
+                TransportTestHarness.endpoint(parentIdentity, port: parentPort),
+                TransportTestHarness.endpoint(otherIdentity, port: otherPort),
+            ],
+            inboundAdmissionBypassPeerKeys: [TransportTestHarness.key(parentIdentity)],
+            mode: .privateNetwork,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 1,
+                perPeerRequestRefillPerSecond: 0
+            )
+        ))
+        let parent = Ivy(config: TransportTestHarness.config(
+            parentIdentity,
+            port: parentPort,
+            mode: .privateNetwork
+        ))
+        let other = Ivy(config: TransportTestHarness.config(
+            otherIdentity,
+            port: otherPort,
+            mode: .privateNetwork
+        ))
+        let recorder = AsyncMessageRecorder()
+        await server.setTestDelegate(recorder)
+
+        try await parent.start()
+        try await other.start()
+        try await server.start()
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let parentCount = await parent.peerConnectionCount
+            let otherCount = await other.peerConnectionCount
+            return serverCount == 2 && parentCount == 1 && otherCount == 1
+        })
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(await parent.sendMessage(
+            to: serverID,
+            topic: "parent-first",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(await parent.sendMessage(
+            to: serverID,
+            topic: "parent-second",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(await other.sendMessage(
+            to: serverID,
+            topic: "other-first",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(await other.sendMessage(
+            to: serverID,
+            topic: "other-second",
+            payload: Data()) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            let received = await recorder.receivedCount()
+            let metrics = await server.tally.metrics
+            return received == 3 && metrics.denied == 1
+        })
+
+        await parent.stop()
+        await other.stop()
+        await server.stop()
+    }
+
+    @Test("Private network carries direct messages and content without overlay traffic")
+    func privateNetworkTrafficIsolation() async throws {
+        let serverIdentity = TransportTestHarness.identity("private-network-server")
+        let clientIdentity = TransportTestHarness.identity("private-network-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            mode: .privateNetwork,
+            privateContentExchangeEnabled: true))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: clientPort,
+            mode: .privateNetwork,
+            privateContentExchangeEnabled: true))
+        let recorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await server.setTestDelegate(recorder)
+        await client.setTestDelegate(clientRecorder)
+        let root = "private-root"
+        let child = "private-child"
+        await server.setContentSource(TransportTestContentSource([
+            root: Data("root bytes".utf8),
+            child: Data("child bytes".utf8),
+        ]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
+        })
+
+        #expect(await server.knownPeerEndpoints.isEmpty)
+        #expect(await client.knownPeerEndpoints.isEmpty)
+        #expect(await client.findNode(target: root).isEmpty)
+        #expect(await client.discoverProviders(rootCID: root).isEmpty)
+
+        let sentBeforeOverlayAPIs = await client.tally.metrics.totalBytesSent
+        await client.broadcastMessage(topic: "not-private", payload: Data("broadcast".utf8))
+        let expiry = UInt64(Date().timeIntervalSince1970) + 60
+        await client.announceProvider(rootCID: root, expiresAt: expiry)
+        #expect(await client.tally.metrics.totalBytesSent == sentBeforeOverlayAPIs)
+
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        let fetched = await client.fetchContent(
+            rootCID: root,
+            cids: [child],
+            from: serverPeer)
+        #expect(fetched.entries == [
+            root: Data("root bytes".utf8),
+            child: Data("child bytes".utf8),
+        ])
+
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        let clientID = TransportTestHarness.key(clientIdentity).peerID
+        let serverSentBeforeReferrals = await server.tally.metrics.totalBytesSent
+        #expect(await client.sendAuthenticatedMessageForTesting(
+            .findNode(target: Data(repeating: 0xaa, count: 32), nonce: 1),
+            to: serverID))
+        #expect(await client.sendAuthenticatedMessageForTesting(
+            .announceProvider(rootCID: root, expiresAt: expiry),
+            to: serverID))
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await server.tally.metrics.totalBytesSent == serverSentBeforeReferrals)
+        #expect(await server.providerHints.isEmpty)
+
+        let payload = Data("hierarchy fact".utf8)
+        #expect(await client.sendMessage(
+            to: serverID,
+            topic: "hierarchy.fact",
+            payload: payload) == .enqueued(endpoint: serverID, route: .direct))
+        #expect(try await TransportTestHarness.eventually {
+            recorder.receivedMessage(topic: "hierarchy.fact", payload: payload, from: clientID)
+        })
+        #expect(recorder.receivedPeer(topic: "hierarchy.fact", payload: payload)
+            == recorder.authenticatedPeers.first)
 
         await client.stop()
         await server.stop()
@@ -520,9 +1167,13 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             await server.peerConnectionCount == 0
         })
+        #expect(await server.servingContentCountForTesting() == 1)
 
         await source.release()
         #expect(try await request.value(waitingFor: "closed stuck content request") == .empty)
+        #expect(try await TransportTestHarness.eventually {
+            await server.servingContentCountForTesting() == 0
+        })
         await client.stop()
         await server.stop()
     }

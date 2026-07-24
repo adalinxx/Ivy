@@ -4,6 +4,11 @@ import Testing
 import Tally
 
 private extension Ivy {
+    func makeWireOperationIDAfterWrap(avoiding inUse: Set<UInt64>) -> UInt64 {
+        nextWireOperationID = .max
+        return makeWireOperationID(avoiding: inUse)
+    }
+
     func pendingContentSnapshot() -> (requests: Int, waiters: Int) {
         (
             pendingContentRequests.count,
@@ -18,6 +23,10 @@ private extension Ivy {
 
     func storedProviderExpiry(rootCID: String, peer: PeerID) -> UInt64? {
         providerHints[rootCID]?.first { $0.peer == peer }?.expiresAt
+    }
+
+    func seedProviderLookupTarget(_ endpoint: PeerEndpoint) {
+        router.addPeer(PeerID(publicKey: endpoint.publicKey), endpoint: endpoint)
     }
 }
 
@@ -51,6 +60,13 @@ struct PendingRequestCapsTests {
             try? await Task.sleep(for: .milliseconds(5))
         }
         return false
+    }
+
+    @Test("wire operation IDs skip zero and live IDs after wrap")
+    func wireOperationIDWrapsWithoutCollision() async {
+        let node = Ivy(config: cappedConfig(maxPending: 2, maxWaiters: 2))
+
+        #expect(await node.makeWireOperationIDAfterWrap(avoiding: [1]) == 2)
     }
 
     @Test("distinct selections stop at the global cap")
@@ -186,6 +202,54 @@ struct PendingRequestCapsTests {
         #expect(await node.storedProviderExpiry(rootCID: "root", peer: peers[0]) == expiry)
         await node.stop()
         for loopback in loopbacks { await loopback.close() }
+    }
+
+    @Test("cancelling provider discovery promptly releases the public fetch slot")
+    func publicFetchProviderCancellation() async throws {
+        let node = Ivy(config: IvyConfig(
+            publicKey: "provider-cancellation-node",
+            listenPort: 0,
+            requestTimeout: .seconds(5),
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxPendingRequests: 1
+        ))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("silent-provider-peer"))
+        let endpoint = PeerEndpoint(
+            publicKey: peer.publicKey,
+            host: "127.0.0.1",
+            port: TransportTestHarness.nextPort()
+        )
+        let loopback = try await TestLoopback.open()
+        try await node.start()
+        try await node.seedConnectedEndpointForTesting(
+            endpoint,
+            connection: PeerConnection(endpoint: endpoint, channel: loopback.client),
+            marker: 1
+        )
+        await node.seedProviderLookupTarget(endpoint)
+
+        let fetch = Task { await node.fetchContent(rootCID: "cancelled-root") }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingProviderSnapshot(rootCID: "cancelled-root").requestID != nil
+        })
+        fetch.cancel()
+        #expect(await fetch.value == .empty)
+        #expect(try await TransportTestHarness.eventually {
+            let provider = await node.pendingProviderSnapshot(rootCID: "cancelled-root")
+            let active = await node.activeFetchCountForTesting
+            return provider.requestID == nil && active == 0
+        })
+
+        let replacement = Task { await node.fetchContent(rootCID: "replacement-root") }
+        #expect(try await TransportTestHarness.eventually {
+            await node.pendingProviderSnapshot(rootCID: "replacement-root").requestID != nil
+        })
+        replacement.cancel()
+        #expect(await replacement.value == .empty)
+
+        await node.stop()
+        await loopback.close()
     }
 
 }
