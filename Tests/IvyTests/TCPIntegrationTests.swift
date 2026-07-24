@@ -840,11 +840,12 @@ struct TCPIntegrationTests {
         let recorder = AsyncMessageRecorder()
         await server.setTestDelegate(recorder)
 
-        try await server.start()
         try await client.start()
-        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        try await server.start()
         #expect(try await TransportTestHarness.eventually {
-            await server.peerConnectionCount == 1
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
         })
 
         let serverID = TransportTestHarness.key(serverIdentity).peerID
@@ -900,13 +901,14 @@ struct TCPIntegrationTests {
         let recorder = AsyncMessageRecorder()
         await server.setTestDelegate(recorder)
 
-        try await server.start()
         try await parent.start()
         try await other.start()
-        try await parent.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
-        try await other.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        try await server.start()
         #expect(try await TransportTestHarness.eventually {
-            await server.peerConnectionCount == 2
+            let serverCount = await server.peerConnectionCount
+            let parentCount = await parent.peerConnectionCount
+            let otherCount = await other.peerConnectionCount
+            return serverCount == 2 && parentCount == 1 && otherCount == 1
         })
 
         let serverID = TransportTestHarness.key(serverIdentity).peerID
