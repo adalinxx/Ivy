@@ -71,7 +71,8 @@ extension Ivy {
             let canonical = PeerEndpoint(
                 publicKey: key.hex,
                 host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
-                port: endpoint.port)
+                port: endpoint.port,
+                transport: endpoint.transport)
             accepted.append(ProviderHint(
                 peer: key.peerID,
                 endpoint: canonical,
@@ -448,7 +449,11 @@ extension Ivy {
 
     func localProviderEndpoint() -> PeerEndpoint? {
         guard let address = advertisedListenAddresses(observedLocalHost: nil).first else { return nil }
-        return PeerEndpoint(publicKey: localKey.hex, host: address.host, port: address.port)
+        return PeerEndpoint(
+            publicKey: localKey.hex,
+            host: address.host,
+            port: address.port,
+            transport: address.transport)
     }
 
     func providerEndpoint(for peer: PeerID) -> PeerEndpoint? {

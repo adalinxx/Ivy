@@ -399,11 +399,13 @@ public struct PeerEndpoint: Sendable, Equatable, Hashable {
     public let publicKey: String
     public let host: String
     public let port: UInt16
+    public let transport: TransportKind
 
-    public init(publicKey: String, host: String, port: UInt16) {
+    public init(publicKey: String, host: String, port: UInt16, transport: TransportKind = .tcp) {
         self.publicKey = publicKey
         self.host = host
         self.port = port
+        self.transport = transport
     }
 }
 
@@ -414,6 +416,7 @@ private extension Data {
             guard appendLengthPrefixedString(endpoint.publicKey),
                   appendLengthPrefixedString(endpoint.host) else { return false }
             appendUInt16(endpoint.port)
+            append(endpoint.transport.rawValue)
         }
         return true
     }
@@ -425,6 +428,7 @@ private extension Data {
             guard appendLengthPrefixedString(endpoint.publicKey),
                   appendLengthPrefixedString(endpoint.host) else { return false }
             appendUInt16(endpoint.port)
+            append(endpoint.transport.rawValue)
             appendUInt64(record.expiresAt)
         }
         return true
@@ -437,8 +441,15 @@ private extension DataReader {
         var endpoints: [PeerEndpoint] = []
         endpoints.reserveCapacity(Int(count))
         for _ in 0..<count {
-            guard let publicKey = readString(), let host = readString(), let port = readUInt16() else { return nil }
-            endpoints.append(PeerEndpoint(publicKey: publicKey, host: host, port: port))
+            guard let publicKey = readString(),
+                  let host = readString(),
+                  let port = readUInt16(),
+                  let transport = readTransportKind() else { return nil }
+            endpoints.append(PeerEndpoint(
+                publicKey: publicKey,
+                host: host,
+                port: port,
+                transport: transport))
         }
         return endpoints
     }
@@ -451,12 +462,22 @@ private extension DataReader {
             guard let publicKey = readString(),
                   let host = readString(),
                   let port = readUInt16(),
+                  let transport = readTransportKind(),
                   let expiresAt = readUInt64() else { return nil }
             records.append(ProviderRecord(
-                endpoint: PeerEndpoint(publicKey: publicKey, host: host, port: port),
+                endpoint: PeerEndpoint(
+                    publicKey: publicKey,
+                    host: host,
+                    port: port,
+                    transport: transport),
                 expiresAt: expiresAt))
         }
         return records
+    }
+
+    mutating func readTransportKind() -> TransportKind? {
+        guard let tag = readUInt8() else { return nil }
+        return TransportKind(rawValue: tag)
     }
 
     mutating func readStrings(max: UInt16) -> [String]? {

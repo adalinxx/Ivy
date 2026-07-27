@@ -9,14 +9,18 @@ enum SessionProtocolError: Error, Equatable {
 public struct ListenAddress: Sendable, Hashable, Comparable {
     public let host: String
     public let port: UInt16
+    public let transport: TransportKind
 
-    public init(host: String, port: UInt16) {
+    public init(host: String, port: UInt16, transport: TransportKind = .tcp) {
         self.host = host
         self.port = port
+        self.transport = transport
     }
 
     public static func < (lhs: ListenAddress, rhs: ListenAddress) -> Bool {
-        lhs.host == rhs.host ? lhs.port < rhs.port : lhs.host < rhs.host
+        if lhs.host != rhs.host { return lhs.host < rhs.host }
+        if lhs.port != rhs.port { return lhs.port < rhs.port }
+        return lhs.transport.rawValue < rhs.transport.rawValue
     }
 }
 
@@ -37,6 +41,7 @@ public struct PeerMetadata: Sendable, Equatable {
         for address in listenAddresses {
             guard bytes.appendSessionString(address.host) else { return nil }
             bytes.appendUInt16(address.port)
+            bytes.append(address.transport.rawValue)
         }
         return bytes.count <= Self.maxEncodedSize ? bytes : nil
     }
@@ -50,10 +55,13 @@ public struct PeerMetadata: Sendable, Equatable {
         }
         var addresses: [ListenAddress] = []
         for _ in 0..<addressCount {
-            guard let host = reader.readString(), let port = reader.readUInt16() else {
+            guard let host = reader.readString(),
+                  let port = reader.readUInt16(),
+                  let tag = reader.readUInt8(),
+                  let transport = TransportKind(rawValue: tag) else {
                 throw SessionProtocolError.malformed
             }
-            addresses.append(ListenAddress(host: host, port: port))
+            addresses.append(ListenAddress(host: host, port: port, transport: transport))
         }
 
         guard reader.isAtEnd else { throw SessionProtocolError.malformed }

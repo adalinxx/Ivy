@@ -17,6 +17,9 @@ public struct IvyConfig: Sendable {
     public var publicKey: String { peerKey.hex }
     public let mode: IvyMode
     public let listenPort: UInt16
+    /// UDP port for the QUIC listener. Defaults to `listenPort`; the TCP and UDP
+    /// port spaces are independent, so sharing the number is normal.
+    public let quicListenPort: UInt16?
     public let bootstrapPeers: [PeerEndpoint]
     /// Authenticated private-plane peers whose application messages must not
     /// be silently discarded by the receiver's local Tally policy.
@@ -49,6 +52,7 @@ public struct IvyConfig: Sendable {
     public init(
         signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
+        quicListenPort: UInt16? = nil,
         bootstrapPeers: [PeerEndpoint] = [],
         inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         tallyConfig: TallyConfig = .default,
@@ -78,6 +82,7 @@ public struct IvyConfig: Sendable {
         self.peerKey = try! PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation)
         self.mode = mode
         self.listenPort = listenPort
+        self.quicListenPort = quicListenPort
         self.bootstrapPeers = bootstrapPeers
         self.inboundAdmissionBypassPeerKeys = inboundAdmissionBypassPeerKeys
         self.carriers = carriers
@@ -101,6 +106,13 @@ public struct IvyConfig: Sendable {
         self.minPeerKeyBits = minPeerKeyBits
         self.maxContentCandidates = maxContentCandidates
         self.externalAddress = externalAddress
+    }
+
+    public func listenPort(for kind: TransportKind) -> UInt16 {
+        switch kind {
+        case .tcp: return listenPort
+        case .quic: return quicListenPort ?? listenPort
+        }
     }
 
     public func validate() throws {
