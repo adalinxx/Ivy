@@ -12,6 +12,7 @@ public enum IvyError: Error, Sendable, Equatable {
     case connectionInProgress
     case identityVerificationFailed
     case noRelayAvailable
+    case unsupportedTransport
 }
 
 struct PendingNeighborResponse: Sendable {
@@ -133,6 +134,7 @@ public actor Ivy {
     let localKey: PeerKey
     let group: EventLoopGroup
     let inboundByteBudget: InboundByteBudget
+    private let transports: [TransportKind: any IvyTransport]
 
     public weak var delegate: IvyDelegate?
     var contentSource: (any IvyContentSource)?
@@ -157,7 +159,7 @@ public actor Ivy {
     var connectedEndpointPeers: [PeerID] {
         sessions.values.compactMap { $0.role == .endpoint ? $0.peerKey.peerID : nil }
     }
-    var serverChannel: Channel?
+    var listeners: [any TransportListenerHandle] = []
     var running = false
     private var lifecycleTail: Task<Void, Never>?
     var runGeneration: UInt64 = 0
@@ -200,8 +202,16 @@ public actor Ivy {
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]
     var nextWireOperationID: UInt64 = 0
 
-    public init(config: IvyConfig, group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton, tally: Tally? = nil) {
+    public init(
+        config: IvyConfig,
+        group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
+        tally: Tally? = nil,
+        transports: [any IvyTransport] = [TCPTransport()]
+    ) {
         self.config = config
+        self.transports = Dictionary(
+            transports.map { ($0.kind, $0) },
+            uniquingKeysWith: { first, _ in first })
         self.localID = PeerID(publicKey: config.publicKey)
         self.localKey = config.peerKey
         self.tally = tally ?? Tally(config: config.tallyConfig)
@@ -231,15 +241,16 @@ public actor Ivy {
     }
 
     private func startNow() async throws {
-        guard !running, serverChannel == nil else { return }
+        guard !running, listeners.isEmpty else { return }
         try config.validate()
+        guard !transports.isEmpty else { throw IvyError.unsupportedTransport }
         runGeneration &+= 1
         let generation = runGeneration
 #if DEBUG || IVY_TESTING
         await lifecycleStartHookForTesting?()
 #endif
-        let listener = try await startListener(generation: generation)
-        serverChannel = listener.channel
+        let listener = try await startListeners(generation: generation)
+        listeners = listener.handles
         inboundAdmissionGate = listener.gate
         running = true
         publicAddressDiscoveryTask?.cancel()
@@ -321,7 +332,7 @@ public actor Ivy {
     }
 
     private func stopNow() async {
-        guard running || serverChannel != nil else {
+        guard running || !listeners.isEmpty else {
             cleanupAllPending()
             return
         }
@@ -336,8 +347,8 @@ public actor Ivy {
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
-        try? await serverChannel?.close().get()
-        serverChannel = nil
+        for listener in listeners { await listener.close() }
+        listeners.removeAll()
         let authenticatedConnections = sessions.values.map(\.connection)
         sessions.removeAll()
         for connection in authenticatedConnections {
@@ -589,6 +600,7 @@ public actor Ivy {
                     publicKey: key.hex,
                     host: rewritten.host,
                     port: rewritten.port),
+                transport: try transport(for: .tcp),
                 group: group,
                 inboundByteBudget: inboundByteBudget)
         } catch {
@@ -2866,7 +2878,7 @@ public actor Ivy {
         lifecycleTail?.cancel()
         publicAddressDiscoveryTask?.cancel()
         routingRefreshTimer?.cancel()
-        serverChannel?.close(promise: nil)
+        for listener in listeners { listener.closeImmediately() }
         for reconnect in reconnectTasks.values { reconnect.task.cancel() }
         for route in relayRoutes.values { route.expiryTask?.cancel() }
         for route in installedRoutes.values {
@@ -3294,48 +3306,57 @@ public actor Ivy {
     var sentContentRepliesForTesting: [UUID] { contentReplyConnectionsForTesting }
 #endif
 
-    func startListener(
+    /// Binds one listener per installed transport, all sharing a single admission gate
+    /// so capacity and netgroup diversity are accounted across transports (IVY-001).
+    func startListeners(
         generation: UInt64
-    ) async throws -> (channel: Channel, gate: InboundAdmissionGate) {
+    ) async throws -> (handles: [any TransportListenerHandle], gate: InboundAdmissionGate) {
         let gate = InboundAdmissionGate(
             maxConnections: config.maxInboundConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
         let inboundByteBudget = self.inboundByteBudget
-        let bootstrap = ServerBootstrap(group: group)
-            .serverChannelOption(.backlog, value: 256)
-            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .childChannelOption(ChannelOptions.autoRead, value: false)
-            .childChannelInitializer { [weak self] channel in
-                guard let self else { return channel.close() }
-                let connectionBudget = InboundByteBudget(
-                    limit: PeerConnection.maxInboundBufferedBytes)
-                do {
-                    try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
-                        budget: inboundByteBudget,
-                        connectionBudget: connectionBudget))
-                    let directInbound = try NIOAsyncChannel<InboundFrame, Never>(
-                        wrappingChannelSynchronously: channel,
-                        configuration: .init(backPressureStrategy: .init(
-                            lowWatermark: 1,
-                            highWatermark: 1)))
-                    let acceptor = InboundConnectionAcceptor(
-                        ivy: self,
-                        generation: generation,
-                        admissionGate: gate,
-                        inboundByteBudget: inboundByteBudget,
-                        connectionInboundByteBudget: connectionBudget,
-                        directInbound: directInbound)
-                    return channel.pipeline.addHandler(acceptor)
-                } catch {
-                    return channel.eventLoop.makeFailedFuture(error)
-                }
+        let streamInitializer: @Sendable (Channel) -> EventLoopFuture<Void> = { [weak self] channel in
+            guard let self else { return channel.close() }
+            let connectionBudget = InboundByteBudget(
+                limit: PeerConnection.maxInboundBufferedBytes)
+            do {
+                let directInbound = try PeerConnection.installFraming(
+                    channel: channel,
+                    inboundByteBudget: inboundByteBudget,
+                    connectionInboundByteBudget: connectionBudget)
+                let acceptor = InboundConnectionAcceptor(
+                    ivy: self,
+                    generation: generation,
+                    admissionGate: gate,
+                    inboundByteBudget: inboundByteBudget,
+                    connectionInboundByteBudget: connectionBudget,
+                    directInbound: directInbound)
+                return channel.pipeline.addHandler(acceptor)
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
             }
+        }
 
-        let channel = try await bootstrap
-            .bind(host: "0.0.0.0", port: Int(config.listenPort))
-            .get()
+        var handles: [any TransportListenerHandle] = []
+        do {
+            for transport in transports.values.sorted(by: { $0.kind.rawValue < $1.kind.rawValue }) {
+                handles.append(try await transport.listen(
+                    host: "0.0.0.0",
+                    port: config.listenPort,
+                    group: group,
+                    streamInitializer: streamInitializer))
+            }
+        } catch {
+            for handle in handles { await handle.close() }
+            throw error
+        }
 
-        return (channel, gate)
+        return (handles, gate)
+    }
+
+    func transport(for kind: TransportKind) throws -> any IvyTransport {
+        guard let transport = transports[kind] else { throw IvyError.unsupportedTransport }
+        return transport
     }
 
 }

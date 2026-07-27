@@ -39,7 +39,7 @@ struct InboundAdmissionTests {
             reservedOutboundConnectionSlots: 1,
             maxConnectionsPerNetgroup: 2))
         try await ivy.start()
-        let port = try #require(await ivy.serverChannel?.localAddress?.port)
+        let port = Int(try #require(await ivy.listeners.first?.localPort))
 
         let first = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connect(host: "127.0.0.1", port: port).get()
@@ -223,7 +223,7 @@ struct InboundAdmissionTests {
         try await restarting.value
 
         #expect(await ivy.running)
-        #expect(await ivy.serverChannel != nil)
+        #expect(await !ivy.listeners.isEmpty)
         await ivy.stop()
     }
 
