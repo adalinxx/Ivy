@@ -126,6 +126,33 @@ struct InboundFrame: Sendable {
     }
 }
 
+private final class WritabilityWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var result: Bool?
+
+    func install(_ continuation: CheckedContinuation<Bool, Never>) {
+        let result = lock.withLock { () -> Bool? in
+            guard let result = self.result else {
+                self.continuation = continuation
+                return nil
+            }
+            return result
+        }
+        if let result { continuation.resume(returning: result) }
+    }
+
+    func resume(_ result: Bool) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            guard self.result == nil else { return nil }
+            self.result = result
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: result)
+    }
+}
+
 final class PeerConnection: @unchecked Sendable {
     static let maxInboundBufferedRecords = 4
     static let maxInboundBufferedBytes = 2 * Int(IvyConfig.protocolMaxFrameSize) + 4
@@ -139,14 +166,30 @@ final class PeerConnection: @unchecked Sendable {
         case relayed(routeID: Data, carrier: PeerKey)
     }
 
+    enum SendResult: Sendable, Equatable {
+        case sent
+        case backpressured
+        case locallyRejected
+        case notConnected
+    }
+
+    enum SendReadiness: Sendable, Equatable {
+        case ready
+        case backpressured
+        case notConnected
+    }
+
     let transport: Transport
     let inboundBufferLimit: Int
     private let stateLock = NSLock()
     private var closed = false
+    private var writable: Bool
     private var closeHandler: (@Sendable () -> Void)?
+    private var writabilityWaiters: [UUID: WritabilityWaiter] = [:]
     private var inboundAdmission: InboundAdmissionLease?
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
+    private let directInbound: NIOAsyncChannel<InboundFrame, Never>?
     private let inbound: AsyncStream<InboundFrame>
     private let inboundContinuation: AsyncStream<InboundFrame>.Continuation
 
@@ -167,6 +210,7 @@ final class PeerConnection: @unchecked Sendable {
     init(
         endpoint: PeerEndpoint,
         channel: Channel,
+        directInbound: NIOAsyncChannel<InboundFrame, Never>? = nil,
         inboundAdmission: InboundAdmissionLease? = nil,
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
@@ -174,10 +218,12 @@ final class PeerConnection: @unchecked Sendable {
     ) {
         self.endpoint = endpoint
         self.transport = .direct(channel)
+        self.writable = channel.isWritable
         self.inboundAdmission = inboundAdmission
         self.inboundByteBudget = inboundByteBudget
         self.connectionInboundByteBudget = connectionInboundByteBudget
             ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
+        self.directInbound = directInbound
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
             bufferingPolicy: .bufferingOldest(inboundBufferLimit))
@@ -193,9 +239,11 @@ final class PeerConnection: @unchecked Sendable {
     ) {
         self.endpoint = endpoint
         self.transport = .relayed(routeID: routeID, carrier: carrier)
+        self.writable = false
         self.inboundByteBudget = inboundByteBudget
         self.connectionInboundByteBudget = connectionInboundByteBudget
             ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
+        self.directInbound = nil
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
             bufferingPolicy: .bufferingOldest(inboundBufferLimit))
@@ -209,47 +257,106 @@ final class PeerConnection: @unchecked Sendable {
         let connectionInboundByteBudget = InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(5))
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(SessionFrameDecoder(
+        let connection: PeerConnection = try await bootstrap.connect(
+            host: endpoint.host,
+            port: Int(endpoint.port)
+        ) { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
                     budget: inboundByteBudget,
                     connectionBudget: connectionInboundByteBudget))
+                let inbound = try NIOAsyncChannel<InboundFrame, Never>(
+                    wrappingChannelSynchronously: channel,
+                    configuration: .init(backPressureStrategy: .init(
+                        lowWatermark: 1,
+                        highWatermark: 1)))
+                let connection = PeerConnection(
+                    endpoint: endpoint,
+                    channel: channel,
+                    directInbound: inbound,
+                    inboundByteBudget: inboundByteBudget,
+                    connectionInboundByteBudget: connectionInboundByteBudget)
+                try channel.pipeline.syncOperations.addHandler(
+                    PeerConnectionLifecycleHandler(connection: connection))
+                return channel.eventLoop.makeSucceededFuture(connection)
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
             }
-
-        let channel = try await bootstrap.connect(host: endpoint.host, port: Int(endpoint.port)).get()
-        let connection = PeerConnection(
-            endpoint: endpoint,
-            channel: channel,
-            inboundByteBudget: inboundByteBudget,
-            connectionInboundByteBudget: connectionInboundByteBudget)
-        connection.observedHost = channel.remoteAddress?.ipAddress
-        try await channel.pipeline.addHandler(PeerChannelHandler(connection: connection)).get()
+        }
+        connection.observedHost = connection.channel?.remoteAddress?.ipAddress
         return connection
     }
 
     @discardableResult
-    func sendRecord(_ record: SessionWireRecord) -> Bool {
+    func sendRecord(_ record: SessionWireRecord) -> SendResult {
         sendSerializedRecord(record.serialize())
     }
 
     @discardableResult
-    func sendSerializedRecord(_ payload: Data) -> Bool {
-        guard !isClosed,
-              !payload.isEmpty,
-              payload.count <= Int(IvyConfig.protocolMaxFrameSize) else { return false }
+    func sendSerializedRecord(_ payload: Data) -> SendResult {
+        guard !payload.isEmpty,
+              payload.count <= Int(IvyConfig.protocolMaxFrameSize) else {
+            return .locallyRejected
+        }
+        switch sendReadiness() {
+        case .ready:
+            break
+        case .backpressured:
+            return .backpressured
+        case .notConnected:
+            return .notConnected
+        }
         switch transport {
         case .direct(let channel):
-            guard channel.isActive, channel.isWritable else { return false }
             var buffer = channel.allocator.buffer(capacity: 4 + payload.count)
             buffer.writeInteger(UInt32(payload.count), endianness: .big)
             buffer.writeBytes(payload)
             channel.writeAndFlush(buffer, promise: nil)
         case .relayed:
-            return false
+            return .notConnected
         }
-        return true
+        return .sent
+    }
+
+    func sendReadiness() -> SendReadiness {
+        stateLock.withLock {
+            guard !closed else { return .notConnected }
+            return writable ? .ready : .backpressured
+        }
+    }
+
+    func waitUntilWritable() async -> Bool {
+        guard channel != nil else { return false }
+        let id = UUID()
+        let waiter = WritabilityWaiter()
+        let result = stateLock.withLock { () -> Bool? in
+            guard !closed else { return false }
+            guard !writable else { return true }
+            writabilityWaiters[id] = waiter
+            return nil
+        }
+        if let result { return result }
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { waiter.install($0) }
+        }, onCancel: {
+            self.finishWritabilityWaiter(id, result: false)
+        })
+    }
+
+    func channelWritabilityChanged(isWritable: Bool) {
+        let waiters = stateLock.withLock { () -> [WritabilityWaiter] in
+            guard !closed else { return [] }
+            writable = isWritable
+            guard isWritable else { return [] }
+            let waiters = Array(writabilityWaiters.values)
+            writabilityWaiters.removeAll()
+            return waiters
+        }
+        for waiter in waiters { waiter.resume(true) }
     }
 
     var records: AsyncStream<InboundFrame> { inbound }
+    var directInboundStream: NIOAsyncChannel<InboundFrame, Never>? { directInbound }
     var isDirect: Bool { if case .direct = transport { return true }; return false }
     var isLive: Bool { !isClosed && (channel?.isActive ?? true) }
 
@@ -267,6 +374,20 @@ final class PeerConnection: @unchecked Sendable {
             defer { closeHandler = nil }
             return (true, closeHandler)
         }
+    }
+
+    private func finishWritabilityWaiter(_ id: UUID, result: Bool) {
+        let waiter = stateLock.withLock { writabilityWaiters.removeValue(forKey: id) }
+        waiter?.resume(result)
+    }
+
+    private func finishWritabilityWaiters(result: Bool) {
+        let waiters = stateLock.withLock { () -> [WritabilityWaiter] in
+            let waiters = Array(writabilityWaiters.values)
+            writabilityWaiters.removeAll()
+            return waiters
+        }
+        for waiter in waiters { waiter.resume(result) }
     }
 
     func installCloseHandler(_ handler: @escaping @Sendable () -> Void) {
@@ -319,6 +440,7 @@ final class PeerConnection: @unchecked Sendable {
         let state = markClosed()
         guard state.didClose else { return }
         releaseInboundAdmission()
+        finishWritabilityWaiters(result: false)
         inboundContinuation.finish()
         state.closeHandler?()
     }
@@ -327,6 +449,7 @@ final class PeerConnection: @unchecked Sendable {
         let state = markClosed()
         guard state.didClose else { return }
         releaseInboundAdmission()
+        finishWritabilityWaiters(result: false)
         channel?.close(promise: nil)
         inboundContinuation.finish()
         state.closeHandler?()
@@ -433,7 +556,7 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
     }
 }
 
-final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
+final class PeerConnectionLifecycleHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = InboundFrame
 
     let connection: PeerConnection
@@ -443,13 +566,16 @@ final class PeerChannelHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        if !connection.feedFrame(unwrapInboundIn(data)) {
-            context.close(promise: nil)
-        }
+        context.fireChannelRead(data)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
         connection.connectionClosed()
+    }
+
+    func channelWritabilityChanged(context: ChannelHandlerContext) {
+        connection.channelWritabilityChanged(isWritable: context.channel.isWritable)
+        context.fireChannelWritabilityChanged()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
@@ -465,6 +591,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     private let admissionGate: InboundAdmissionGate
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
+    private let directInbound: NIOAsyncChannel<InboundFrame, Never>
     private var connection: PeerConnection?
 
     init(
@@ -472,13 +599,15 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
         generation: UInt64,
         admissionGate: InboundAdmissionGate,
         inboundByteBudget: InboundByteBudget,
-        connectionInboundByteBudget: InboundByteBudget
+        connectionInboundByteBudget: InboundByteBudget,
+        directInbound: NIOAsyncChannel<InboundFrame, Never>
     ) {
         self.ivy = ivy
         self.generation = generation
         self.admissionGate = admissionGate
         self.inboundByteBudget = inboundByteBudget
         self.connectionInboundByteBudget = connectionInboundByteBudget
+        self.directInbound = directInbound
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -496,6 +625,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
         let connection = PeerConnection(
             endpoint: endpoint,
             channel: channel,
+            directInbound: directInbound,
             inboundAdmission: lease,
             inboundByteBudget: inboundByteBudget,
             connectionInboundByteBudget: connectionInboundByteBudget)
@@ -518,14 +648,17 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        if connection?.feedFrame(unwrapInboundIn(data)) == false {
-            context.close(promise: nil)
-        }
+        context.fireChannelRead(data)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
         connection?.connectionClosed()
         connection = nil
+    }
+
+    func channelWritabilityChanged(context: ChannelHandlerContext) {
+        connection?.channelWritabilityChanged(isWritable: context.channel.isWritable)
+        context.fireChannelWritabilityChanged()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

@@ -243,6 +243,7 @@ extension IvyConfig {
         signingKey: Data = Data(),
         logger: any IvyLogger = NullLogger(),
         maxConnections: Int = IvyConfig.defaultMaxConnections,
+        reservedOutboundConnectionSlots: Int = 0,
         maxConnectionsPerNetgroup: Int = 2,
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
@@ -251,6 +252,7 @@ extension IvyConfig {
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
     ) {
@@ -273,6 +275,7 @@ extension IvyConfig {
             routingRefreshInterval: routingRefreshInterval,
             logger: logger,
             maxConnections: maxConnections,
+            reservedOutboundConnectionSlots: reservedOutboundConnectionSlots,
             maxConnectionsPerNetgroup: maxConnectionsPerNetgroup,
             maxPendingRequests: maxPendingRequests,
             maxWaitersPerRequest: maxWaitersPerRequest,
@@ -281,6 +284,7 @@ extension IvyConfig {
             maxContentCandidates: maxContentCandidates,
             externalAddress: externalAddress,
             relayEnabled: relayEnabled,
+            privateContentExchangeEnabled: privateContentExchangeEnabled,
             carriers: carriers,
             mode: mode)
     }

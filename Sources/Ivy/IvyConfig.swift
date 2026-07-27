@@ -18,6 +18,9 @@ public struct IvyConfig: Sendable {
     public let mode: IvyMode
     public let listenPort: UInt16
     public let bootstrapPeers: [PeerEndpoint]
+    /// Authenticated private-plane peers whose application messages must not
+    /// be silently discarded by the receiver's local Tally policy.
+    public let inboundAdmissionBypassPeerKeys: Set<PeerKey>
     public let carriers: [PeerEndpoint]
     public let tallyConfig: TallyConfig
     public let kBucketSize: Int
@@ -28,6 +31,8 @@ public struct IvyConfig: Sendable {
     public let routingRefreshInterval: Duration
     public let logger: any IvyLogger
     public let maxConnections: Int
+    /// Slots held back from inbound handshakes so an outbound configured peer can connect.
+    public let reservedOutboundConnectionSlots: Int
     public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
     public let maxWaitersPerRequest: Int
@@ -37,11 +42,15 @@ public struct IvyConfig: Sendable {
     public let minPeerKeyBits: Int
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
+    /// Enables direct exact-CID request/response messages on a private network.
+    /// Public overlays always support content exchange.
+    public let privateContentExchangeEnabled: Bool
 
     public init(
         signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
         bootstrapPeers: [PeerEndpoint] = [],
+        inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         tallyConfig: TallyConfig = .default,
         kBucketSize: Int = 20,
         requestTimeout: Duration = .seconds(15),
@@ -51,6 +60,7 @@ public struct IvyConfig: Sendable {
         routingRefreshInterval: Duration = .seconds(120),
         logger: any IvyLogger = NullLogger(),
         maxConnections: Int = IvyConfig.defaultMaxConnections,
+        reservedOutboundConnectionSlots: Int = 0,
         maxConnectionsPerNetgroup: Int = 2,
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
@@ -60,6 +70,7 @@ public struct IvyConfig: Sendable {
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
     ) {
@@ -68,9 +79,11 @@ public struct IvyConfig: Sendable {
         self.mode = mode
         self.listenPort = listenPort
         self.bootstrapPeers = bootstrapPeers
+        self.inboundAdmissionBypassPeerKeys = inboundAdmissionBypassPeerKeys
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
+        self.privateContentExchangeEnabled = privateContentExchangeEnabled
         self.tallyConfig = tallyConfig
         self.kBucketSize = kBucketSize
         self.requestTimeout = requestTimeout
@@ -79,6 +92,7 @@ public struct IvyConfig: Sendable {
         self.routingRefreshInterval = routingRefreshInterval
         self.logger = logger
         self.maxConnections = maxConnections
+        self.reservedOutboundConnectionSlots = reservedOutboundConnectionSlots
         self.maxConnectionsPerNetgroup = maxConnectionsPerNetgroup
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
@@ -97,6 +111,10 @@ public struct IvyConfig: Sendable {
               maxConcurrentContentRequests > 0,
               maxContentCandidates > 0 else {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
+        }
+        guard (0...maxConnections).contains(reservedOutboundConnectionSlots) else {
+            throw IvyModeError.invalidConfiguration(
+                "reserved outbound connection slots must fit within maxConnections")
         }
         guard maxInboundBufferedBytes >= Int(IvyConfig.protocolMaxFrameSize) + 4 else {
             throw IvyModeError.invalidConfiguration(
@@ -124,6 +142,10 @@ public struct IvyConfig: Sendable {
                     "externalAddress must be an IP literal with a nonzero port")
             }
         }
+        if case .privateNetwork = mode, relayEnabled || !carriers.isEmpty {
+            throw IvyModeError.invalidConfiguration(
+                "private network does not support relay transport")
+        }
 
         let pinned = try mode.pinnedKey()
         if pinned == peerKey {
@@ -145,6 +167,7 @@ public struct IvyConfig: Sendable {
             }
         }
 
+        var bootstrapKeys = Set<PeerKey>()
         for endpoint in bootstrapPeers {
             guard endpointIsDialable(endpoint) else {
                 throw IvyModeError.invalidConfiguration("bootstrap endpoint must be dialable")
@@ -152,6 +175,7 @@ public struct IvyConfig: Sendable {
             guard let key = try? PeerKey(endpoint.publicKey) else {
                 throw IvyModeError.invalidEndpointIdentity(endpoint.publicKey)
             }
+            bootstrapKeys.insert(key)
             guard !carrierKeys.contains(key) else {
                 throw IvyModeError.identityRoleCollision(endpoint.publicKey)
             }
@@ -161,6 +185,19 @@ public struct IvyConfig: Sendable {
             if let pinned, key != pinned {
                 throw IvyModeError.peerOutsidePinnedMode(expected: pinned.hex, actual: endpoint.publicKey)
             }
+        }
+        guard inboundAdmissionBypassPeerKeys.isEmpty || mode == .privateNetwork else {
+            throw IvyModeError.invalidConfiguration(
+                "inbound admission bypass is private-network only"
+            )
+        }
+        guard !inboundAdmissionBypassPeerKeys.contains(peerKey) else {
+            throw IvyModeError.identityRoleCollision(peerKey.hex)
+        }
+        guard inboundAdmissionBypassPeerKeys.isSubset(of: bootstrapKeys) else {
+            throw IvyModeError.invalidConfiguration(
+                "inbound admission bypass peers must be configured bootstrap peers"
+            )
         }
     }
 
@@ -175,5 +212,9 @@ public struct IvyConfig: Sendable {
 
     func allowsEndpoint(_ key: PeerKey) -> Bool {
         key != peerKey && mode.allowsEndpoint(key) && !isConfiguredCarrier(key)
+    }
+
+    var maxInboundConnections: Int {
+        maxConnections - reservedOutboundConnectionSlots
     }
 }

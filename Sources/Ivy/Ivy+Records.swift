@@ -9,10 +9,10 @@ struct ProviderHint: Sendable, Equatable {
 
 struct PendingProviderQuery {
     let requestID: UInt64
-    var continuations: [CheckedContinuation<[PeerEndpoint], Never>]
+    var continuations: [UUID: CheckedContinuation<[PeerEndpoint], Never>]
     var expectedPeers: Set<String>
     var responsesByPeer: [String: [ProviderHint]]
-    var timeoutTask: Task<Void, Never>? = nil
+    var timeoutTask: IvyTimer? = nil
 }
 
 extension Ivy {
@@ -20,6 +20,7 @@ extension Ivy {
     static let maxProviderTTL: UInt64 = 24 * 60 * 60
 
     func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
+        guard config.mode.usesOverlayServices else { return }
         evictExpiredProviders(rootCID: rootCID)
         let records = providerRecordsForWire(providerHints[rootCID] ?? [])
         fireToPeer(
@@ -53,7 +54,8 @@ extension Ivy {
         records: [ProviderRecord],
         from peer: PeerID
     ) {
-        guard var pending = pendingProviderQueries[rootCID],
+        guard config.mode.usesOverlayServices,
+              var pending = pendingProviderQueries[rootCID],
               pending.requestID == requestID,
               pending.expectedPeers.remove(peer.publicKey) != nil else { return }
 
@@ -84,7 +86,8 @@ extension Ivy {
     }
 
     func handleAnnounceProvider(rootCID: String, expiresAt: UInt64, from peer: PeerID) {
-        guard providerExpiryIsValid(expiresAt),
+        guard config.mode.usesOverlayServices,
+              providerExpiryIsValid(expiresAt),
               shouldStoreProviderHint(rootCID: rootCID) else { return }
         storeProviderHint(
             rootCID: rootCID,
@@ -94,7 +97,9 @@ extension Ivy {
     }
 
     public func announceProvider(rootCID: String, expiresAt: UInt64) {
-        guard MessageLimits.accepts(rootCID), providerExpiryIsValid(expiresAt) else { return }
+        guard config.mode.usesOverlayServices,
+              MessageLimits.accepts(rootCID),
+              providerExpiryIsValid(expiresAt) else { return }
         if let endpoint = localProviderEndpoint() {
             storeProviderHint(
                 rootCID: rootCID,
@@ -111,7 +116,7 @@ extension Ivy {
 
     public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
         let generation = runGeneration
-        guard MessageLimits.accepts(rootCID) else { return [] }
+        guard config.mode.usesOverlayServices, MessageLimits.accepts(rootCID) else { return [] }
         let cached = cachedProviderEndpoints(rootCID: rootCID)
         return cached.isEmpty
             ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(
@@ -129,13 +134,17 @@ extension Ivy {
         rootCID: String,
         generation: UInt64
     ) async -> [PeerEndpoint] {
-        guard isCurrentRun(generation), MessageLimits.accepts(rootCID) else { return [] }
+        guard config.mode.usesOverlayServices,
+              isCurrentRun(generation),
+              !Task.isCancelled,
+              MessageLimits.accepts(rootCID) else { return [] }
         var targets = providerLookupTargets(rootCID: rootCID)
         if targets.isEmpty {
             _ = await findNode(target: rootCID, generation: generation)
-            guard isCurrentRun(generation) else { return [] }
+            guard isCurrentRun(generation), !Task.isCancelled else { return [] }
             targets = providerLookupTargets(rootCID: rootCID)
         }
+        guard !Task.isCancelled else { return [] }
         return await queryProviders(
             rootCID: rootCID,
             targets: targets,
@@ -152,7 +161,7 @@ extension Ivy {
         targets: [Router.BucketEntry],
         generation: UInt64? = nil
     ) async -> [PeerEndpoint] {
-        if let generation, !isCurrentRun(generation) { return [] }
+        if Task.isCancelled || generation.map({ !isCurrentRun($0) }) == true { return [] }
         var seenTargets: Set<String> = []
         let boundedTargets = targets.filter {
             seenTargets.insert($0.id.publicKey).inserted
@@ -165,44 +174,53 @@ extension Ivy {
             return []
         }
 
-        let endpoints = await withCheckedContinuation { continuation in
-            if var pending = pendingProviderQueries[rootCID] {
-                pending.continuations.append(continuation)
-                pendingProviderQueries[rootCID] = pending
-                return
-            }
-
-            let requestID = makeProviderRequestID()
-            var pending = PendingProviderQuery(
-                requestID: requestID,
-                continuations: [continuation],
-                expectedPeers: [],
-                responsesByPeer: [:])
-            for target in boundedTargets {
-                if case .enqueued = fireToPeer(
-                    target.id,
-                    .findProviders(rootCID: rootCID, requestID: requestID)) {
-                    pending.expectedPeers.insert(target.id.publicKey)
+        let waiterID = UUID()
+        let endpoints = await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return [PeerEndpoint]() }
+            return await withCheckedContinuation {
+                (continuation: CheckedContinuation<[PeerEndpoint], Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: [])
+                    return
                 }
+                if var pending = pendingProviderQueries[rootCID] {
+                    pending.continuations[waiterID] = continuation
+                    pendingProviderQueries[rootCID] = pending
+                    return
+                }
+
+                let requestID = makeProviderRequestID()
+                var pending = PendingProviderQuery(
+                    requestID: requestID,
+                    continuations: [waiterID: continuation],
+                    expectedPeers: [],
+                    responsesByPeer: [:])
+                for target in boundedTargets {
+                    if case .enqueued = fireToPeer(
+                        target.id,
+                        .findProviders(rootCID: rootCID, requestID: requestID)) {
+                        pending.expectedPeers.insert(target.id.publicKey)
+                    }
+                }
+                guard !pending.expectedPeers.isEmpty else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                pendingProviderQueries[rootCID] = pending
+                let timeoutTask = delayedTask(after: .milliseconds(500)) { [weak self] in
+                    await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
+                }
+                pendingProviderQueries[rootCID]?.timeoutTask = timeoutTask
             }
-            guard !pending.expectedPeers.isEmpty else {
-                continuation.resume(returning: [])
-                return
-            }
-            pendingProviderQueries[rootCID] = pending
-            let timeoutTask = delayedTask(after: .milliseconds(500)) { [weak self] in
-                await self?.resolveProviderQuery(rootCID: rootCID, requestID: requestID)
-            }
-            pendingProviderQueries[rootCID]?.timeoutTask = timeoutTask
+        } onCancel: {
+            Task { await self.cancelProviderQueryWaiter(rootCID, waiterID: waiterID) }
         }
-        if let generation, !isCurrentRun(generation) { return [] }
+        if Task.isCancelled || generation.map({ !isCurrentRun($0) }) == true { return [] }
         return endpoints
     }
 
     private func makeProviderRequestID() -> UInt64 {
-        makeWireOperationID { requestID in
-            pendingProviderQueries.values.contains { $0.requestID == requestID }
-        }
+        makeWireOperationID(avoiding: Set(pendingProviderQueries.values.map(\.requestID)))
     }
 
     func resolveProviderQuery(rootCID: String, requestID: UInt64) {
@@ -219,9 +237,22 @@ extension Ivy {
                 expiresAt: hint.expiresAt)
         }
         let endpoints = hints.compactMap(\.endpoint)
-        for continuation in pending.continuations {
+        for continuation in pending.continuations.values {
             continuation.resume(returning: endpoints)
         }
+    }
+
+    private func cancelProviderQueryWaiter(_ rootCID: String, waiterID: UUID) {
+        guard var pending = pendingProviderQueries[rootCID],
+              let continuation = pending.continuations.removeValue(forKey: waiterID)
+        else { return }
+        continuation.resume(returning: [])
+        guard pending.continuations.isEmpty else {
+            pendingProviderQueries[rootCID] = pending
+            return
+        }
+        pendingProviderQueries.removeValue(forKey: rootCID)
+        pending.timeoutTask?.cancel()
     }
 
     func providerLookupTargets(rootCID: String) -> [Router.BucketEntry] {
@@ -264,7 +295,9 @@ extension Ivy {
     }
 
     public func rememberProvider(rootCID: String, peer: PeerID) {
-        guard MessageLimits.accepts(rootCID), hasEndpointSession(peer) else { return }
+        guard config.mode.usesOverlayServices,
+              MessageLimits.accepts(rootCID),
+              hasEndpointSession(peer) else { return }
         storeProviderHint(
             rootCID: rootCID,
             peer: peer,
@@ -379,6 +412,7 @@ extension Ivy {
     }
 
     public func providers(for rootCID: String) -> [PeerID] {
+        guard config.mode.usesOverlayServices else { return [] }
         evictExpiredProviders(rootCID: rootCID)
         var seen: Set<PeerID> = []
         return (providerHints[rootCID] ?? []).compactMap { hint in

@@ -12,11 +12,17 @@ public enum IvyModeError: Error, Sendable, Equatable {
 
 public enum IvyMode: Sendable, Equatable {
     case overlay
+    case privateNetwork
     case pinned(peer: String)
 
     public var participatesInPublicDiscovery: Bool {
         if case .overlay = self { return true }
         return false
+    }
+
+    var usesOverlayServices: Bool {
+        if case .privateNetwork = self { return false }
+        return true
     }
 
     func pinnedKey() throws -> PeerKey? {
@@ -27,7 +33,7 @@ public enum IvyMode: Sendable, Equatable {
 
     func allowsEndpoint(_ key: PeerKey) -> Bool {
         switch self {
-        case .overlay:
+        case .overlay, .privateNetwork:
             return true
         case .pinned(let expected):
             return (try? PeerKey(expected)) == key
