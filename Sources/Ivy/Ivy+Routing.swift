@@ -246,6 +246,11 @@ extension Ivy {
         let discovered = key.peerID
         guard discovered != localID else { return false }
 
+        guard hasTransport(endpoint.transport) else {
+            config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: no \(endpoint.transport) transport installed")
+            return false
+        }
+
         let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty,
               host != "0.0.0.0",

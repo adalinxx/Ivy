@@ -585,7 +585,8 @@ public actor Ivy {
         let canonical = PeerEndpoint(
             publicKey: key.hex,
             host: endpoint.host,
-            port: endpoint.port)
+            port: endpoint.port,
+            transport: endpoint.transport)
 #if DEBUG || IVY_TESTING
         let rewritten = role == .endpoint
             ? dialEndpointRewriteForTesting?(canonical) ?? canonical
@@ -599,8 +600,9 @@ public actor Ivy {
                 endpoint: PeerEndpoint(
                     publicKey: key.hex,
                     host: rewritten.host,
-                    port: rewritten.port),
-                transport: try transport(for: .tcp),
+                    port: rewritten.port,
+                    transport: rewritten.transport),
+                transport: try transport(for: rewritten.transport),
                 group: group,
                 inboundByteBudget: inboundByteBudget)
         } catch {
@@ -677,7 +679,11 @@ public actor Ivy {
         }
 
         outgoingDials[key.peerID] = PendingOutgoingDial(
-            endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port),
+            endpoint: PeerEndpoint(
+                publicKey: key.hex,
+                host: endpoint.host,
+                port: endpoint.port,
+                transport: endpoint.transport),
             generation: runGeneration)
         return true
     }
@@ -693,7 +699,8 @@ public actor Ivy {
             dial.endpoint = PeerEndpoint(
                 publicKey: dial.endpoint.publicKey,
                 host: host,
-                port: dial.endpoint.port)
+                port: dial.endpoint.port,
+                transport: dial.endpoint.transport)
         }
         outgoingDials[peer] = dial
         return directConnectionCount(inNetgroup: NetGroup.group(dial.endpoint.host))
@@ -1289,18 +1296,30 @@ public actor Ivy {
             observedLocalHost: connection.channel?.localAddress?.ipAddress))
     }
 
+    /// Advertises one address per installed transport (IVY-023). `externalAddress`
+    /// declares the reachable TCP port; other transports keep their configured port
+    /// under the declared host, since no external mapping is known for them.
     func advertisedListenAddresses(observedLocalHost: String?) -> [ListenAddress] {
         var addresses: [ListenAddress] = []
-        if let external = config.externalAddress {
-            addresses.append(ListenAddress(host: external.host, port: external.port))
-        } else {
-            if let publicAddress, config.listenPort != 0 {
-                addresses.append(ListenAddress(host: publicAddress.host, port: config.listenPort))
+        for kind in transports.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            let port = config.listenPort(for: kind)
+            if let external = config.externalAddress {
+                addresses.append(ListenAddress(
+                    host: external.host,
+                    port: kind == .tcp ? external.port : port,
+                    transport: kind))
+                continue
             }
-            if config.listenPort != 0,
-               let localHost = observedLocalHost,
+            guard port != 0 else { continue }
+            if let publicAddress {
+                addresses.append(ListenAddress(
+                    host: publicAddress.host,
+                    port: port,
+                    transport: kind))
+            }
+            if let localHost = observedLocalHost,
                localHost != "0.0.0.0", localHost != "::" {
-                addresses.append(ListenAddress(host: localHost, port: config.listenPort))
+                addresses.append(ListenAddress(host: localHost, port: port, transport: kind))
             }
         }
         return addresses
@@ -1388,7 +1407,8 @@ public actor Ivy {
                 route = PeerEndpoint(
                     publicKey: peerKey.hex,
                     host: pending.connection.endpoint.host,
-                    port: pending.connection.endpoint.port)
+                    port: pending.connection.endpoint.port,
+                    transport: pending.connection.endpoint.transport)
             } else {
                 route = nil
             }
@@ -1442,7 +1462,11 @@ public actor Ivy {
         from peer: PeerID
     ) -> PeerEndpoint? {
         for address in addresses {
-            let endpoint = PeerEndpoint(publicKey: key.hex, host: address.host, port: address.port)
+            let endpoint = PeerEndpoint(
+                publicKey: key.hex,
+                host: address.host,
+                port: address.port,
+                transport: address.transport)
             if isAcceptableDiscoveredEndpoint(
                 endpoint,
                 provenance: .selfAdvertisement,
@@ -2089,7 +2113,8 @@ public actor Ivy {
                 endpoint: PeerEndpoint(
                     publicKey: target.hex,
                     host: endpoint.host,
-                    port: endpoint.port),
+                    port: endpoint.port,
+                    transport: endpoint.transport),
                 target: target,
                 routeID: routeID,
                 carrier: carrier) else {
@@ -2632,7 +2657,8 @@ public actor Ivy {
                 let canonical = PeerEndpoint(
                     publicKey: key.hex,
                     host: ep.host.trimmingCharacters(in: .whitespacesAndNewlines),
-                    port: ep.port)
+                    port: ep.port,
+                    transport: ep.transport)
                 accepted.append(canonical)
             }
             receiveNeighborResponse(nonce: nonce, endpoints: accepted, from: peer)
@@ -3342,7 +3368,7 @@ public actor Ivy {
             for transport in transports.values.sorted(by: { $0.kind.rawValue < $1.kind.rawValue }) {
                 handles.append(try await transport.listen(
                     host: "0.0.0.0",
-                    port: config.listenPort,
+                    port: config.listenPort(for: transport.kind),
                     group: group,
                     streamInitializer: streamInitializer))
             }
@@ -3357,6 +3383,10 @@ public actor Ivy {
     func transport(for kind: TransportKind) throws -> any IvyTransport {
         guard let transport = transports[kind] else { throw IvyError.unsupportedTransport }
         return transport
+    }
+
+    func hasTransport(_ kind: TransportKind) -> Bool {
+        transports[kind] != nil
     }
 
 }
