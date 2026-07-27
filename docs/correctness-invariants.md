@@ -19,11 +19,12 @@ Authentication proves a peer key, never application authority.
 | IVY-013 | Equal fetches coalesce across the whole bounded provider-search pipeline. |
 | IVY-014 | Provider records are expiring hints and grant no possession, validity, or authority. |
 | IVY-015 | Public discovery returns admitted candidates; only authenticated promotion installs routing state, and there is no PEX. |
-| IVY-016 | Outbound relay initiation uses configured carriers; inbound offers grant transport only, and every relayed session authenticates both endpoint identities end to end. |
+| IVY-016 | Outbound relay initiation uses configured carriers; inbound offers grant transport only, every relayed session authenticates both endpoint identities end to end, and carrier forwarding is ordered, exact-session-bound, and deadline-bounded. |
 | IVY-017 | Peer-global blame requires that peer's verified signature; carrier-controlled ambiguity remains unattributed. |
 | IVY-018 | Queue acceptance does not assert receipt, application acceptance, or durability. |
 | IVY-019 | Authorization, content validity, storage, consensus, fees, and settlement remain above Ivy. |
 | IVY-020 | Application unavailability or deficient content may change selection for that root, but cannot disconnect or globally condemn an authenticated peer. |
+| IVY-021 | A complete Volume is bounded, request/root/session/run-bound, globally reservation-capped on receive and serve, sequentially assembled per provider, and visible only after exact complete decoding. |
 
 Primary coverage: `SessionProtocolTests`, `IvyTopologyTests`,
 `InboundAdmissionTests`, `MessageFrameDecoderBoundTests`,

@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import Tally
 
 public struct PeerHealthConfig: Sendable {
@@ -32,7 +33,8 @@ actor PeerHealthMonitor {
 
     private var peers: [PeerID: PeerHealth] = [:]
     private let config: PeerHealthConfig
-    private var monitorTask: Task<Void, Never>?
+    private var monitorTimer: RepeatedTask?
+    private var monitorGeneration: UInt64 = 0
     private let onStale: @Sendable (PeerID, SessionID) -> Void
     private let now: @Sendable () -> ContinuousClock.Instant
     private let nextNonce: @Sendable () -> UInt64
@@ -49,30 +51,56 @@ actor PeerHealthMonitor {
         self.nextNonce = nextNonce
     }
 
+    deinit {
+        monitorTimer?.cancel()
+    }
+
     func startMonitoring(
+        on eventLoop: EventLoop,
         sendPing: @escaping @Sendable (PeerID, SessionID, UInt64) async -> Void
     ) {
         guard config.enabled else { return }
-        monitorTask?.cancel()
-        monitorTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: self?.config.keepaliveInterval ?? .seconds(60))
-                } catch {
+        monitorTimer?.cancel()
+        monitorGeneration &+= 1
+        let generation = monitorGeneration
+        let interval = TimeAmount(config.keepaliveInterval)
+        monitorTimer = eventLoop.scheduleRepeatedAsyncTask(
+            initialDelay: interval,
+            delay: interval
+        ) { [weak self] task in
+            let promise = eventLoop.makePromise(of: Void.self)
+            _ = Task { [weak self] in
+                guard let self else {
+                    task.cancel()
+                    promise.succeed(())
                     return
                 }
-                guard let self else { return }
-                let staleList = await self.checkAndPing(sendPing: sendPing)
-                for (peer, sessionID) in staleList {
-                    self.onStale(peer, sessionID)
+                if !(await self.runMonitoringCycle(generation: generation, sendPing: sendPing)) {
+                    task.cancel()
                 }
+                promise.succeed(())
             }
+            return promise.futureResult
         }
     }
 
     func stopMonitoring() {
-        monitorTask?.cancel()
-        monitorTask = nil
+        monitorGeneration &+= 1
+        monitorTimer?.cancel()
+        monitorTimer = nil
+    }
+
+    private func runMonitoringCycle(
+        generation: UInt64,
+        sendPing: @escaping @Sendable (PeerID, SessionID, UInt64) async -> Void
+    ) async -> Bool {
+        guard generation == monitorGeneration else { return false }
+        let staleList = await checkAndPing(sendPing: sendPing)
+        guard generation == monitorGeneration else { return false }
+        for (peer, sessionID) in staleList {
+            onStale(peer, sessionID)
+        }
+        return generation == monitorGeneration
     }
 
     func trackPeer(_ peer: PeerID, sessionID: SessionID) {

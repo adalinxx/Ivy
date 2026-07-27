@@ -5,6 +5,18 @@ import NIOPosix
 import Testing
 @testable import Ivy
 
+private struct RelayVolumeSource: IvyContentSource {
+    let entries: [ContentEntry]
+
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        entries
+    }
+}
+
 @Suite("Configured carrier relay", .serialized)
 struct RelayIntegrationTests {
     @Test("unconfigured overlay peers cannot inject unrelated relay state")
@@ -154,6 +166,72 @@ struct RelayIntegrationTests {
         await node.cleanupRoutesForReplacementForTesting(peer: remote, preserving: nil)
         #expect(!(await node.hasInstalledRouteForTesting(routeID)))
         #expect(!connection.isLive)
+    }
+
+    @Test("a stalled relay destination expires and closes its route")
+    func stalledRelayDestinationExpires() async throws {
+        let sourceIdentity = TransportTestHarness.identity("relay-stall-source")
+        let targetIdentity = TransportTestHarness.identity("relay-stall-target")
+        let carrierIdentity = TransportTestHarness.identity("relay-stall-carrier")
+        let carrierPort = TransportTestHarness.nextPort()
+        let sourcePort = TransportTestHarness.nextPort()
+        let targetPort = TransportTestHarness.nextPort()
+        let carrierEndpoint = TransportTestHarness.endpoint(
+            carrierIdentity,
+            port: carrierPort
+        )
+        let targetID = TransportTestHarness.key(targetIdentity).peerID
+        let carrier = Ivy(config: TransportTestHarness.config(
+            carrierIdentity,
+            port: carrierPort,
+            relayEnabled: true,
+            requestTimeout: .milliseconds(30),
+        ))
+        let source = Ivy(config: TransportTestHarness.config(
+            sourceIdentity,
+            port: sourcePort,
+            carriers: [carrierEndpoint],
+            mode: .pinned(peer: targetID.publicKey)
+        ))
+        let target = Ivy(config: TransportTestHarness.config(
+            targetIdentity,
+            port: targetPort
+        ))
+
+        try await carrier.start()
+        try await target.start()
+        try await source.start()
+        try await target.connect(to: carrierEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await carrier.peerConnectionCount == 2
+        })
+        try await source.connectViaRelay(to: PeerEndpoint(
+            publicKey: targetID.publicKey,
+            host: "relay",
+            port: 0
+        ))
+        await carrier.setEndpointWritabilityForTesting(targetID, writable: false)
+
+        let result = await source.sendMessage(
+            to: targetID,
+            topic: "relay.stall",
+            payload: Data([0xaa])
+        )
+        guard case .enqueued = result else {
+            Issue.record("expected the relay packet to enqueue")
+            await source.stop()
+            await target.stop()
+            await carrier.stop()
+            return
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await carrier.relayRouteCountForTesting == 0
+        })
+
+        await carrier.setEndpointWritabilityForTesting(targetID, writable: true)
+        await source.stop()
+        await target.stop()
+        await carrier.stop()
     }
 
     @Test("a relay reply from the wrong carrier cannot consume pending state")
@@ -337,7 +415,8 @@ struct RelayIntegrationTests {
         let carrier = Ivy(config: TransportTestHarness.config(
             carrierIdentity,
             port: carrierPort,
-            relayEnabled: true))
+            relayEnabled: true,
+            requestTimeout: .seconds(5)))
         let endpoint = Ivy(config: TransportTestHarness.config(
             endpointIdentity,
             port: TransportTestHarness.nextPort()))
@@ -687,7 +766,7 @@ struct RelayIntegrationTests {
         await carrier.stop()
     }
 
-    @Test("A configured carrier authenticates one route ID and forwards peer messages")
+    @Test("A configured carrier forwards peer messages and multi-frame Volumes")
     func configuredCarrierRelay() async throws {
         let carrierIdentity = TransportTestHarness.identity("relay-carrier")
         let sourceIdentity = TransportTestHarness.identity("relay-source")
@@ -707,14 +786,23 @@ struct RelayIntegrationTests {
             sourceIdentity,
             port: sourcePort,
             carriers: [carrierEndpoint],
-            mode: .pinned(peer: targetID.publicKey)))
+            mode: .pinned(peer: targetID.publicKey),
+            requestTimeout: .seconds(5)))
         let target = Ivy(config: TransportTestHarness.config(
             targetIdentity,
-            port: targetPort))
+            port: targetPort,
+            requestTimeout: .seconds(5)))
         let sourceRecorder = TransportTestRecorder()
         let targetRecorder = TransportTestRecorder()
         await source.setTestDelegate(sourceRecorder)
         await target.setTestDelegate(targetRecorder)
+        let volumeBytes = Data(
+            repeating: 0xa5,
+            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+        )
+        await target.setContentSource(RelayVolumeSource(entries: [
+            ContentEntry(cid: "relay-root", data: volumeBytes),
+        ]))
 
         try await carrier.start()
         try await target.start()
@@ -768,6 +856,12 @@ struct RelayIntegrationTests {
         }
         #expect(targetCarrier == carrierKey)
         #expect(targetRouteID == routeID)
+        let messagePeer = try #require(targetRecorder.receivedPeer(
+            topic: "node.state",
+            payload: payload))
+        #expect(messagePeer.key.peerID == sourceID)
+        #expect(messagePeer.role == .endpoint)
+        #expect(messagePeer.route == .relayed(carrier: carrierKey, routeID: routeID))
 
         let tooLargeForRelay = Data(
             repeating: 0xaa,
@@ -795,6 +889,18 @@ struct RelayIntegrationTests {
                 payload: afterRejection,
                 from: sourceID)
         })
+
+        let targetPeer = try #require(
+            sourceRecorder.authenticatedPeers.first { $0.key.peerID == targetID }
+        )
+        #expect(await source.fetchVolume(
+            rootCID: "relay-root",
+            from: targetPeer
+        ) == AttributedVolumeResponse(
+            rootCID: "relay-root",
+            entries: ["relay-root": volumeBytes],
+            servedBy: targetID
+        ))
 
         await target.stop()
         #expect(try await TransportTestHarness.eventually {

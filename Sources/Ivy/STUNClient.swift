@@ -53,44 +53,39 @@ actor STUNClient {
             request.appendUInt16(0x0000)
             request.appendUInt32(0x2112A442)
             request.append(contentsOf: txnID)
+            let encodedRequest = request
 
             var buf = channel.allocator.buffer(capacity: 20)
-            buf.writeBytes(request)
+            buf.writeBytes(encodedRequest)
             let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
             try await channel.writeAndFlush(envelope).get()
 
-            let retransmissionTask = Task {
-                var delay: UInt64 = 500
-                while delay < 3_000, !Task.isCancelled {
-                    do {
-                        try await Task.sleep(for: .milliseconds(delay))
-                    } catch {
-                        return
-                    }
-                    var retry = channel.allocator.buffer(capacity: request.count)
-                    retry.writeBytes(request)
-                    let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: retry)
-                    try? await channel.writeAndFlush(envelope).get()
-                    delay *= 2
-                }
+            let firstRetry = channel.eventLoop.scheduleTask(in: .milliseconds(500)) {
+                var retry = channel.allocator.buffer(capacity: encodedRequest.count)
+                retry.writeBytes(encodedRequest)
+                channel.writeAndFlush(
+                    AddressedEnvelope(remoteAddress: remoteAddr, data: retry),
+                    promise: nil
+                )
             }
-            defer { retransmissionTask.cancel() }
+            let secondRetry = channel.eventLoop.scheduleTask(in: .milliseconds(1_500)) {
+                var retry = channel.allocator.buffer(capacity: encodedRequest.count)
+                retry.writeBytes(encodedRequest)
+                channel.writeAndFlush(
+                    AddressedEnvelope(remoteAddress: remoteAddr, data: retry),
+                    promise: nil
+                )
+            }
+            defer {
+                firstRetry.cancel()
+                secondRetry.cancel()
+            }
 
-            return await withTaskGroup(of: ObservedAddress?.self) { group in
-                group.addTask { await handler.waitForResponse() }
-                group.addTask {
-                    try? await Task.sleep(for: .seconds(3))
-                    return nil
-                }
-                // Take the FIRST result from either task. If the timeout fires
-                // first (returns nil), cancelAll so waitForResponse() isn't left
-                // suspended forever with an unresumable continuation.
-                for await result in group {
-                    group.cancelAll()
-                    return result
-                }
-                return nil
+            let timeout = channel.eventLoop.scheduleTask(in: .seconds(3)) {
+                handler.finishWithoutResponse()
             }
+            defer { timeout.cancel() }
+            return await handler.waitForResponse()
         } catch {
             return nil
         }
@@ -105,6 +100,7 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<ObservedAddress?, Never>?
     private var response: ObservedAddress?
+    private var finished = false
 
     init(expectedTransactionID: [UInt8]? = nil, expectedRemoteAddress: SocketAddress? = nil) {
         self.expectedTransactionID = expectedTransactionID
@@ -115,26 +111,34 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
         await withTaskCancellationHandler {
             await withCheckedContinuation { cont in
                 lock.lock()
-                if Task.isCancelled {
-                    continuation = nil
-                    lock.unlock()
-                    cont.resume(returning: nil)
-                } else if let response {
+                if let response {
                     self.response = nil
                     lock.unlock()
                     cont.resume(returning: response)
+                } else if Task.isCancelled || finished {
+                    lock.unlock()
+                    cont.resume(returning: nil)
                 } else {
                     continuation = cont
                     lock.unlock()
                 }
             }
         } onCancel: {
-            lock.lock()
-            let cont = continuation
-            continuation = nil
-            lock.unlock()
-            cont?.resume(returning: nil)
+            finishWithoutResponse()
         }
+    }
+
+    func finishWithoutResponse() {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        cont?.resume(returning: nil)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -145,6 +149,11 @@ final class STUNResponseHandler: ChannelInboundHandler, @unchecked Sendable {
         var buf = envelope.data
         guard let addr = Self.parseResponse(&buf, expectedTransactionID: expectedTransactionID) else { return }
         lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
         let cont = continuation
         continuation = nil
         if cont == nil, response == nil {

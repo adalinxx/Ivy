@@ -1,4 +1,6 @@
 import Foundation
+import NIOCore
+import NIOEmbedded
 import Testing
 @testable import Ivy
 import Tally
@@ -179,5 +181,33 @@ struct PeerHealthMonitorTests {
         #expect(try await sweep.value(waitingFor: "peer health sweep").isEmpty)
         #expect(await monitor.health(for: replacedPeer)?.sessionID == replacement)
         #expect(await pings.peers == [observedFirstPeer])
+    }
+
+    @Test("stopping monitoring cancels its scheduled sweep")
+    func stopCancelsScheduledSweep() async {
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let clock = TestContinuousClock()
+        let pings = PingRecorder()
+        let peer = PeerID(publicKey: deterministicTestPeerKey("health-timer-stop-peer"))
+        let sessionID = try! SessionID(bytes: Data(repeating: 9, count: 32))
+        let monitor = PeerHealthMonitor(
+            config: PeerHealthConfig(
+                keepaliveInterval: .milliseconds(1),
+                staleTimeout: .seconds(1),
+                maxMissedPongs: 1),
+            onStale: { _, _ in },
+            now: { clock.now },
+            nextNonce: { 1 })
+
+        await monitor.trackPeer(peer, sessionID: sessionID)
+        clock.advance(by: .milliseconds(1))
+        await monitor.startMonitoring(on: eventLoop) { peer, _, nonce in
+            await pings.record(peer, nonce: nonce)
+        }
+        await monitor.stopMonitoring()
+        await eventLoop.advanceTime(by: .milliseconds(10))
+
+        #expect(await pings.peers.isEmpty)
+        await eventLoop.shutdownGracefully()
     }
 }

@@ -261,8 +261,8 @@ private func keyWithPresentationOnlyWork() -> (canonical: String, alternate: Str
         let canonical = deterministicTestPeerKey("routing-presentation-work-\(index)")
         let alternate = "ED01" + canonical.uppercased()
         let canonicalBits = KeyDifficulty.keyWorkBits(canonical)
-        let alternateBits = KeyDifficulty.keyWorkBits(alternate)
-        if alternateBits > canonicalBits {
+        let rawPresentationBits = KeyDifficulty.trailingZeroBits(of: alternate)
+        if rawPresentationBits > canonicalBits {
             return (canonical, alternate, canonicalBits + 1)
         }
     }

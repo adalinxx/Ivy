@@ -270,9 +270,28 @@ struct STUNSourceAddressTests {
 
         let payload = makeSTUNResponse(ip: "198.51.100.5", port: 4001, transactionID: txnID)
         try await channel.writeInbound(AddressedEnvelope(remoteAddress: expected, data: payload))
+        handler.finishWithoutResponse()
 
         let result = await handler.waitForResponse()
         #expect(result == ObservedAddress(host: "198.51.100.5", port: 4001))
+        _ = try? await channel.finish()
+    }
+
+    @Test("Valid response after timeout is ignored")
+    func validResponseAfterTimeoutIsIgnored() async throws {
+        let txnID = Array(UInt8(1)...UInt8(12))
+        let expected = try SocketAddress(ipAddress: "203.0.113.10", port: 3478)
+        let handler = STUNResponseHandler(
+            expectedTransactionID: txnID,
+            expectedRemoteAddress: expected
+        )
+        let channel = await NIOAsyncTestingChannel(handler: handler)
+
+        handler.finishWithoutResponse()
+        let payload = makeSTUNResponse(ip: "198.51.100.5", port: 4001, transactionID: txnID)
+        try await channel.writeInbound(AddressedEnvelope(remoteAddress: expected, data: payload))
+
+        #expect(await handler.waitForResponse() == nil)
         _ = try? await channel.finish()
     }
 
@@ -306,6 +325,170 @@ struct STUNSourceAddressTests {
         #expect(result == ObservedAddress(host: "198.51.100.5", port: 4001),
                 "handler must drop the spoofed reply and accept only the expected-source reply")
         _ = try? await channel.finish()
+    }
+}
+
+@Suite("STUN response completion")
+struct STUNResponseCompletionTests {
+    @Test("timeout completes a waiter that has not received a response")
+    func timeoutCompletesPendingWaiter() async {
+        let handler = STUNResponseHandler()
+        let waiter = Task { await handler.waitForResponse() }
+        await Task.yield()
+
+        handler.finishWithoutResponse()
+
+        #expect(await waiter.value == nil)
+    }
+
+    @Test("timeout remains terminal when it wins before a waiter is installed")
+    func timeoutBeforeWaiterIsTerminal() async {
+        let handler = STUNResponseHandler()
+        handler.finishWithoutResponse()
+
+        #expect(await handler.waitForResponse() == nil)
+    }
+}
+
+private actor ControlledPublicAddressDiscovery {
+    private let addresses: [ObservedAddress]
+    private var nextIndex = 0
+    private var pending: [Int: CheckedContinuation<ObservedAddress?, Never>] = [:]
+    private var pendingWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(addresses: [ObservedAddress]) {
+        self.addresses = addresses
+    }
+
+    func discover() async -> ObservedAddress? {
+        let index = nextIndex
+        nextIndex += 1
+        guard addresses.indices.contains(index) else { return nil }
+        return await withCheckedContinuation { continuation in
+            pending[index] = continuation
+            let waiters = pendingWaiters
+            pendingWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    func waitForPending(_ count: Int) async {
+        while pending.count < count {
+            await withCheckedContinuation { pendingWaiters.append($0) }
+        }
+    }
+
+    func release(_ index: Int) {
+        pending.removeValue(forKey: index)?.resume(returning: addresses[index])
+    }
+}
+
+private actor CancellablePublicAddressDiscovery {
+    private var continuation: CheckedContinuation<ObservedAddress?, Never>?
+    private var started = false
+    private var cancelled = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func discover() async -> ObservedAddress? {
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if cancelled || Task.isCancelled {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                self.continuation = continuation
+                started = true
+                let waiters = startWaiters
+                startWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }, onCancel: {
+            Task { await self.cancel() }
+        })
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func waitUntilCancelled() async {
+        guard !cancelled else { return }
+        await withCheckedContinuation { cancellationWaiters.append($0) }
+    }
+
+    private func cancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        continuation?.resume(returning: nil)
+        continuation = nil
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+@Suite("Asynchronous public-address discovery")
+struct AsynchronousPublicAddressDiscoveryTests {
+    private func configuration(_ label: String) -> IvyConfig {
+        IvyConfig(
+            publicKey: label,
+            listenPort: 0,
+            stunServers: [("stun.test", 3478)],
+            healthConfig: PeerHealthConfig(enabled: false)
+        )
+    }
+
+    @Test("startup does not wait for discovery and stale results cannot cross runs")
+    func startupAndRestartFenceDiscovery() async throws {
+        let oldAddress = ObservedAddress(host: "203.0.113.10", port: 40_001)
+        let currentAddress = ObservedAddress(host: "203.0.113.20", port: 40_002)
+        let discovery = ControlledPublicAddressDiscovery(
+            addresses: [oldAddress, currentAddress]
+        )
+        let node = Ivy(config: configuration("async-discovery"))
+        await node.setPublicAddressDiscoveryHookForTesting {
+            await discovery.discover()
+        }
+
+        try await node.start()
+        let first = try #require(
+            await node.publicAddressDiscoveryTaskForTesting()
+        )
+        await discovery.waitForPending(1)
+        #expect(await node.publicAddress == nil)
+
+        await node.stop()
+        try await node.start()
+        let second = try #require(
+            await node.publicAddressDiscoveryTaskForTesting()
+        )
+        await discovery.waitForPending(2)
+
+        await discovery.release(0)
+        await first.value
+        #expect(await node.publicAddress == nil)
+
+        await discovery.release(1)
+        await second.value
+        #expect(await node.publicAddress == currentAddress)
+        await node.stop()
+    }
+
+    @Test("stop cancels an in-flight discovery")
+    func stopCancelsDiscovery() async throws {
+        let discovery = CancellablePublicAddressDiscovery()
+        let node = Ivy(config: configuration("cancel-discovery"))
+        await node.setPublicAddressDiscoveryHookForTesting {
+            await discovery.discover()
+        }
+
+        try await node.start()
+        await discovery.waitUntilStarted()
+        await node.stop()
+        await discovery.waitUntilCancelled()
+        #expect(await node.publicAddress == nil)
     }
 }
 

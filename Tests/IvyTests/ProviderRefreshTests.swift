@@ -24,7 +24,7 @@ private extension Ivy {
             let keys = Set(peers.map(\.publicKey))
             pendingProviderQueries[rootCID] = PendingProviderQuery(
                 requestID: requestID,
-                continuations: [continuation],
+                continuations: [UUID(): continuation],
                 expectedPeers: keys,
                 responsesByPeer: [:])
         }

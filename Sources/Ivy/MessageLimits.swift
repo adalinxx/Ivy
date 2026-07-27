@@ -6,6 +6,10 @@ enum MessageLimits {
     static let maxListenAddrs: UInt16 = 16
     static let maxContentCIDCount: UInt16 = 4096
     static let maxContentEntryCount: UInt16 = 4096
+    static let maxVolumeEntryCount = UInt16.max
+    static let maxVolumeChunkCount: UInt16 = 1024
+    static let maxVolumeArchiveBytes = 64 * 1024 * 1024
+    static let maxInFlightVolumeBytes = 128 * 1024 * 1024
 
     static func accepts(_ string: String) -> Bool {
         !string.isEmpty

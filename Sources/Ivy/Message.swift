@@ -24,6 +24,16 @@ enum Message: Sendable {
     case contentRequest(requestID: UInt64, rootCID: String, cids: [String])
     case contentResponse(requestID: UInt64, entries: [ContentEntry])
     case contentUnavailable(requestID: UInt64)
+    case volumeRequest(requestID: UInt64, rootCID: String)
+    case volumeChunk(
+        requestID: UInt64,
+        rootCID: String,
+        index: UInt16,
+        count: UInt16,
+        totalEntries: UInt16,
+        totalBytes: UInt64,
+        payload: Data
+    )
 
     case findProviders(rootCID: String, requestID: UInt64)
     case providers(rootCID: String, requestID: UInt64, records: [ProviderRecord])
@@ -44,6 +54,8 @@ enum Message: Sendable {
         case findNode = 5
         case neighbors = 6
         case contentRequest = 26
+        case volumeRequest = 27
+        case volumeChunk = 28
         case findProviders = 40
         case providers = 41
         case announceProvider = 42
@@ -78,6 +90,29 @@ enum Message: Sendable {
                   consume(SessionWireRecord.dataRecordOverhead, from: &remaining) else { return nil }
         }
         return contentResponsePayloadBudget(for: cids, within: remaining)
+    }
+
+    static func volumeChunkDataBudget(
+        rootCID: String,
+        maxFrameSize: UInt32,
+        relayed: Bool
+    ) -> Int? {
+        var remaining = Int(maxFrameSize)
+        guard consume(SessionWireRecord.dataRecordOverhead, from: &remaining) else {
+            return nil
+        }
+        if relayed {
+            guard consume(1 + 32 + 4, from: &remaining),
+                  consume(SessionWireRecord.dataRecordOverhead, from: &remaining) else {
+                return nil
+            }
+        }
+        guard MessageLimits.accepts(rootCID),
+              consume(1 + 8 + 2 + rootCID.utf8.count + 2 + 2 + 2 + 8 + 4,
+                      from: &remaining) else {
+            return nil
+        }
+        return remaining
     }
 
     func serialize(maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize) -> Data {
@@ -129,6 +164,40 @@ enum Message: Sendable {
             guard requestID != 0 else { return false }
             bytes.append(Tag.contentUnavailable.rawValue)
             bytes.appendUInt64(requestID)
+        case .volumeRequest(let requestID, let rootCID):
+            guard requestID != 0, MessageLimits.accepts(rootCID) else { return false }
+            bytes.append(Tag.volumeRequest.rawValue)
+            bytes.appendUInt64(requestID)
+            guard bytes.appendLengthPrefixedString(rootCID) else { return false }
+        case let .volumeChunk(
+            requestID,
+            rootCID,
+            index,
+            count,
+            totalEntries,
+            totalBytes,
+            payload
+        ):
+            guard requestID != 0,
+                  MessageLimits.accepts(rootCID),
+                  count > 0,
+                  count <= MessageLimits.maxVolumeChunkCount,
+                  index < count,
+                  totalEntries > 0,
+                  totalBytes > 0,
+                  totalBytes <= UInt64(MessageLimits.maxVolumeArchiveBytes),
+                  !payload.isEmpty else { return false }
+            bytes.append(Tag.volumeChunk.rawValue)
+            bytes.appendUInt64(requestID)
+            guard bytes.appendLengthPrefixedString(rootCID) else { return false }
+            bytes.appendUInt16(index)
+            bytes.appendUInt16(count)
+            bytes.appendUInt16(totalEntries)
+            bytes.appendUInt64(totalBytes)
+            guard bytes.appendLengthPrefixedData(
+                payload,
+                maxDataPayload: maxDataPayload
+            ) else { return false }
         case .findProviders(let rootCID, let requestID):
             guard MessageLimits.accepts(rootCID), requestID != 0 else { return false }
             bytes.append(Tag.findProviders.rawValue)
@@ -263,6 +332,27 @@ enum Message: Sendable {
         case .contentUnavailable:
             guard let requestID = reader.readUInt64(), requestID != 0 else { return nil }
             return .contentUnavailable(requestID: requestID)
+        case .volumeRequest:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let rootCID = reader.readString() else { return nil }
+            return .volumeRequest(requestID: requestID, rootCID: rootCID)
+        case .volumeChunk:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let rootCID = reader.readString(),
+                  let index = reader.readUInt16(),
+                  let count = reader.readUInt16(),
+                  let totalEntries = reader.readUInt16(),
+                  let totalBytes = reader.readUInt64(),
+                  let payload = reader.readData() else { return nil }
+            return .volumeChunk(
+                requestID: requestID,
+                rootCID: rootCID,
+                index: index,
+                count: count,
+                totalEntries: totalEntries,
+                totalBytes: totalBytes,
+                payload: payload
+            )
         case .findProviders:
             guard let rootCID = reader.readString(),
                   let requestID = reader.readUInt64(), requestID != 0 else { return nil }
