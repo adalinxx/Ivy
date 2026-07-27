@@ -126,6 +126,23 @@ struct InboundFrame: Sendable {
     }
 }
 
+/// Carries the connection built inside a transport's channel initializer back to the dialer.
+private final class DialedConnectionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: PeerConnection?
+
+    func store(_ connection: PeerConnection) {
+        lock.withLock { self.connection = connection }
+    }
+
+    func take() -> PeerConnection? {
+        lock.withLock {
+            defer { connection = nil }
+            return connection
+        }
+    }
+}
+
 private final class WritabilityWaiter: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Bool, Never>?
@@ -251,25 +268,22 @@ final class PeerConnection: @unchecked Sendable {
 
     static func dial(
         endpoint: PeerEndpoint,
+        transport: any IvyTransport,
         group: EventLoopGroup,
         inboundByteBudget: InboundByteBudget
     ) async throws -> PeerConnection {
         let connectionInboundByteBudget = InboundByteBudget(limit: Self.maxInboundBufferedBytes)
-        let bootstrap = ClientBootstrap(group: group)
-            .connectTimeout(.seconds(5))
-        let connection: PeerConnection = try await bootstrap.connect(
+        let dialed = DialedConnectionBox()
+        let channel = try await transport.dial(
             host: endpoint.host,
-            port: Int(endpoint.port)
+            port: endpoint.port,
+            group: group
         ) { channel in
             do {
-                try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
-                    budget: inboundByteBudget,
-                    connectionBudget: connectionInboundByteBudget))
-                let inbound = try NIOAsyncChannel<InboundFrame, Never>(
-                    wrappingChannelSynchronously: channel,
-                    configuration: .init(backPressureStrategy: .init(
-                        lowWatermark: 1,
-                        highWatermark: 1)))
+                let inbound = try Self.installFraming(
+                    channel: channel,
+                    inboundByteBudget: inboundByteBudget,
+                    connectionInboundByteBudget: connectionInboundByteBudget)
                 let connection = PeerConnection(
                     endpoint: endpoint,
                     channel: channel,
@@ -278,13 +292,35 @@ final class PeerConnection: @unchecked Sendable {
                     connectionInboundByteBudget: connectionInboundByteBudget)
                 try channel.pipeline.syncOperations.addHandler(
                     PeerConnectionLifecycleHandler(connection: connection))
-                return channel.eventLoop.makeSucceededFuture(connection)
+                dialed.store(connection)
+                return channel.eventLoop.makeSucceededVoidFuture()
             } catch {
                 return channel.eventLoop.makeFailedFuture(error)
             }
         }
-        connection.observedHost = connection.channel?.remoteAddress?.ipAddress
+        guard let connection = dialed.take() else {
+            channel.close(promise: nil)
+            throw TransportError.channelNotInitialized
+        }
+        connection.observedHost = channel.remoteAddress?.ipAddress
         return connection
+    }
+
+    /// Installs the frame decoder and inbound bridge shared by dialed and accepted channels.
+    /// Must run on `channel`'s event loop before any read is delivered.
+    static func installFraming(
+        channel: Channel,
+        inboundByteBudget: InboundByteBudget,
+        connectionInboundByteBudget: InboundByteBudget
+    ) throws -> NIOAsyncChannel<InboundFrame, Never> {
+        try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
+            budget: inboundByteBudget,
+            connectionBudget: connectionInboundByteBudget))
+        return try NIOAsyncChannel<InboundFrame, Never>(
+            wrappingChannelSynchronously: channel,
+            configuration: .init(backPressureStrategy: .init(
+                lowWatermark: 1,
+                highWatermark: 1)))
     }
 
     @discardableResult
