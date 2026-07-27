@@ -529,7 +529,7 @@ public actor Ivy {
         if let requiredGeneration, requiredGeneration != generation {
             throw IvyError.notRunning
         }
-        for route in routes {
+        for route in orderedByDialPreference(routes) {
             do {
                 if try await connectDirect(
                     to: route,
@@ -3387,6 +3387,23 @@ public actor Ivy {
 
     func hasTransport(_ kind: TransportKind) -> Bool {
         transports[kind] != nil
+    }
+
+    /// Tries QUIC before TCP, and transports this node cannot dial last, keeping
+    /// the caller's order within each group.
+    func orderedByDialPreference(_ routes: [PeerEndpoint]) -> [PeerEndpoint] {
+        func preference(_ kind: TransportKind) -> Int {
+            guard hasTransport(kind) else { return 2 }
+            switch kind {
+            case .quic: return 0
+            case .tcp: return 1
+            }
+        }
+        return routes.enumerated().sorted { lhs, rhs in
+            let left = preference(lhs.element.transport)
+            let right = preference(rhs.element.transport)
+            return left == right ? lhs.offset < rhs.offset : left < right
+        }.map(\.element)
     }
 
 }
