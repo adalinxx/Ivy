@@ -25,9 +25,11 @@ Authentication proves a peer key, never application authority.
 | IVY-019 | Authorization, content validity, storage, consensus, fees, and settlement remain above Ivy. |
 | IVY-020 | Application unavailability or deficient content may change selection for that root, but cannot disconnect or globally condemn an authenticated peer. |
 | IVY-021 | A complete Volume is bounded, request/root/session/run-bound, globally reservation-capped on receive and serve, sequentially assembled per provider, and visible only after exact complete decoding. |
+| IVY-022 | Every transport delivers ordered bounded frames into the same admission gate, byte budgets, and signed-session state machine; identity is never asserted by transport-layer credentials. |
+| IVY-023 | A node advertises an address for a transport only when it has bound that transport, and never dials or routes an address for a transport it has not installed. |
 
 Primary coverage: `SessionProtocolTests`, `IvyTopologyTests`,
 `InboundAdmissionTests`, `MessageFrameDecoderBoundTests`,
 `ContentExchangeTests`, `PendingRequestCapsTests`, `ProviderRefreshTests`,
-`ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`, and
-`TCPIntegrationTests`.
+`ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`,
+`TransportTaggingTests`, `TransportSelectionTests`, and `TCPIntegrationTests`.

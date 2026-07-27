@@ -8,8 +8,28 @@ caller: authority, validation, storage, protocol meaning
                          |
 Ivy: admission, sessions, routing, content, relay
                          |
-SwiftNIO: direct TCP or configured carrier
+SwiftNIO: direct transport (TCP, QUIC) or configured carrier
 ```
+
+## Transports
+
+A transport supplies ordered, reliable byte-stream channels and nothing else.
+Dialing and listening sit behind `IvyTransport`; everything above it — framing,
+admission, byte budgets, backpressure, and the signed session state machine — is
+shared, so a new transport cannot weaken the model. Every listener feeds one
+admission gate, so capacity and netgroup diversity are accounted across
+transports rather than per transport.
+
+Advertised addresses carry the transport they belong to, and a node advertises a
+transport only once it has bound one. A peer offering several is dialed QUIC
+first, then TCP; a transport this node has not installed is neither dialed nor
+routable.
+
+QUIC (see `IvyQUIC`) maps one connection to one bidirectional stream carrying the
+same framed records as TCP, with reads parked until admission grants a slot. Its
+TLS layer is plumbing: certificates are ephemeral and unverified, identity still
+comes only from the signed handshake, and QUIC dials use the same zero route
+binding as direct TCP.
 
 ## Connections
 
@@ -30,7 +50,7 @@ confidentiality and forward secrecy belong above or below Ivy.
 
 Wire/session protocol v9 rejects v8 during authentication. V9 introduces
 multi-frame complete-Volume replies, which cannot safely share the older
-one-frame Volume contract.
+one-frame Volume contract, and tags every advertised address with its transport.
 
 Treat every authenticated endpoint connection as an independent availability
 zone, not a verdict about the peer. Application timeouts, unavailable content,
