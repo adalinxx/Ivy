@@ -589,7 +589,8 @@ public actor Ivy {
                     host: rewritten.host,
                     port: rewritten.port),
                 group: group,
-                inboundByteBudget: inboundByteBudget)
+                inboundByteBudget: inboundByteBudget,
+                maxFrameSize: config.protocolMaxFrameSize)
         } catch {
             let connected = await finishOutgoingDialOrAwaitCompetingResponder(
                 for: key,
@@ -1173,6 +1174,8 @@ public actor Ivy {
                 rejectRecord(on: connection)
                 return
             }
+            // Negotiated: cap what we send this peer at what it advertised it accepts.
+            connection.peerMaxFrameSize = remoteMetadata.maxFrameSize
 
             let helloResponder = SessionHelloResponder(
                 routeBinding: signed.hello.routeBinding,
@@ -1220,6 +1223,8 @@ public actor Ivy {
                 rejectRecord(on: connection)
                 return
             }
+            // Negotiated: cap what we send this peer at what it advertised it accepts.
+            connection.peerMaxFrameSize = remoteMetadata.maxFrameSize
 
             pending.helloResponder = signed
             pending.sessionID = sessionID
@@ -1272,8 +1277,10 @@ public actor Ivy {
     }
 
     private func localMetadata(for connection: PeerConnection) -> PeerMetadata {
-        PeerMetadata(listenAddresses: advertisedListenAddresses(
-            observedLocalHost: connection.channel?.localAddress?.ipAddress))
+        PeerMetadata(
+            listenAddresses: advertisedListenAddresses(
+                observedLocalHost: connection.channel?.localAddress?.ipAddress),
+            maxFrameSize: config.protocolMaxFrameSize)
     }
 
     func advertisedListenAddresses(observedLocalHost: String?) -> [ListenAddress] {
@@ -3310,6 +3317,7 @@ public actor Ivy {
                     limit: PeerConnection.maxInboundBufferedBytes)
                 do {
                     try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
+                        maxFrameSize: self.config.protocolMaxFrameSize,
                         budget: inboundByteBudget,
                         connectionBudget: connectionBudget))
                     let directInbound = try NIOAsyncChannel<InboundFrame, Never>(
