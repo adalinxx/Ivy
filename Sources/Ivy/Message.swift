@@ -335,6 +335,8 @@ enum Message: Sendable {
             bytes.append(reason.rawValue)
         case .reachabilityRequest(let requestID, let transport, let port, let nonce):
             guard requestID != 0,
+                  // A relay hint names a carrier, not a socket anyone can dial back.
+                  transport.isDirectlyDialable,
                   port != 0,
                   nonce.count == ReachabilityProbe.nonceByteCount else { return false }
             bytes.append(Tag.reachabilityRequest.rawValue)
@@ -518,6 +520,7 @@ enum Message: Sendable {
         case .reachabilityRequest:
             guard let requestID = reader.readUInt64(), requestID != 0,
                   let transport = reader.readTransportKind(),
+                  transport.isDirectlyDialable,
                   let port = reader.readUInt16(), port != 0,
                   let nonce = reader.readFixedData(count: ReachabilityProbe.nonceByteCount) else {
                 return nil

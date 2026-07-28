@@ -57,6 +57,8 @@ public struct IvyConfig: Sendable {
     /// Punches running at once, across all peers.
     public let maxConcurrentHolePunches: Int
     public let holePunchPerPeerCooldown: Duration
+    /// Hole-punch dials this node will make in any 60 seconds, across all peers.
+    public let maxPunchDialsPerWindow: Int
     /// Allows private and loopback punch candidates. Off by default: a peer
     /// names its own addresses, so accepting them lets it aim dials at hosts
     /// inside this node's network. Useful on a LAN and in tests.
@@ -108,6 +110,7 @@ public struct IvyConfig: Sendable {
         holePunchTimeout: Duration = .seconds(10),
         maxConcurrentHolePunches: Int = 2,
         holePunchPerPeerCooldown: Duration = .seconds(300),
+        maxPunchDialsPerWindow: Int = 20,
         allowPrivateHolePunchCandidates: Bool = false,
         reachabilityEnabled: Bool = true,
         reachabilityProbeInterval: Duration = .seconds(900),
@@ -136,6 +139,7 @@ public struct IvyConfig: Sendable {
         self.holePunchTimeout = holePunchTimeout
         self.maxConcurrentHolePunches = maxConcurrentHolePunches
         self.holePunchPerPeerCooldown = holePunchPerPeerCooldown
+        self.maxPunchDialsPerWindow = maxPunchDialsPerWindow
         self.allowPrivateHolePunchCandidates = allowPrivateHolePunchCandidates
         // Reachability is an overlay service: a private plane has no NAT story
         // to discover and no strangers to prove reachability to.
@@ -202,6 +206,7 @@ public struct IvyConfig: Sendable {
             guard holePunchAttempts > 0,
                   holePunchTimeout > .zero,
                   maxConcurrentHolePunches > 0,
+                  maxPunchDialsPerWindow > 0,
                   holePunchPerPeerCooldown > .zero else {
                 throw IvyModeError.invalidConfiguration("hole punch limits are invalid")
             }

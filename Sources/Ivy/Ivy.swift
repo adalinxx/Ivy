@@ -183,6 +183,8 @@ public actor Ivy {
     var holePunches: [PeerKey: PendingHolePunch] = [:]
     var holePunchCooldowns: [PeerKey: ContinuousClock.Instant] = [:]
     var holePunchStartTasks: [PeerKey: Task<Void, Never>] = [:]
+    var recentPunchDials: [ContinuousClock.Instant] = []
+    static let punchDialRateWindow: Duration = .seconds(60)
     private var nextHolePunchIDValue: UInt64 = 0
 
     func nextHolePunchID() -> UInt64 {
@@ -253,11 +255,15 @@ public actor Ivy {
         config: IvyConfig,
         group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         tally: Tally? = nil,
-        transports: [any IvyTransport] = [TCPTransport()]
+        transports: [any IvyTransport]? = nil
     ) {
         self.config = config
+        // The default transport is built from the config so a punch can dial from
+        // the listening port, which is what makes the NAT mapping match.
+        let installed = transports
+            ?? [TCPTransport(reusePort: config.holePunchEnabled)]
         self.transports = Dictionary(
-            transports.map { ($0.kind, $0) },
+            installed.map { ($0.kind, $0) },
             uniquingKeysWith: { first, _ in first })
         self.localID = PeerID(publicKey: config.publicKey)
         self.localKey = config.peerKey
@@ -408,6 +414,7 @@ public actor Ivy {
         holePunchStartTasks.removeAll()
         holePunches.removeAll()
         holePunchCooldowns.removeAll()
+        recentPunchDials.removeAll()
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
@@ -3724,7 +3731,9 @@ public actor Ivy {
             maxConnections: config.maxInboundConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
         let inboundByteBudget = self.inboundByteBudget
-        let streamInitializer: @Sendable (Channel) -> EventLoopFuture<Void> = { [weak self] channel in
+        func makeStreamInitializer(
+            _ kind: TransportKind
+        ) -> @Sendable (Channel) -> EventLoopFuture<Void> { { [weak self] channel in
             guard let self else { return channel.close() }
             let connectionBudget = InboundByteBudget(
                 limit: PeerConnection.maxInboundBufferedBytes)
@@ -3736,6 +3745,7 @@ public actor Ivy {
                 let acceptor = InboundConnectionAcceptor(
                     ivy: self,
                     generation: generation,
+                    transportKind: kind,
                     admissionGate: gate,
                     inboundByteBudget: inboundByteBudget,
                     connectionInboundByteBudget: connectionBudget,
@@ -3744,7 +3754,7 @@ public actor Ivy {
             } catch {
                 return channel.eventLoop.makeFailedFuture(error)
             }
-        }
+        } }
 
         var handles: [TransportKind: any TransportListenerHandle] = [:]
         do {
@@ -3753,7 +3763,7 @@ public actor Ivy {
                     host: "0.0.0.0",
                     port: config.listenPort(for: transport.kind),
                     group: group,
-                    streamInitializer: streamInitializer)
+                    streamInitializer: makeStreamInitializer(transport.kind))
             }
         } catch {
             for handle in handles.values { await handle.close() }

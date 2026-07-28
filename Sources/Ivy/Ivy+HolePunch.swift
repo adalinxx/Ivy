@@ -188,6 +188,9 @@ extension Ivy {
     /// it is the point. Every other limit a referral dial faces still applies,
     /// because the address came from the peer itself.
     private func punchDialIsPermitted(to endpoint: PeerEndpoint) -> Bool {
+        // Candidates are addresses the peer chose, so bound the aggregate: the
+        // per-peer cooldown alone would still let many peers sum into a scan.
+        guard recordPunchDialAllowance() else { return false }
         // The host itself was already screened for routability by
         // `acceptablePunchCandidates`, which is where the private-address policy
         // lives; a candidate is still only ever an address the peer chose, so the
@@ -305,6 +308,18 @@ extension Ivy {
         guard let punch = holePunches.removeValue(forKey: peer) else { return }
         punch.timeoutTask?.cancel()
         punch.dialTask?.cancel()
+    }
+
+    /// Consumes one slot from the node-wide punch-dial budget.
+    private func recordPunchDialAllowance() -> Bool {
+        let now = ContinuousClock.now
+        recentPunchDials.removeAll { now - $0 >= Self.punchDialRateWindow }
+        guard recentPunchDials.count < config.maxPunchDialsPerWindow else {
+            config.logger.info("Refusing a hole-punch dial: at the node-wide rate limit")
+            return false
+        }
+        recentPunchDials.append(now)
+        return true
     }
 
     private func isCoolingDown(_ peer: PeerKey) -> Bool {

@@ -7,8 +7,8 @@ and macOS 26, floors that would otherwise propagate to every Ivy consumer.
 
 ## Status: builds and passes an integration test
 
-Requires a **released Tally that admits a swift-crypto prerelease** (3.0.2 or
-later). swift-nio-quic 0.1.0 pins `swift-crypto` **5.0.0-beta.2** exactly, and
+Resolves from a clean checkout as of **Tally 3.0.2**, which admits a swift-crypto
+prerelease. swift-nio-quic 0.1.0 pins `swift-crypto` **5.0.0-beta.2** exactly, and
 SwiftPM never matches a prerelease against a range whose bounds are all releases,
 so a dependency declaring `from: "3.0.0"` makes the graph unresolvable. Ivy and
 Tally both give their lower bound a prerelease component (`"3.0.0-a"..<"6.0.0"`),
@@ -41,7 +41,7 @@ established the design's load-bearing assumptions:
   possible yet; QUIC dials use the same zero binding as direct TCP.
 - Connection migration cannot be disabled through `QUICConfiguration`.
 
-## Building, once resolvable
+## Building
 
 ```
 SWIFT_CERTIFICATES_ALLOW_SWIFT_CRYPTO_BETA=1 swift build
