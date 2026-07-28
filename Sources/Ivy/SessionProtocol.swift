@@ -384,6 +384,17 @@ struct SessionSequenceState: Sendable, Equatable {
 enum SessionWireRecord: Sendable, Equatable {
     private static let magic = Data([0x49, 0x56, 0x59, 0x09])
     static let dataRecordOverhead = magic.count + 1 + 32 + 8 + 4 + 64
+    /// Envelope bytes wrapping a signed hello: magic + tag + the 4-byte
+    /// length prefix `appendSessionData` writes + the 64-byte signature.
+    static let helloRecordEnvelopeOverhead = magic.count + 1 + 4 + 64
+    /// Largest handshake record any connection must carry: a *responder* hello
+    /// (the larger of the two — it pins one extra key) at full metadata, wrapped
+    /// in the signed-record envelope. A `protocolMaxFrameSize` below this cannot
+    /// carry the handshake, so the connection would fail before it starts.
+    static let maxHandshakeRecordSize =
+        PeerMetadata.maxEncodedSize
+        + SessionHelloResponder.encodedOverhead
+        + helloRecordEnvelopeOverhead
 
     case helloInitiator(SignedSessionHelloInitiator)
     case helloResponder(SignedSessionHelloResponder)
