@@ -177,6 +177,9 @@ final class PeerConnection: @unchecked Sendable {
     let connectionID = UUID()
     var endpoint: PeerEndpoint
     var observedHost: String?
+    /// Whether this node accepted the connection rather than dialing it. Fixed at
+    /// construction, so it cannot race with session bookkeeping.
+    let isAccepted: Bool
 
     enum Transport {
         case direct(Channel)
@@ -231,9 +234,11 @@ final class PeerConnection: @unchecked Sendable {
         inboundAdmission: InboundAdmissionLease? = nil,
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
-        connectionInboundByteBudget: InboundByteBudget? = nil
+        connectionInboundByteBudget: InboundByteBudget? = nil,
+        isAccepted: Bool = false
     ) {
         self.endpoint = endpoint
+        self.isAccepted = isAccepted
         self.transport = .direct(channel)
         self.writable = channel.isWritable
         self.inboundAdmission = inboundAdmission
@@ -252,9 +257,11 @@ final class PeerConnection: @unchecked Sendable {
         carrier: PeerKey,
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
-        connectionInboundByteBudget: InboundByteBudget? = nil
+        connectionInboundByteBudget: InboundByteBudget? = nil,
+        isAccepted: Bool = false
     ) {
         self.endpoint = endpoint
+        self.isAccepted = isAccepted
         self.transport = .relayed(routeID: routeID, carrier: carrier)
         self.writable = false
         self.inboundByteBudget = inboundByteBudget
@@ -648,8 +655,23 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
         self.directInbound = directInbound
     }
 
+    func handlerAdded(context: ChannelHandlerContext) {
+        // A stream channel can already be active by the time this handler is
+        // installed, in which case `channelActive` will never fire for it and
+        // admission would never run.
+        guard context.channel.isActive else { return }
+        admit(context: context)
+    }
+
     func channelActive(context: ChannelHandlerContext) {
-        guard connection == nil, let ivy else {
+        admit(context: context)
+        context.fireChannelActive()
+    }
+
+    private func admit(context: ChannelHandlerContext) {
+        // Both entry points can fire for one channel; admitting twice is a no-op.
+        guard connection == nil else { return }
+        guard let ivy else {
             context.close(promise: nil)
             return
         }
@@ -666,7 +688,8 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
             directInbound: directInbound,
             inboundAdmission: lease,
             inboundByteBudget: inboundByteBudget,
-            connectionInboundByteBudget: connectionInboundByteBudget)
+            connectionInboundByteBudget: connectionInboundByteBudget,
+            isAccepted: true)
         connection.observedHost = observedHost
         self.connection = connection
         Task { [weak ivy] in
@@ -682,7 +705,6 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
                 channel.read()
             }
         }
-        context.fireChannelActive()
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {

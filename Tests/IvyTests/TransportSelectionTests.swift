@@ -98,7 +98,7 @@ struct TransportSelectionTests {
             }
         }
 
-        let port = try #require(await listener.listeners.first?.localPort)
+        let port = try #require(await listener.boundPort(for: .quic))
         let endpoint = PeerEndpoint(
             publicKey: try PeerKey(rawRepresentation: listenerKey.publicKey.rawRepresentation).hex,
             host: "127.0.0.1",

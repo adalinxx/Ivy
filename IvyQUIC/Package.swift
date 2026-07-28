@@ -29,5 +29,13 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
             ]
         ),
+        .testTarget(
+            name: "IvyQUICTests",
+            dependencies: [
+                "IvyQUIC",
+                .product(name: "Ivy", package: "Ivy"),
+                .product(name: "NIOCore", package: "swift-nio"),
+            ]
+        ),
     ]
 )

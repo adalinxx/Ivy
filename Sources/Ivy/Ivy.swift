@@ -163,7 +163,13 @@ public actor Ivy {
     var connectedEndpointPeers: [PeerID] {
         sessions.values.compactMap { $0.role == .endpoint ? $0.peerKey.peerID : nil }
     }
-    var listeners: [any TransportListenerHandle] = []
+    var listeners: [TransportKind: any TransportListenerHandle] = [:]
+
+    /// The port a transport actually bound, which is the only way to learn it
+    /// when the configured port is 0.
+    public func boundPort(for kind: TransportKind) -> UInt16? {
+        listeners[kind]?.localPort
+    }
     var running = false
     private var lifecycleTail: Task<Void, Never>?
     var runGeneration: UInt64 = 0
@@ -405,7 +411,7 @@ public actor Ivy {
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
-        for listener in listeners { await listener.close() }
+        for listener in listeners.values { await listener.close() }
         listeners.removeAll()
         let authenticatedConnections = sessions.values.map(\.connection)
         sessions.removeAll()
@@ -538,13 +544,6 @@ public actor Ivy {
         sessions.values.filter {
             $0.role == .endpoint && $0.connection.isDirect && $0.connection.isLive
         }
-    }
-
-    /// True when this connection was accepted by our listener rather than dialed.
-    func isAcceptedPendingConnection(_ connectionID: UUID) -> Bool {
-        guard let pending = pendingSessions[connectionID] else { return false }
-        if case .responder = pending.direction { return true }
-        return false
     }
 
     func liveSession(for key: PeerKey) -> AuthenticatedSession? {
@@ -1339,7 +1338,7 @@ public actor Ivy {
         // unmatched nonce is not misbehaviour, so the socket closes without blame.
         if session(for: connection.connectionID) == nil,
            connection.isDirect,
-           isAcceptedPendingConnection(connection.connectionID),
+           connection.isAccepted,
            let nonce = ReachabilityProbe.decode(bytes) {
             _ = confirmReachability(nonce: nonce, arrivingOn: connection.endpoint.transport)
             failPendingSession(connection.connectionID)
@@ -3212,7 +3211,7 @@ public actor Ivy {
         lifecycleTail?.cancel()
         publicAddressDiscoveryTask?.cancel()
         routingRefreshTimer?.cancel()
-        for listener in listeners { listener.closeImmediately() }
+        for listener in listeners.values { listener.closeImmediately() }
         for timer in reachabilityTimers.values { timer.cancel() }
         for timer in reachabilityDeadlines.values { timer.cancel() }
         for reconnect in reconnectTasks.values { reconnect.task.cancel() }
@@ -3710,7 +3709,10 @@ public actor Ivy {
     /// so capacity and netgroup diversity are accounted across transports (IVY-001).
     func startListeners(
         generation: UInt64
-    ) async throws -> (handles: [any TransportListenerHandle], gate: InboundAdmissionGate) {
+    ) async throws -> (
+        handles: [TransportKind: any TransportListenerHandle],
+        gate: InboundAdmissionGate
+    ) {
         let gate = InboundAdmissionGate(
             maxConnections: config.maxInboundConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
@@ -3737,17 +3739,17 @@ public actor Ivy {
             }
         }
 
-        var handles: [any TransportListenerHandle] = []
+        var handles: [TransportKind: any TransportListenerHandle] = [:]
         do {
             for transport in transports.values.sorted(by: { $0.kind.rawValue < $1.kind.rawValue }) {
-                handles.append(try await transport.listen(
+                handles[transport.kind] = try await transport.listen(
                     host: "0.0.0.0",
                     port: config.listenPort(for: transport.kind),
                     group: group,
-                    streamInitializer: streamInitializer))
+                    streamInitializer: streamInitializer)
             }
         } catch {
-            for handle in handles { await handle.close() }
+            for handle in handles.values { await handle.close() }
             throw error
         }
 
