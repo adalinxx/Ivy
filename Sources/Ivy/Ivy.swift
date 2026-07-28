@@ -165,6 +165,28 @@ public actor Ivy {
     var runGeneration: UInt64 = 0
     private var inboundAdmissionGate: InboundAdmissionGate?
 
+    var reachability: [TransportKind: ReachabilityState] = [:]
+    var pendingReachabilityProbes: [Data: PendingReachabilityProbe] = [:]
+    var reachabilityTimers: [TransportKind: IvyTimer] = [:]
+    var reachabilityDeadlines: [TransportKind: IvyTimer] = [:]
+    var lastDialBack: [PeerKey: ContinuousClock.Instant] = [:]
+    var activeDialBacks = 0
+    private var nextReachabilityRequestIDValue: UInt64 = 0
+
+    var installedTransportKinds: [TransportKind] {
+        transports.keys.sorted { $0.rawValue < $1.rawValue }
+    }
+
+    /// Whether peers can dial this node directly on `kind`.
+    public func reachabilityStatus(for kind: TransportKind) -> Reachability {
+        reachability[kind]?.status ?? .unknown
+    }
+
+    func nextReachabilityRequestID() -> UInt64 {
+        nextReachabilityRequestIDValue &+= 1
+        return nextReachabilityRequestIDValue
+    }
+
     let stunClient: STUNClient
     private var publicAddressDiscoveryTask: Task<Void, Never>?
     private(set) public var publicAddress: ObservedAddress?
@@ -313,6 +335,7 @@ public actor Ivy {
         if config.mode.participatesInPublicDiscovery {
             startRoutingRefresh(generation: generation)
         }
+        startReachabilityProbes(generation: generation)
     }
 
     public func stop() async {
@@ -344,6 +367,13 @@ public actor Ivy {
         inboundAdmissionGate = nil
         routingRefreshTimer?.cancel()
         routingRefreshTimer = nil
+        for timer in reachabilityTimers.values { timer.cancel() }
+        for timer in reachabilityDeadlines.values { timer.cancel() }
+        reachabilityTimers.removeAll()
+        reachabilityDeadlines.removeAll()
+        pendingReachabilityProbes.removeAll()
+        reachability.removeAll()
+        lastDialBack.removeAll()
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
@@ -474,6 +504,16 @@ public actor Ivy {
                 && session.connection.isDirect
                 && connectionNetgroup(session.connection) == group
         }.count
+    }
+
+    var directEndpointSessions: [AuthenticatedSession] {
+        sessions.values.filter {
+            $0.role == .endpoint && $0.connection.isDirect && $0.connection.isLive
+        }
+    }
+
+    func liveSession(for key: PeerKey) -> AuthenticatedSession? {
+        sessions[key]
     }
 
     func connectionNetgroup(_ connection: PeerConnection) -> String {
@@ -1150,6 +1190,16 @@ public actor Ivy {
     }
 
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
+        // A dial-back proving our reachability arrives as the only frame on a
+        // fresh inbound connection, before any session exists. An unmatched nonce
+        // is not evidence of misbehaviour, so the socket closes without blame.
+        if session(for: connection.connectionID) == nil,
+           let nonce = ReachabilityProbe.decode(bytes) {
+            _ = confirmReachability(nonce: nonce)
+            failPendingSession(connection.connectionID)
+            return
+        }
+
         let record: SessionWireRecord
         do {
             record = try SessionWireRecord.deserialize(bytes)
@@ -1769,6 +1819,34 @@ public actor Ivy {
             payload,
             on: session,
             bypassAdmission: bypassAdmission || message.isKeepalive)
+    }
+
+    func enqueueReachabilityRequest(
+        requestID: UInt64,
+        transport: TransportKind,
+        port: UInt16,
+        nonce: Data,
+        on session: AuthenticatedSession
+    ) -> SendMessageResult {
+        enqueue(
+            .reachabilityRequest(
+                requestID: requestID,
+                transport: transport,
+                port: port,
+                nonce: nonce),
+            on: session,
+            bypassAdmission: false)
+    }
+
+    func sendReachabilityResponse(
+        requestID: UInt64,
+        status: ReachabilityStatus,
+        on session: AuthenticatedSession
+    ) {
+        enqueue(
+            .reachabilityResponse(requestID: requestID, status: status),
+            on: session,
+            bypassAdmission: false)
     }
 
     private func enqueuePayload(
@@ -2730,6 +2808,19 @@ public actor Ivy {
         case .announceProvider(let rootCID, let expiresAt):
             handleAnnounceProvider(rootCID: rootCID, expiresAt: expiresAt, from: peer)
 
+        case .reachabilityRequest(let requestID, let transport, let port, let nonce):
+            guard let session else { return }
+            await handleReachabilityRequest(
+                requestID: requestID,
+                transport: transport,
+                port: port,
+                nonce: nonce,
+                session: session)
+
+        case .reachabilityResponse(let requestID, let status):
+            guard session != nil else { return }
+            handleReachabilityResponse(requestID: requestID, status: status, from: peer)
+
         case .peerMessage(let topic, let payload):
             guard let session else { return }
             await delegate?.ivy(
@@ -2905,6 +2996,8 @@ public actor Ivy {
         publicAddressDiscoveryTask?.cancel()
         routingRefreshTimer?.cancel()
         for listener in listeners { listener.closeImmediately() }
+        for timer in reachabilityTimers.values { timer.cancel() }
+        for timer in reachabilityDeadlines.values { timer.cancel() }
         for reconnect in reconnectTasks.values { reconnect.task.cancel() }
         for route in relayRoutes.values { route.expiryTask?.cancel() }
         for route in installedRoutes.values {
@@ -3328,6 +3421,21 @@ public actor Ivy {
     }
 
     var pendingSessionCountForTesting: Int { pendingSessions.count }
+
+    func registerReachabilityProbeForTesting(
+        requestID: UInt64,
+        peer: PeerKey,
+        transport: TransportKind,
+        nonce: Data
+    ) {
+        reachability[transport, default: ReachabilityState()].beginRound(probeCount: 1)
+        pendingReachabilityProbes[nonce] = PendingReachabilityProbe(
+            requestID: requestID,
+            peer: peer,
+            transport: transport,
+            nonce: nonce,
+            generation: runGeneration)
+    }
 
     var sentContentRepliesForTesting: [UUID] { contentReplyConnectionsForTesting }
 #endif

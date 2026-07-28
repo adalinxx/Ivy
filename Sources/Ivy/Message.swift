@@ -15,6 +15,12 @@ struct ProviderRecord: Sendable, Equatable {
     let expiresAt: UInt64
 }
 
+enum ReachabilityStatus: UInt8, Sendable, Equatable {
+    case dialed = 0
+    case refused = 1
+    case dialFailed = 2
+}
+
 enum Message: Sendable {
     case ping(nonce: UInt64)
     case pong(nonce: UInt64)
@@ -46,6 +52,14 @@ enum Message: Sendable {
     case relayPacket(routeID: Data, opaqueEndpointRecord: Data)
     case relayClose(routeID: Data)
 
+    /// Asks the receiver to dial this sender back at `port` on the address it
+    /// already observes for the session, proving the sender is publicly
+    /// reachable. There is deliberately no host field: the target is the
+    /// observed source address, which the sender cannot forge, so the exchange
+    /// cannot be aimed at a third party (IVY-024).
+    case reachabilityRequest(requestID: UInt64, transport: TransportKind, port: UInt16, nonce: Data)
+    case reachabilityResponse(requestID: UInt64, status: ReachabilityStatus)
+
     case peerMessage(topic: String, payload: Data)
 
     private enum Tag: UInt8 {
@@ -68,6 +82,8 @@ enum Message: Sendable {
         case relayReady = 63
         case relayPacket = 64
         case relayClose = 65
+        case reachabilityRequest = 70
+        case reachabilityResponse = 71
     }
 
     var isKeepalive: Bool {
@@ -243,6 +259,20 @@ enum Message: Sendable {
             guard routeID.count == 32 else { return false }
             bytes.append(Tag.relayClose.rawValue)
             bytes.append(routeID)
+        case .reachabilityRequest(let requestID, let transport, let port, let nonce):
+            guard requestID != 0,
+                  port != 0,
+                  nonce.count == ReachabilityProbe.nonceByteCount else { return false }
+            bytes.append(Tag.reachabilityRequest.rawValue)
+            bytes.appendUInt64(requestID)
+            bytes.append(transport.rawValue)
+            bytes.appendUInt16(port)
+            bytes.append(nonce)
+        case .reachabilityResponse(let requestID, let status):
+            guard requestID != 0 else { return false }
+            bytes.append(Tag.reachabilityResponse.rawValue)
+            bytes.appendUInt64(requestID)
+            bytes.append(status.rawValue)
         case .peerMessage(let topic, let payload):
             guard !topic.isEmpty else { return false }
             bytes.append(Tag.peerMessage.rawValue)
@@ -387,6 +417,23 @@ enum Message: Sendable {
         case .relayClose:
             guard let routeID = reader.readFixedData(count: 32) else { return nil }
             return .relayClose(routeID: routeID)
+        case .reachabilityRequest:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let transport = reader.readTransportKind(),
+                  let port = reader.readUInt16(), port != 0,
+                  let nonce = reader.readFixedData(count: ReachabilityProbe.nonceByteCount) else {
+                return nil
+            }
+            return .reachabilityRequest(
+                requestID: requestID,
+                transport: transport,
+                port: port,
+                nonce: nonce)
+        case .reachabilityResponse:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let rawStatus = reader.readUInt8(),
+                  let status = ReachabilityStatus(rawValue: rawStatus) else { return nil }
+            return .reachabilityResponse(requestID: requestID, status: status)
         case .peerMessage:
             guard let topic = reader.readString(), let payload = reader.readData() else { return nil }
             return .peerMessage(topic: topic, payload: payload)
