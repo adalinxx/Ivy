@@ -19,6 +19,43 @@ private struct RelayVolumeSource: IvyContentSource {
 
 @Suite("Configured carrier relay", .serialized)
 struct RelayIntegrationTests {
+    @Test("relayed outbound frame is capped by the carrier's advertised limit")
+    func relayedFrameCappedByCarrier() async throws {
+        let carrierIdentity = TransportTestHarness.identity("relay-cap-carrier")
+        let endpointIdentity = TransportTestHarness.identity("relay-cap-endpoint")
+        let carrierKey = TransportTestHarness.key(carrierIdentity)
+        let carrierEndpoint = TransportTestHarness.endpoint(carrierIdentity, port: 4001)
+        let endpointEndpoint = TransportTestHarness.endpoint(endpointIdentity, port: 4002)
+
+        let node = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("relay-cap-node"),
+            port: TransportTestHarness.nextPort()))
+
+        // The carrier authenticates in the .carrier role with a 4 MiB accept limit.
+        let carrierChannel = EmbeddedChannel()
+        try await carrierChannel.connect(
+            to: SocketAddress(ipAddress: "127.0.0.1", port: 4001)).get()
+        let carrierConnection = PeerConnection(endpoint: carrierEndpoint, channel: carrierChannel)
+        carrierConnection.peerMaxFrameSize = 4 * 1024 * 1024
+        try await node.seedConnectedEndpointForTesting(
+            carrierEndpoint,
+            connection: carrierConnection,
+            role: .carrier,
+            marker: 1)
+
+        // An endpoint reached over a relay through that carrier advertises 8 MiB.
+        let relayed = PeerConnection(
+            endpoint: endpointEndpoint,
+            routeID: Data(repeating: 2, count: 32),
+            carrier: carrierKey)
+        relayed.peerMaxFrameSize = 8 * 1024 * 1024
+
+        // Must cap at the carrier's 4 MiB — a .carrier-role session is invisible
+        // to endpoint-role lookups, so before the fix this returned the full 8 MiB.
+        let effective = await node.effectiveOutboundFrameSize(for: relayed)
+        #expect(effective == 4 * 1024 * 1024)
+    }
+
     @Test("unconfigured overlay peers cannot inject unrelated relay state")
     func unrelatedRelayControlIsRejected() async throws {
         let senderIdentity = TransportTestHarness.identity("relay-unrelated-sender")

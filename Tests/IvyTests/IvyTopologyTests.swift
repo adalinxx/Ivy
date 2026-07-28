@@ -84,6 +84,29 @@ struct IvyTopologyTests {
         }
     }
 
+    @Test("protocolMaxFrameSize must carry the largest handshake record exactly")
+    func frameSizeMustCarryLargestHandshakeRecord() {
+        // The largest record is a responder hello (64 KiB metadata + 5 pinned
+        // keys) wrapped in the signed-record envelope: 65536 + 166 + 73 = 65775.
+        #expect(SessionWireRecord.maxHandshakeRecordSize == 65_775)
+
+        let invalidMessage = "route, provider-TTL, volume, or frame-size limits are invalid"
+        // One byte short cannot carry the responder handshake → rejected.
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(
+                signingKey: identity(1),
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxHandshakeRecordSize - 1)
+            ).validate()
+        }
+        // Exactly the boundary is accepted.
+        #expect(throws: Never.self) {
+            try IvyConfig(
+                signingKey: identity(1),
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxHandshakeRecordSize)
+            ).validate()
+        }
+    }
+
     @Test("inbound admission bypass is pinned to a private bootstrap peer")
     func inboundAdmissionBypassValidation() throws {
         let local = identity(1)

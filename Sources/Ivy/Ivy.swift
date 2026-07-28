@@ -160,8 +160,12 @@ public actor Ivy {
     func effectiveOutboundFrameSize(for connection: PeerConnection?) -> UInt32 {
         guard let connection else { return IvyConfig.defaultProtocolMaxFrameSize }
         var limit = connection.peerMaxFrameSize
+        // A configured carrier authenticates in the `.carrier` role, so it is not
+        // found by endpoint-role lookups; use the direct-carrier session lookup so
+        // an 8 MiB endpoint behind a 4 MiB carrier is capped at the carrier's 4 MiB
+        // rather than building a frame the carrier will refuse to forward.
         if case .relayed(_, let carrier) = connection.transport,
-           let carrierConnection = endpointConnection(for: carrier.peerID) {
+           let carrierConnection = directRelayCarrierSession(for: carrier)?.connection {
             limit = min(limit, carrierConnection.peerMaxFrameSize)
         }
         return limit
