@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import Ivy
 
-@Suite("Reachability")
+@Suite("Reachability", .serialized)
 struct ReachabilityTests {
     @Test("a dial-back frame roundtrips and rejects malformed input")
     func probeFrameCodec() throws {
