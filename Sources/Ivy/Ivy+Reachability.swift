@@ -59,11 +59,16 @@ extension Ivy {
 
     /// Picks authenticated direct endpoint sessions in distinct netgroups, so one
     /// operator cannot supply every confirmation.
+    ///
+    /// The order is random rather than by peer key: a deterministic order is
+    /// grindable, and an attacker holding the first few keys could capture every
+    /// probe slot round after round.
     private func reachabilityProbeSample() -> [AuthenticatedSession] {
         var seenGroups: Set<String> = []
         var sample: [AuthenticatedSession] = []
+        var generator = SystemRandomNumberGenerator()
         let candidates: [AuthenticatedSession] = directEndpointSessions
-            .sorted { $0.peerKey < $1.peerKey }
+            .shuffled(using: &generator)
         for session in candidates {
             let group = connectionNetgroup(session.connection)
             guard seenGroups.insert(group).inserted else { continue }
@@ -109,9 +114,13 @@ extension Ivy {
 
     /// A dial-back landed: this node is reachable on that transport. Only an
     /// inbound nonce counts, so a peer cannot talk us into a false positive.
-    func confirmReachability(nonce: Data) -> Bool {
-        guard let probe = pendingReachabilityProbes.removeValue(forKey: nonce),
+    func confirmReachability(nonce: Data, arrivingOn transport: TransportKind) -> Bool {
+        guard let probe = pendingReachabilityProbes[nonce],
+              // The dial-back must arrive on the transport it was asked for, or it
+              // says nothing about that transport's reachability.
+              probe.transport == transport,
               isCurrentRun(probe.generation) else { return false }
+        pendingReachabilityProbes.removeValue(forKey: nonce)
         var state = reachability[probe.transport, default: ReachabilityState()]
         let previous = state.status
         state.recordConfirmation(required: config.reachabilityConfirmations)

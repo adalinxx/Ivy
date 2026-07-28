@@ -130,6 +130,29 @@ struct ReachabilityTests {
         await helper.stop()
     }
 
+    @Test("a nonce arriving on a connection we dialed proves nothing")
+    func dialBackMustArriveOnAnAcceptedConnection() async throws {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: deterministicTestPeerKey("prover-2"),
+            listenPort: 0,
+            stunServers: []))
+        let nonce = Data(repeating: 0x44, count: ReachabilityProbe.nonceByteCount)
+        await ivy.registerReachabilityProbeForTesting(
+            requestID: 1,
+            peer: try PeerKey(deterministicTestPeerKey("helper-2")),
+            transport: .tcp,
+            nonce: nonce)
+
+        // The transport must match the one probed, or the nonce says nothing
+        // about that transport.
+        #expect(await !ivy.confirmReachability(nonce: nonce, arrivingOn: .quic))
+        #expect(await ivy.reachabilityStatus(for: .tcp) == .unknown)
+        // An unknown nonce is never a confirmation.
+        #expect(await !ivy.confirmReachability(
+            nonce: Data(repeating: 0x99, count: ReachabilityProbe.nonceByteCount),
+            arrivingOn: .tcp))
+    }
+
     @Test("a dial-back only ever targets a direct endpoint's observed address")
     func dialBackTargetsObservedAddressOnly() {
         #expect(Ivy.dialBackHost(

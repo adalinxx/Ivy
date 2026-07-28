@@ -188,8 +188,13 @@ extension Ivy {
     /// it is the point. Every other limit a referral dial faces still applies,
     /// because the address came from the peer itself.
     private func punchDialIsPermitted(to endpoint: PeerEndpoint) -> Bool {
+        // The host itself was already screened for routability by
+        // `acceptablePunchCandidates`, which is where the private-address policy
+        // lives; a candidate is still only ever an address the peer chose, so the
+        // rest of the endpoint policy applies unchanged.
         guard let key = try? PeerKey(endpoint.publicKey),
               config.allowsEndpoint(key),
+              peerMeetsDifficulty(key),
               !reconnectSuppressed.contains(key.peerID),
               connectionCapacityUsed < config.maxConnections else { return false }
         let group = NetGroup.group(endpoint.host)
