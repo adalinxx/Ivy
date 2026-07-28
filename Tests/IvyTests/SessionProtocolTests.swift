@@ -267,6 +267,28 @@ struct SessionProtocolTests {
 
         #expect(Ivy.preferredSessionID(larger, smaller) == smaller)
         #expect(Ivy.preferredSessionID(smaller, larger) == smaller)
+
+        // Between two sessions of the same transport class the smaller ID wins,
+        // in whichever order the two peers see them.
+        #expect(Ivy.prefersExistingSession(
+            existingID: smaller, existingIsDirect: true,
+            incomingID: larger, incomingIsDirect: true))
+        #expect(!Ivy.prefersExistingSession(
+            existingID: larger, existingIsDirect: true,
+            incomingID: smaller, incomingIsDirect: true))
+
+        // A direct session beats a relayed one even when its ID is larger, so a
+        // punched connection replaces the relay that arranged it.
+        #expect(!Ivy.prefersExistingSession(
+            existingID: smaller, existingIsDirect: false,
+            incomingID: larger, incomingIsDirect: true))
+        #expect(Ivy.prefersExistingSession(
+            existingID: smaller, existingIsDirect: true,
+            incomingID: larger, incomingIsDirect: false))
+        // Both peers see the same pair, so neither keeps the relayed session.
+        #expect(Ivy.prefersExistingSession(
+            existingID: larger, existingIsDirect: true,
+            incomingID: smaller, incomingIsDirect: false))
     }
 
     @Test("application frames are not session records")
