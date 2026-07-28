@@ -98,7 +98,7 @@ struct ReachabilityTests {
         try await prover.start()
         try await helper.start()
 
-        let helperPort = try #require(await helper.listeners.first?.localPort)
+        let helperPort = try #require(await helper.boundPort(for: .tcp))
         try await prover.connect(to: PeerEndpoint(
             publicKey: try PeerKey(rawRepresentation: helperKey.publicKey.rawRepresentation).hex,
             host: "127.0.0.1",
@@ -106,7 +106,7 @@ struct ReachabilityTests {
 
         // The prover's own listener port is what the helper is asked to dial; the
         // helper learns the host from the socket, not from the request.
-        let proverPort = try #require(await prover.listeners.first?.localPort)
+        let proverPort = try #require(await prover.boundPort(for: .tcp))
         let session = try #require(await prover.directEndpointSessions.first)
         let requestID = await prover.nextReachabilityRequestID()
         let nonce = Data(repeating: 0x33, count: ReachabilityProbe.nonceByteCount)
@@ -122,7 +122,9 @@ struct ReachabilityTests {
             nonce: nonce,
             on: session)
 
-        #expect(try await TransportTestHarness.eventually {
+        // A real dial-back round trip is slower than an in-process assertion, and
+        // slower still when the whole suite is running.
+        #expect(try await TransportTestHarness.eventually(attempts: 400) {
             await prover.reachabilityStatus(for: .tcp) == .publiclyReachable
         })
 

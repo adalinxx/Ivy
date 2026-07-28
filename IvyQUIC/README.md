@@ -5,26 +5,21 @@ QUIC transport for Ivy, backed by [swift-nio-quic](https://github.com/apple/swif
 Kept as a separate package because swift-nio-quic requires a Swift 6.3 toolchain
 and macOS 26, floors that would otherwise propagate to every Ivy consumer.
 
-## Status: does not resolve yet
+## Status: builds and passes an integration test
 
-swift-nio-quic 0.1.0 depends on `swift-crypto` **5.0.0-beta.2**. SwiftPM never
-matches a prerelease against a version range, so that beta cannot coexist with any
-package requiring a released swift-crypto — including Ivy and, transitively, Tally
-(`swift-crypto 3.0.0..<4.0.0`). Forcing Ivy onto the prerelease does not help:
+Requires a **released Tally that admits a swift-crypto prerelease** (3.0.2 or
+later). swift-nio-quic 0.1.0 pins `swift-crypto` **5.0.0-beta.2** exactly, and
+SwiftPM never matches a prerelease against a range whose bounds are all releases,
+so a dependency declaring `from: "3.0.0"` makes the graph unresolvable. Ivy and
+Tally both give their lower bound a prerelease component (`"3.0.0-a"..<"6.0.0"`),
+which admits the beta when something demands it while leaving ordinary builds on
+the newest stable release — verified: Ivy alone still resolves swift-crypto 3.15.1.
 
-```
-error: Dependencies could not be resolved because 'ivy' depends on 'tally' 3.0.0..<4.0.0
-and 'ivy' depends on 'swift-crypto' 5.0.0-beta.1..<6.0.0.
-```
+## What is verified against the real library
 
-This unblocks itself when swift-nio-quic (or swift-certificates) ships against a
-released swift-crypto 5.x, or when Tally widens its own range. The sources here are
-written against the real 0.1.0 API and are ready to build at that point.
-
-## What was verified against the real library
-
-A standalone probe (Swift 6.3.3 / macOS 26.3) established the design's load-bearing
-assumptions, so the code here is not speculative:
+Two Ivy nodes complete an authenticated session over QUIC
+(`Tests/IvyQUICTests`). A standalone probe (Swift 6.3.3 / macOS 26.3) also
+established the design's load-bearing assumptions:
 
 - **Admission before reads holds.** Setting `autoRead = false` on a QUIC stream
   channel inside the inbound stream initializer sticks (children otherwise inherit
@@ -42,7 +37,6 @@ assumptions, so the code here is not speculative:
 - Dialing from the listener's own UDP port shares one socket between the listener
   and the dial, which this code does not yet arrange; a punch therefore leaves
   from whatever port the bind yields.
-
 - No TLS exporter is exposed, so mixing a channel binding into `routeBinding` is not
   possible yet; QUIC dials use the same zero binding as direct TCP.
 - Connection migration cannot be disabled through `QUICConfiguration`.

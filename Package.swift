@@ -9,7 +9,11 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/adalinxx/Tally.git", from: "3.0.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
+        // The lower bound carries a prerelease so a graph that also contains a
+        // package pinning a swift-crypto prerelease can resolve; SwiftPM never
+        // matches a prerelease against a range whose bounds are all releases.
+        // Ordinary builds still take the newest stable release.
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0-a"..<"6.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
     targets: [
