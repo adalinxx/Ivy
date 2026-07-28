@@ -84,25 +84,28 @@ struct IvyTopologyTests {
         }
     }
 
-    @Test("protocolMaxFrameSize must carry the largest handshake record exactly")
+    @Test("protocolMaxFrameSize must carry the largest RELAYED handshake exactly")
     func frameSizeMustCarryLargestHandshakeRecord() {
-        // The largest record is a responder hello (64 KiB metadata + 5 pinned
-        // keys) wrapped in the signed-record envelope: 65536 + 166 + 73 = 65775.
+        // Direct: responder hello (64 KiB metadata + 5 pinned keys) in the signed
+        // envelope = 65536 + 166 + 73 = 65775. Relayed adds a relayPacket (37) and
+        // the carrier's signed data record (113): 65775 + 37 + 113 = 65925. The
+        // config floor is the relayed maximum, so any node can forward a handshake.
         #expect(SessionWireRecord.maxHandshakeRecordSize == 65_775)
+        #expect(SessionWireRecord.maxRelayedHandshakeRecordSize == 65_925)
 
         let invalidMessage = "route, provider-TTL, volume, or frame-size limits are invalid"
-        // One byte short cannot carry the responder handshake → rejected.
+        // The direct maximum is NOT enough — it cannot carry the relayed handshake.
         #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
             try IvyConfig(
                 signingKey: identity(1),
-                protocolMaxFrameSize: UInt32(SessionWireRecord.maxHandshakeRecordSize - 1)
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxRelayedHandshakeRecordSize - 1)
             ).validate()
         }
-        // Exactly the boundary is accepted.
+        // Exactly the relayed boundary is accepted.
         #expect(throws: Never.self) {
             try IvyConfig(
                 signingKey: identity(1),
-                protocolMaxFrameSize: UInt32(SessionWireRecord.maxHandshakeRecordSize)
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxRelayedHandshakeRecordSize)
             ).validate()
         }
     }

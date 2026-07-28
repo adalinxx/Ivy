@@ -48,6 +48,10 @@ enum Message: Sendable {
 
     case peerMessage(topic: String, payload: Data)
 
+    /// Bytes a `relayPacket` adds around its opaque endpoint record: the message
+    /// tag, the 32-byte route ID, and the 4-byte length prefix on the record.
+    static let relayPacketEnvelopeOverhead = 1 + 32 + 4
+
     private enum Tag: UInt8 {
         case ping = 0
         case pong = 1
