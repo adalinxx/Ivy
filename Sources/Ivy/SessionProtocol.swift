@@ -58,7 +58,10 @@ public struct PeerMetadata: Sendable, Equatable {
             guard let host = reader.readString(),
                   let port = reader.readUInt16(),
                   let tag = reader.readUInt8(),
-                  let transport = TransportKind(rawValue: tag) else {
+                  let transport = TransportKind(rawValue: tag),
+                  // A listen address is a socket a peer binds; a relay endpoint
+                  // is not one and belongs only in provider records.
+                  transport.isDirectlyDialable else {
                 throw SessionProtocolError.malformed
             }
             addresses.append(ListenAddress(host: host, port: port, transport: transport))

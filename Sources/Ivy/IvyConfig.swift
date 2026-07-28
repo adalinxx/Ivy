@@ -45,6 +45,10 @@ public struct IvyConfig: Sendable {
     public let minPeerKeyBits: Int
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
+    /// Inbound relayed sessions accepted at once. A relayed peer's own address is
+    /// unobservable, so the netgroup cap cannot bound it and this does instead.
+    public let maxRelayedInboundConnections: Int
+    public let maxRelayedInboundPerCarrier: Int
     /// Probes peers to learn whether this node is dialable from outside its NAT.
     public let reachabilityEnabled: Bool
     public let reachabilityProbeInterval: Duration
@@ -85,6 +89,8 @@ public struct IvyConfig: Sendable {
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        maxRelayedInboundConnections: Int = 32,
+        maxRelayedInboundPerCarrier: Int = 8,
         reachabilityEnabled: Bool = true,
         reachabilityProbeInterval: Duration = .seconds(900),
         reachabilityProbeSampleSize: Int = 4,
@@ -105,6 +111,8 @@ public struct IvyConfig: Sendable {
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
+        self.maxRelayedInboundConnections = maxRelayedInboundConnections
+        self.maxRelayedInboundPerCarrier = maxRelayedInboundPerCarrier
         // Reachability is an overlay service: a private plane has no NAT story
         // to discover and no strangers to prove reachability to.
         self.reachabilityEnabled = reachabilityEnabled && mode.usesOverlayServices
@@ -137,6 +145,8 @@ public struct IvyConfig: Sendable {
         switch kind {
         case .tcp: return listenPort
         case .quic: return quicListenPort ?? listenPort
+        // A relay endpoint names a carrier to reach, not a socket to bind.
+        case .relay: return 0
         }
     }
 
@@ -163,6 +173,9 @@ public struct IvyConfig: Sendable {
               relayTimeout > .zero,
               routingRefreshInterval > .zero else {
             throw IvyModeError.invalidConfiguration("routing and timeout limits are invalid")
+        }
+        guard maxRelayedInboundConnections > 0, maxRelayedInboundPerCarrier > 0 else {
+            throw IvyModeError.invalidConfiguration("relayed inbound limits must be positive")
         }
         if reachabilityEnabled {
             guard reachabilityProbeInterval > .zero,

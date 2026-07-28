@@ -165,6 +165,9 @@ public actor Ivy {
     var runGeneration: UInt64 = 0
     private var inboundAdmissionGate: InboundAdmissionGate?
 
+    /// Peers a provider record named as a carrier for someone, which we may send
+    /// relay requests to even though they are not configured carriers.
+    var advertisedCarriers: Set<PeerKey> = []
     var reachability: [TransportKind: ReachabilityState] = [:]
     var pendingReachabilityProbes: [Data: PendingReachabilityProbe] = [:]
     var reachabilityTimers: [TransportKind: IvyTimer] = [:]
@@ -374,6 +377,7 @@ public actor Ivy {
         pendingReachabilityProbes.removeAll()
         reachability.removeAll()
         lastDialBack.removeAll()
+        advertisedCarriers.removeAll()
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
@@ -516,6 +520,12 @@ public actor Ivy {
         sessions[key]
     }
 
+    var liveCarrierKeys: [PeerKey] {
+        sessions.values
+            .filter { $0.role == .carrier && $0.connection.isDirect && $0.connection.isLive }
+            .map(\.peerKey)
+    }
+
     func connectionNetgroup(_ connection: PeerConnection) -> String {
         guard let host = connection.observedHost, !host.isEmpty else {
             return "raw:connection:" + connection.connectionID.uuidString
@@ -569,7 +579,8 @@ public actor Ivy {
         if let requiredGeneration, requiredGeneration != generation {
             throw IvyError.notRunning
         }
-        for route in orderedByDialPreference(routes) {
+        let ordered = orderedByDialPreference(routes)
+        for route in ordered where route.transport.isDirectlyDialable {
             do {
                 if try await connectDirect(
                     to: route,
@@ -589,7 +600,49 @@ public actor Ivy {
             }
         }
         guard config.mode.usesOverlayServices else { throw IvyError.noRelayAvailable }
+        // A peer that advertised a carrier tells us where to find it; reaching it
+        // needs a session with that carrier first.
+        for route in ordered where route.transport == .relay {
+            if await openAdvertisedCarrier(named: route, generation: generation) { break }
+        }
         try await connectViaRelay(to: endpoint, requiredGeneration: generation)
+        return true
+    }
+
+    /// Connects to a carrier a provider record named, as an ordinary peer under
+    /// the usual dial limits, and permits one relay request to it. The record can
+    /// name any address, so the dial is bounded exactly like a referral dial.
+    private func openAdvertisedCarrier(
+        named route: PeerEndpoint,
+        generation: UInt64
+    ) async -> Bool {
+        guard let carrierKeyText = route.carrierKey,
+              let carrier = try? PeerKey(carrierKeyText),
+              carrier != localKey,
+              (try? PeerKey(route.publicKey)) != carrier,
+              config.allowsEndpoint(carrier) else { return false }
+        if liveSession(for: carrier) != nil {
+            advertisedCarriers.insert(carrier)
+            return true
+        }
+        let endpoint = PeerEndpoint(
+            publicKey: carrier.hex,
+            host: route.host,
+            port: route.port)
+        guard isAcceptableDiscoveredEndpoint(
+            endpoint,
+            provenance: .referral("provider carrier"),
+            from: carrier.peerID) else { return false }
+        do {
+            guard try await connectDirect(
+                to: endpoint,
+                key: carrier,
+                role: .endpoint,
+                generation: generation) else { return false }
+        } catch {
+            return false
+        }
+        advertisedCarriers.insert(carrier)
         return true
     }
 
@@ -1028,6 +1081,28 @@ public actor Ivy {
         sessions.count + pendingSessions.count + unrepresentedOutgoingDials.count
     }
 
+    func relayedInboundHasCapacity(carrier: PeerKey) -> Bool {
+        var total = 0
+        var viaCarrier = 0
+        for connection in inboundRelayedConnections {
+            guard case .relayed(_, let existing) = connection.transport else { continue }
+            total += 1
+            if existing == carrier { viaCarrier += 1 }
+        }
+        return total < config.maxRelayedInboundConnections
+            && viaCarrier < config.maxRelayedInboundPerCarrier
+    }
+
+    private var inboundRelayedConnections: [PeerConnection] {
+        let pending = pendingSessions.values.lazy
+            .filter { !$0.connection.isDirect }
+            .map(\.connection)
+        let authenticated = sessions.values.lazy
+            .filter { !$0.connection.isDirect }
+            .map(\.connection)
+        return Array(pending) + Array(authenticated)
+    }
+
     private func directConnectionCount(inNetgroup group: String) -> Int {
         let authenticated = sessions.values.lazy.filter {
             $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
@@ -1050,6 +1125,14 @@ public actor Ivy {
               (!connection.isDirect
                 || directConnectionCount(inNetgroup: netgroup)
                     < config.maxConnectionsPerNetgroup) else {
+            connection.cancel()
+            return false
+        }
+        // A relayed peer's own address is unobservable, so the netgroup cap above
+        // cannot bound it. Cap relayed inbound separately, overall and per carrier,
+        // or one operator behind a carrier could take every inbound slot.
+        if case .relayed(_, let carrier) = connection.transport,
+           !relayedInboundHasCapacity(carrier: carrier) {
             connection.cancel()
             return false
         }
@@ -2112,6 +2195,10 @@ public actor Ivy {
 
     private func endpointMayReceiveRelayControl(_ message: Message, peer: PeerKey) -> Bool {
         switch message {
+        case .relayOpen:
+            // Only towards a peer the target named as its carrier, and only while
+            // we are actually opening a route through it.
+            return advertisedCarriers.contains(peer)
         case .relayOffer(let routeID, _):
             return config.relayEnabled && relayRoutes[routeID]?.target == peer
         case .relayReady(let routeID, _):
@@ -2165,8 +2252,13 @@ public actor Ivy {
               !Task.isCancelled,
               !reconnectSuppressed.contains(target.peerID) else { throw IvyError.notRunning }
         if endpointSession(for: target)?.connection.isLive == true { return }
+        // Configured carriers first, then any peer the target itself named as its
+        // carrier and we already hold a session with.
         let candidates = sessions.values
-            .filter { $0.role == .carrier && $0.connection.isDirect }
+            .filter {
+                $0.connection.isDirect
+                    && ($0.role == .carrier || advertisedCarriers.contains($0.peerKey))
+            }
             .map(\.peerKey)
 
         for carrier in candidates.sorted() {
@@ -3422,6 +3514,17 @@ public actor Ivy {
 
     var pendingSessionCountForTesting: Int { pendingSessions.count }
 
+    func seedRelayedInboundForTesting(carrier: PeerKey) {
+        let connection = makeRelayedConnection(
+            endpoint: PeerEndpoint(publicKey: carrier.hex, host: "relay", port: 0),
+            routeID: Data(repeating: UInt8(pendingSessions.count &+ 1), count: 32),
+            carrier: carrier)
+        pendingSessions[connection.connectionID] = PendingSession(
+            connection: connection,
+            direction: .responder,
+            generation: runGeneration)
+    }
+
     func registerReachabilityProbeForTesting(
         requestID: UInt64,
         peer: PeerKey,
@@ -3505,6 +3608,7 @@ public actor Ivy {
             switch kind {
             case .quic: return 0
             case .tcp: return 1
+            case .relay: return 2
             }
         }
         return routes.enumerated().sorted { lhs, rhs in
