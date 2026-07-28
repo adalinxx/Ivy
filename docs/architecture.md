@@ -67,8 +67,9 @@ nonces, route binding, and bounded metadata, followed by the initiator's signed
 finish.
 
 Application records bind sender, receiver, session ID, sequence, and payload.
-Receive sequences strictly increase. Simultaneous sessions for one peer and
-role converge on the smaller session ID. Records are signed but not encrypted;
+Receive sequences strictly increase. Simultaneous sessions for one peer and role
+converge on a direct session over a relayed one, and on the smaller session ID
+between two of the same kind. Records are signed but not encrypted;
 confidentiality and forward secrecy belong above or below Ivy.
 
 Wire/session protocol v9 rejects v8 during authentication. V9 introduces
