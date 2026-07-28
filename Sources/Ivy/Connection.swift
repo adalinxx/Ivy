@@ -633,6 +633,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
 
     weak var ivy: Ivy?
     private let generation: UInt64
+    private let transportKind: TransportKind
     private let admissionGate: InboundAdmissionGate
     private let inboundByteBudget: InboundByteBudget
     private let connectionInboundByteBudget: InboundByteBudget
@@ -642,6 +643,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     init(
         ivy: Ivy,
         generation: UInt64,
+        transportKind: TransportKind,
         admissionGate: InboundAdmissionGate,
         inboundByteBudget: InboundByteBudget,
         connectionInboundByteBudget: InboundByteBudget,
@@ -649,6 +651,7 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
     ) {
         self.ivy = ivy
         self.generation = generation
+        self.transportKind = transportKind
         self.admissionGate = admissionGate
         self.inboundByteBudget = inboundByteBudget
         self.connectionInboundByteBudget = connectionInboundByteBudget
@@ -681,7 +684,14 @@ final class InboundConnectionAcceptor: ChannelInboundHandler, @unchecked Sendabl
             context.close(promise: nil)
             return
         }
-        let endpoint = PeerEndpoint(publicKey: "", host: "unknown", port: 0)
+        // The peer is unidentified until it authenticates, but the transport that
+        // carried it is known now and must be recorded: a dial-back arriving here
+        // is only evidence about the transport it actually arrived on.
+        let endpoint = PeerEndpoint(
+            publicKey: "",
+            host: "unknown",
+            port: 0,
+            transport: transportKind)
         let connection = PeerConnection(
             endpoint: endpoint,
             channel: channel,

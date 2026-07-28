@@ -2,6 +2,13 @@
 
 Authenticated, bounded peer transport and routing for Swift.
 
+Transports are pluggable: TCP ships in this package, and QUIC is available as the
+separate `IvyQUIC` package, which carries the same framed session records over a
+single stream. Peers advertise which transport each address belongs to. A node
+learns whether it is dialable by asking peers to dial it back, publishes a carrier
+to be reached through when it is not, and upgrades a relayed session to a direct
+one by punching.
+
 Ivy proves which peer sent an accepted record and bounds the work needed to
 receive it. The caller decides what the record means.
 

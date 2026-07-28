@@ -6,10 +6,20 @@ public struct TCPTransport: IvyTransport {
     public let kind: TransportKind = .tcp
     private let connectTimeout: TimeAmount
     private let backlog: Int32
+    private let reusePort: Bool
 
-    public init(connectTimeout: TimeAmount = .seconds(5), backlog: Int32 = 256) {
+    /// - Parameter reusePort: Allows a dial to leave from the listening port, so
+    ///   a hole punch creates the NAT mapping this node advertises. It also lets
+    ///   another socket on the host bind the same port, so it is off unless
+    ///   punching needs it.
+    public init(
+        connectTimeout: TimeAmount = .seconds(5),
+        backlog: Int32 = 256,
+        reusePort: Bool = false
+    ) {
         self.connectTimeout = connectTimeout
         self.backlog = backlog
+        self.reusePort = reusePort
     }
 
     public func dial(
@@ -24,7 +34,7 @@ public struct TCPTransport: IvyTransport {
                 .connectTimeout(connectTimeout)
                 .channelInitializer(initializer)
         }
-        if let boundToPort, boundToPort != 0 {
+        if let boundToPort, boundToPort != 0, reusePort {
             do {
                 return try await bootstrap()
                     .channelOption(.socketOption(.so_reuseaddr), value: 1)
@@ -46,9 +56,16 @@ public struct TCPTransport: IvyTransport {
         group: any EventLoopGroup,
         streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> any TransportListenerHandle {
-        let channel = try await ServerBootstrap(group: group)
+        var bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(.backlog, value: backlog)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+        if reusePort {
+            // A punch dial must be able to share this port; both sockets need the
+            // option for the bind to succeed.
+            bootstrap = bootstrap
+                .serverChannelOption(.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
+        }
+        let channel = try await bootstrap
             .childChannelOption(ChannelOptions.autoRead, value: false)
             .childChannelInitializer(streamInitializer)
             .bind(host: host, port: Int(port))

@@ -47,12 +47,17 @@ an endpoint the storing node already holds. Relay hints live only in provider
 records; routing and session metadata stay direct-only.
 
 Once two peers share a relayed session, the side that accepted it offers its
-addresses, measures the round trip, and both dial at the same moment. A punched
-connection is an ordinary connection: it faces the same admission, netgroup,
-handshake, and scoring policy, and only the timing is coordinated. A punch that
+addresses, measures the round trip, and both dial at the same moment. Those dials
+leave from the listening port, so the mapping a NAT creates is the one this node
+advertises; that requires the listener to permit port reuse, which it does only
+while punching is enabled. A punched connection is an ordinary connection: it
+faces the same admission, netgroup, handshake, and scoring policy, and only the
+timing is coordinated. A punch that
 fails keeps the relay and is held against nobody. Candidates on private or
 loopback addresses are refused unless configured otherwise, since a peer names
-its own addresses and could otherwise aim dials inside the network.
+its own addresses and could otherwise aim dials inside the network. Because those
+addresses stay peer-chosen, punch dials are additionally bounded node-wide, not
+just per peer, so many peers cannot sum into a scan.
 
 ## Connections
 

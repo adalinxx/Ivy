@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOPosix
 import Testing
 @testable import Ivy
 
@@ -107,5 +108,65 @@ struct TransportSelectionTests {
 
         try await dialer.connect(to: endpoint)
         #expect(await dialer.connectedPeers.count == 1)
+    }
+}
+
+@Suite("Listening-port reuse")
+struct ListenPortReuseTests {
+    @Test("a dial can leave from the listening port when reuse is enabled")
+    func dialReusesListeningPort() async throws {
+        let group = MultiThreadedEventLoopGroup.singleton
+        let transport = TCPTransport(reusePort: true)
+        let listener = try await transport.listen(
+            host: "127.0.0.1",
+            port: 0,
+            group: group,
+            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+        let listenPort = try #require(listener.localPort)
+
+        // Somewhere to dial that is not ourselves.
+        let peer = try await transport.listen(
+            host: "127.0.0.1",
+            port: 0,
+            group: group,
+            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+        let peerPort = try #require(peer.localPort)
+
+        let channel = try await transport.dial(
+            host: "127.0.0.1",
+            port: peerPort,
+            group: group,
+            boundToPort: listenPort,
+            initializer: { $0.eventLoop.makeSucceededVoidFuture() })
+        // This is what makes a hole punch work: the mapping the peer sees is the
+        // one this node advertises.
+        #expect(channel.localAddress?.port == Int(listenPort))
+
+        try? await channel.close().get()
+        await listener.close()
+        await peer.close()
+    }
+
+    @Test("a dial falls back to an ephemeral port when reuse is disabled")
+    func dialFallsBackWithoutReuse() async throws {
+        let group = MultiThreadedEventLoopGroup.singleton
+        let transport = TCPTransport(reusePort: false)
+        let peer = try await transport.listen(
+            host: "127.0.0.1",
+            port: 0,
+            group: group,
+            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+        let peerPort = try #require(peer.localPort)
+
+        let channel = try await transport.dial(
+            host: "127.0.0.1",
+            port: peerPort,
+            group: group,
+            boundToPort: peerPort,
+            initializer: { $0.eventLoop.makeSucceededVoidFuture() })
+        #expect(channel.localAddress?.port != Int(peerPort))
+
+        try? await channel.close().get()
+        await peer.close()
     }
 }
