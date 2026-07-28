@@ -150,7 +150,7 @@ public struct IvyConfig: Sendable {
         guard maxRoutesPerIdentity > 0,
               maxProviderTTLSeconds > 0,
               maxInFlightVolumeBytes > 0,
-              Int(protocolMaxFrameSize) >= SessionWireRecord.maxHandshakeRecordSize else {
+              Int(protocolMaxFrameSize) >= SessionWireRecord.maxRelayedHandshakeRecordSize else {
             throw IvyModeError.invalidConfiguration(
                 "route, provider-TTL, volume, or frame-size limits are invalid")
         }
