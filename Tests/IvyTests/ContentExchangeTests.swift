@@ -583,7 +583,7 @@ struct ContentExchangeTests {
         })
         #expect(await source.startedCount() == 2)
         #expect(await ivy.volumeReservations().serving
-            == MessageLimits.maxInFlightVolumeBytes)
+            == IvyConfig.defaultMaxInFlightVolumeBytes)
 
         await source.releaseAll()
         #expect(try await TransportTestHarness.eventually {
@@ -910,7 +910,7 @@ struct ContentExchangeTests {
             )
         }
         #expect(await ivy.volumeReservations().receiving
-            == MessageLimits.maxInFlightVolumeBytes)
+            == IvyConfig.defaultMaxInFlightVolumeBytes)
         #expect(await ivy.inFlightVolumeByteCount() == 2)
         #expect(await ivy.pendingVolumeState().candidates.count == 2)
         let tally = await ivy.tally
@@ -1871,14 +1871,14 @@ struct ContentExchangeTests {
             let reservation = await ivy.volumeReservations().serving
             return started == 2
                 && serving == 2
-                && reservation == MessageLimits.maxInFlightVolumeBytes
+                && reservation == IvyConfig.defaultMaxInFlightVolumeBytes
         })
 
         await ivy.stop()
         #expect(await ivy.servingContentCount() == 2)
         #expect(
             await ivy.volumeReservations().serving
-                == MessageLimits.maxInFlightVolumeBytes
+                == IvyConfig.defaultMaxInFlightVolumeBytes
         )
         try await ivy.start()
         await ivy.scheduleVolumeRequest(
@@ -1907,7 +1907,7 @@ struct ContentExchangeTests {
             let reservation = await ivy.volumeReservations().serving
             return started == 3
                 && serving == 2
-                && reservation == MessageLimits.maxInFlightVolumeBytes
+                && reservation == IvyConfig.defaultMaxInFlightVolumeBytes
         })
 
         await source.release(1)

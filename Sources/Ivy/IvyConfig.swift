@@ -6,6 +6,9 @@ public struct IvyConfig: Sendable {
     public static let protocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
     public static let defaultMaxConnections = 256
     public static let defaultMaxInboundBufferedBytes = 64 * 1024 * 1024
+    public static let defaultMaxRoutesPerIdentity = 3
+    public static let defaultMaxProviderTTLSeconds: UInt64 = 24 * 60 * 60
+    public static let defaultMaxInFlightVolumeBytes = 128 * 1024 * 1024
     public static let defaultSTUNServers: [(String, Int)] = [
         ("stun.l.google.com", 19302),
         ("stun1.l.google.com", 19302),
@@ -40,6 +43,11 @@ public struct IvyConfig: Sendable {
     public let maxContentCandidates: Int
     public let maxInboundBufferedBytes: Int
     public let minPeerKeyBits: Int
+    /// Operator-tunable guards (sane defaults). Formerly hardcoded constants; a
+    /// node may raise or lower them, accepting the resource/policy consequences.
+    public let maxRoutesPerIdentity: Int
+    public let maxProviderTTLSeconds: UInt64
+    public let maxInFlightVolumeBytes: Int
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
     /// Enables direct exact-CID request/response messages on a private network.
@@ -68,6 +76,9 @@ public struct IvyConfig: Sendable {
         maxInboundBufferedBytes: Int = IvyConfig.defaultMaxInboundBufferedBytes,
         minPeerKeyBits: Int = 0,
         maxContentCandidates: Int = 8,
+        maxRoutesPerIdentity: Int = IvyConfig.defaultMaxRoutesPerIdentity,
+        maxProviderTTLSeconds: UInt64 = IvyConfig.defaultMaxProviderTTLSeconds,
+        maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
         privateContentExchangeEnabled: Bool = false,
@@ -100,6 +111,9 @@ public struct IvyConfig: Sendable {
         self.maxInboundBufferedBytes = maxInboundBufferedBytes
         self.minPeerKeyBits = minPeerKeyBits
         self.maxContentCandidates = maxContentCandidates
+        self.maxRoutesPerIdentity = maxRoutesPerIdentity
+        self.maxProviderTTLSeconds = maxProviderTTLSeconds
+        self.maxInFlightVolumeBytes = maxInFlightVolumeBytes
         self.externalAddress = externalAddress
     }
 

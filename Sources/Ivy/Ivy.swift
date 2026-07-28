@@ -178,7 +178,6 @@ public actor Ivy {
     static let reconnectMaxDelayMs: UInt64 = 30_000
     static let reconnectJitterMs: UInt64 = 250
     static let kademliaLookupParallelism = 3
-    static let maxRoutesPerIdentity = 3
 
     var providerHints: [String: [ProviderHint]] = [:]
     static let maxProviderRoots = 10_000

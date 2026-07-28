@@ -572,7 +572,7 @@ extension Ivy {
 
     private func reserveServingVolumeCapacity() -> Bool {
         guard MessageLimits.maxVolumeArchiveBytes
-                <= MessageLimits.maxInFlightVolumeBytes - reservedServingVolumeBytes else {
+                <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes else {
             return false
         }
         reservedServingVolumeBytes += MessageLimits.maxVolumeArchiveBytes
@@ -1040,7 +1040,7 @@ extension Ivy {
                 )
                 return
             }
-            guard byteCount <= MessageLimits.maxInFlightVolumeBytes
+            guard byteCount <= config.maxInFlightVolumeBytes
                     - reservedVolumeBytes else {
                 markVolumeCandidateDone(
                     requestID: requestID,
@@ -1062,7 +1062,7 @@ extension Ivy {
             rejectVolumeCandidate(requestID: requestID, peer: peer)
             return
         }
-        guard payload.count <= MessageLimits.maxInFlightVolumeBytes
+        guard payload.count <= config.maxInFlightVolumeBytes
                 - inFlightVolumeBytes else {
             markVolumeCandidateDone(
                 requestID: requestID,

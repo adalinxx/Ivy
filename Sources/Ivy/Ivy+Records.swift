@@ -17,7 +17,6 @@ struct PendingProviderQuery {
 
 extension Ivy {
     static let providerObservationTTL: UInt64 = 20 * 60
-    static let maxProviderTTL: UInt64 = 24 * 60 * 60
 
     func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
         guard config.mode.usesOverlayServices else { return }
@@ -38,7 +37,7 @@ extension Ivy {
         }
         let byIdentity = Dictionary(grouping: records, by: \.endpoint.publicKey)
         var selected: [ProviderRecord] = []
-        for index in 0..<Self.maxRoutesPerIdentity {
+        for index in 0..<config.maxRoutesPerIdentity {
             for identity in byIdentity.keys.sorted()
                 where selected.count < Int(MessageLimits.maxNeighborCount) {
                 let routes = byIdentity[identity] ?? []
@@ -278,7 +277,7 @@ extension Ivy {
         let candidates = Array(peerOrder.compactMap { key -> [PeerEndpoint]? in
             guard !hasEndpointSession(PeerID(publicKey: key)) else { return nil }
             return alternativesByPeer[key].map {
-                Array($0.prefix(Self.maxRoutesPerIdentity))
+                Array($0.prefix(config.maxRoutesPerIdentity))
             }
         }.prefix(config.maxContentCandidates))
 
@@ -338,7 +337,7 @@ extension Ivy {
             var routes = routesByPeer[hint.peer] ?? []
             routes.removeAll { $0.endpoint == hint.endpoint }
             routes.append(hint)
-            routesByPeer[hint.peer] = Array(routes.suffix(Self.maxRoutesPerIdentity))
+            routesByPeer[hint.peer] = Array(routes.suffix(config.maxRoutesPerIdentity))
         }
         return peerOrder.suffix(config.kBucketSize).flatMap { routesByPeer[$0] ?? [] }
     }
@@ -373,13 +372,13 @@ extension Ivy {
 
         var selected: [ProviderHint] = []
         var seenEndpoints: Set<PeerEndpoint> = []
-        for routeIndex in 0..<Self.maxRoutesPerIdentity {
+        for routeIndex in 0..<config.maxRoutesPerIdentity {
             for peer in peers {
                 for source in sources {
                     let routes = (responses[source] ?? []).filter { $0.peer == peer }
                     guard routes.indices.contains(routeIndex),
                           selected.lazy.filter({ $0.peer == peer }).count
-                            < Self.maxRoutesPerIdentity else { continue }
+                            < config.maxRoutesPerIdentity else { continue }
                     let hint = routes[routeIndex]
                     guard let endpoint = hint.endpoint,
                           seenEndpoints.insert(endpoint).inserted else { continue }
@@ -443,7 +442,7 @@ extension Ivy {
 
     func providerExpiryIsValid(_ expiresAt: UInt64) -> Bool {
         let now = nowUnix()
-        return expiresAt > now && expiresAt <= now + Self.maxProviderTTL
+        return expiresAt > now && expiresAt <= now + config.maxProviderTTLSeconds
     }
 
     func localProviderEndpoint() -> PeerEndpoint? {
