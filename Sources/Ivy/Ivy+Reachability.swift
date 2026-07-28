@@ -171,11 +171,13 @@ extension Ivy {
                   observedHost: session.connection.observedHost),
               hasTransport(kind),
               tally.shouldAllow(peer: session.peerKey.peerID) else {
+            config.logger.info("Refusing a dial-back: not a permitted peer or transport")
             respondToReachabilityRequest(requestID, status: .refused, session: session)
             return
         }
         guard activeDialBacks < config.maxConcurrentDialBacks,
               dialBackAllowed(for: session.peerKey) else {
+            config.logger.info("Refusing a dial-back: at the concurrency or per-peer limit")
             respondToReachabilityRequest(requestID, status: .refused, session: session)
             return
         }

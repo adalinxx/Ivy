@@ -77,6 +77,10 @@ struct ReachabilityTests {
         await ivy.stop()
     }
 
+    // Known flake: this occasionally never confirms when the whole suite runs,
+    // while passing consistently on its own. Serializing the suite and widening
+    // the budget both failed to settle it, and it stops reproducing under
+    // logging, so the cause is still unidentified.
     @Test("a peer dials back the address it observes, proving reachability")
     func dialBackConfirmsReachabilityOverLoopback() async throws {
         let proverKey = deterministicTestSigningKey("prover")
