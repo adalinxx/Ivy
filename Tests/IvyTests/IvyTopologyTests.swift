@@ -60,6 +60,56 @@ struct IvyTopologyTests {
         }
     }
 
+    @Test("operator-tunable route/TTL/volume/frame knobs are validated at startup")
+    func operatorKnobValidation() {
+        let invalidMessage = "route, provider-TTL, volume, or frame-size limits are invalid"
+        // A baseline valid config; each variant below flips one knob to an unusable value.
+        #expect(throws: Never.self) {
+            try IvyConfig(signingKey: identity(1)).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxRoutesPerIdentity: 0).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxProviderTTLSeconds: 0).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxInFlightVolumeBytes: 0).validate()
+        }
+        // A frame too small to carry the largest handshake record breaks every
+        // connection before it starts, so it must be rejected up front. A tiny
+        // frame also trips the inbound-budget guard first; assert either rejects.
+        #expect(throws: (any Error).self) {
+            try IvyConfig(signingKey: identity(1), protocolMaxFrameSize: 16).validate()
+        }
+    }
+
+    @Test("protocolMaxFrameSize must carry the largest RELAYED handshake exactly")
+    func frameSizeMustCarryLargestHandshakeRecord() {
+        // Direct: responder hello (64 KiB metadata + 5 pinned keys) in the signed
+        // envelope = 65536 + 166 + 73 = 65775. Relayed adds a relayPacket (37) and
+        // the carrier's signed data record (113): 65775 + 37 + 113 = 65925. The
+        // config floor is the relayed maximum, so any node can forward a handshake.
+        #expect(SessionWireRecord.maxHandshakeRecordSize == 65_775)
+        #expect(SessionWireRecord.maxRelayedHandshakeRecordSize == 65_925)
+
+        let invalidMessage = "route, provider-TTL, volume, or frame-size limits are invalid"
+        // The direct maximum is NOT enough — it cannot carry the relayed handshake.
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(
+                signingKey: identity(1),
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxRelayedHandshakeRecordSize - 1)
+            ).validate()
+        }
+        // Exactly the relayed boundary is accepted.
+        #expect(throws: Never.self) {
+            try IvyConfig(
+                signingKey: identity(1),
+                protocolMaxFrameSize: UInt32(SessionWireRecord.maxRelayedHandshakeRecordSize)
+            ).validate()
+        }
+    }
+
     @Test("inbound admission bypass is pinned to a private bootstrap peer")
     func inboundAdmissionBypassValidation() throws {
         let local = identity(1)
@@ -269,7 +319,7 @@ struct IvyTopologyTests {
 
         let serialized = wireRecord.serialize()
         #expect(!serialized.isEmpty)
-        #expect(serialized.count <= Int(IvyConfig.protocolMaxFrameSize))
+        #expect(serialized.count <= Int(IvyConfig.defaultProtocolMaxFrameSize))
         guard case .data(let decodedCarrier) = try SessionWireRecord.deserialize(serialized),
               case .relayPacket(_, let opaqueRecord) = Message.deserialize(decodedCarrier.payload) else {
             Issue.record("Expected a nested responder record")
@@ -297,7 +347,7 @@ struct IvyTopologyTests {
 
         let undersizedInboundBudget = IvyConfig(
             signingKey: identity(1),
-            maxInboundBufferedBytes: Int(IvyConfig.protocolMaxFrameSize))
+            maxInboundBufferedBytes: Int(IvyConfig.defaultProtocolMaxFrameSize))
         #expect(throws: IvyModeError.invalidConfiguration(
             "inbound byte budget must hold one maximum frame")) {
             try undersizedInboundBudget.validate()

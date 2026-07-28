@@ -40,11 +40,18 @@ bound exhaustion close it.
 
 ## Bounds
 
-- Every encoder, decoder, direct peer, and relay uses one 4 MiB frame-body cap.
-- Each connection may hold at most two maximum frame bodies plus a partial
-  header. One node-wide byte budget also covers bytes actually received in
-  partial frames, relayed records, and queued records. Its default is 64 MiB;
-  exhaustion closes the affected connection without peer blame.
+- Each node advertises the maximum frame body it will accept (inbound) in its
+  handshake; the default is 4 MiB and it is operator-tunable via
+  `protocolMaxFrameSize`. A node never sends a frame larger than the peer
+  advertised it will accept, and on a relayed route it is further capped at the
+  carrier connection's negotiated size. Inbound framing is validated against the
+  node's own local cap.
+- Each connection's inbound byte budget scales with the local frame cap: it may
+  hold at most two maximum frame bodies plus a header (2·cap + 4). One node-wide
+  byte budget also covers bytes actually received in partial frames, relayed
+  records, and queued records; its default is 64 MiB and is operator-tunable via
+  `maxInboundBufferedBytes`. Exhaustion closes the affected connection without
+  peer blame.
 - Canonical session metadata is limited to 64 KiB.
 - Strings, collections, connections, netgroups, pending requests, waiters,
   candidates, routing entries, provider hints, and relay routes are bounded.
@@ -106,7 +113,7 @@ responses are unavailable, never partial.
 
 A Volume request names only its root. The source returns one complete bounded
 Volume, which Ivy canonically orders and streams in sequential frames. Each
-frame still obeys the same 4 MiB route cap. Competing providers assemble
+frame still obeys the same negotiated route cap (4 MiB by default). Competing providers assemble
 independently, and replacement sessions, gaps, duplicates, conflicting stream
 metadata, and malformed archives discard only that provider's attempt. Ivy
 returns no `AttributedVolumeResponse` until one archive is complete and contains

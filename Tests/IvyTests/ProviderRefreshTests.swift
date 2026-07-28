@@ -139,7 +139,7 @@ struct ProviderRefreshTests {
             requestID: requestID,
             records: [ProviderRecord(endpoint: honestProvider, expiresAt: expiry)],
             from: honestResponder)
-        let poisonedRoutes = (0..<Ivy.maxRoutesPerIdentity).map { index in
+        let poisonedRoutes = (0..<IvyConfig.defaultMaxRoutesPerIdentity).map { index in
             ProviderRecord(
                 endpoint: PeerEndpoint(
                     publicKey: honestProvider.publicKey,
@@ -163,7 +163,7 @@ struct ProviderRefreshTests {
             from: floodingResponder)
         #expect(await node.pendingProviderHintCount(
             rootCID: root,
-            from: floodingResponder) <= 4 * Ivy.maxRoutesPerIdentity)
+            from: floodingResponder) <= 4 * IvyConfig.defaultMaxRoutesPerIdentity)
         await node.handleProvidersResponse(
             rootCID: root,
             requestID: requestID,
@@ -473,7 +473,7 @@ struct ProviderRefreshTests {
         let expiry = await node.nowUnix() + 60
         let hints = (0..<100).flatMap { identity -> [ProviderHint] in
             let peer = PeerID(publicKey: deterministicTestPeerKey("wire-provider-\(identity)"))
-            return (0..<Ivy.maxRoutesPerIdentity).map { route in
+            return (0..<IvyConfig.defaultMaxRoutesPerIdentity).map { route in
                 ProviderHint(
                     peer: peer,
                     endpoint: PeerEndpoint(
