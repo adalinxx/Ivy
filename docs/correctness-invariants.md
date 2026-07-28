@@ -8,7 +8,7 @@ Authentication proves a peer key, never application authority.
 | IVY-002 | Pending sockets are invisible to routing, delegates, content, and application messages. |
 | IVY-003 | Promotion requires the complete route-bound signed handshake and bounded canonical metadata. |
 | IVY-004 | Accepted records bind sender, receiver, session, sequence, and payload; sequences never replay or wrap. |
-| IVY-005 | Duplicate sessions for one peer and role converge on the smaller session ID. |
+| IVY-005 | Duplicate sessions for one peer and role converge on a direct session over a relayed one, and on the smaller session ID within a transport class. |
 | IVY-006 | Endpoint and carrier identities are disjoint; carriers never enter endpoint routing. |
 | IVY-007 | Work from an old run, operation, or authenticated session cannot mutate or reply through successor state. |
 | IVY-008 | Frames, fields, connections, pending work, routing, hints, routes, and all partial or queued inbound bytes are bounded. |
@@ -27,9 +27,13 @@ Authentication proves a peer key, never application authority.
 | IVY-021 | A complete Volume is bounded, request/root/session/run-bound, globally reservation-capped on receive and serve, sequentially assembled per provider, and visible only after exact complete decoding. |
 | IVY-022 | Every transport delivers ordered bounded frames into the same admission gate, byte budgets, and signed-session state machine; identity is never asserted by transport-layer credentials. |
 | IVY-023 | A node advertises an address for a transport only when it has bound that transport, and never dials or routes an address for a transport it has not installed. |
+| IVY-024 | A reachability dial-back targets only the requester's observed address, is rate-limited per peer and in total, and confirms reachability only when its nonce arrives inbound. |
+| IVY-025 | Hole punching coordinates timing only: punched connections face unchanged admission, netgroup, handshake, and Tally policy, and a failed punch keeps the relayed session and blames nobody. |
+| IVY-026 | Relay endpoints are expiring self-advertised hints naming a carrier that delivered the peer's own session; they appear only in provider records and grant no authority beyond that carrier's own limits. |
 
 Primary coverage: `SessionProtocolTests`, `IvyTopologyTests`,
 `InboundAdmissionTests`, `MessageFrameDecoderBoundTests`,
 `ContentExchangeTests`, `PendingRequestCapsTests`, `ProviderRefreshTests`,
 `ProviderSuppressionTests`, `RoutingIngressHardeningTests`, `RelayIntegrationTests`,
-`TransportTaggingTests`, `TransportSelectionTests`, and `TCPIntegrationTests`.
+`TransportTaggingTests`, `TransportSelectionTests`, `ReachabilityTests`,
+`RelayAdvertisingTests`, `HolePunchTests`, and `TCPIntegrationTests`.

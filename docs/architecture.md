@@ -31,6 +31,29 @@ TLS layer is plumbing: certificates are ephemeral and unverified, identity still
 comes only from the signed handshake, and QUIC dials use the same zero route
 binding as direct TCP.
 
+## Reachability and hole punching
+
+A node learns whether peers can dial it by asking a few of them, each in a
+different netgroup, to dial it back at a port it names. The request carries no
+host: the responder dials the address it already observes for the session, so the
+exchange cannot be aimed at a third party, and the dial-back frame is smaller
+than the request. Only that nonce arriving inbound confirms reachability, so a
+peer that lies can withhold a confirmation but never invent one.
+
+A node that cannot be dialed publishes provider records naming a carrier to reach
+it through, so strangers can find it without having configured the same carrier.
+The named carrier is the one that delivered the peer's own session, addressed by
+an endpoint the storing node already holds. Relay hints live only in provider
+records; routing and session metadata stay direct-only.
+
+Once two peers share a relayed session, the side that accepted it offers its
+addresses, measures the round trip, and both dial at the same moment. A punched
+connection is an ordinary connection: it faces the same admission, netgroup,
+handshake, and scoring policy, and only the timing is coordinated. A punch that
+fails keeps the relay and is held against nobody. Candidates on private or
+loopback addresses are refused unless configured otherwise, since a peer names
+its own addresses and could otherwise aim dials inside the network.
+
 ## Connections
 
 Inbound capacity is reserved by global and netgroup limits before automatic

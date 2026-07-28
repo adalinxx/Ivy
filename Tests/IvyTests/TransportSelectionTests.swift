@@ -17,11 +17,16 @@ final class FakeQUICTransport: IvyTransport, @unchecked Sendable {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
+        boundToPort: UInt16?,
         initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> Channel {
         lock.withLock { dials.append("\(host):\(port)") }
         return try await backing.dial(
-            host: host, port: port, group: group, initializer: initializer)
+            host: host,
+            port: port,
+            group: group,
+            boundToPort: boundToPort,
+            initializer: initializer)
     }
 
     func listen(

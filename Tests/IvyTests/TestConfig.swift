@@ -254,6 +254,7 @@ extension IvyConfig {
         relayEnabled: Bool = false,
         maxRelayedInboundConnections: Int = 32,
         maxRelayedInboundPerCarrier: Int = 8,
+        allowPrivateHolePunchCandidates: Bool = false,
         privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
@@ -288,6 +289,7 @@ extension IvyConfig {
             relayEnabled: relayEnabled,
             maxRelayedInboundConnections: maxRelayedInboundConnections,
             maxRelayedInboundPerCarrier: maxRelayedInboundPerCarrier,
+            allowPrivateHolePunchCandidates: allowPrivateHolePunchCandidates,
             privateContentExchangeEnabled: privateContentExchangeEnabled,
             carriers: carriers,
             mode: mode)
