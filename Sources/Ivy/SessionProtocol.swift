@@ -24,9 +24,19 @@ public struct PeerMetadata: Sendable, Equatable {
     public static let maxEncodedSize = 64 * 1024
 
     public let listenAddresses: [ListenAddress]
+    /// The maximum wire frame this peer will ACCEPT, advertised so the other side
+    /// caps what it sends. Encoded as a trailing UInt32 that is OMITTED when it
+    /// equals the default — so a legacy peer (which never sends it) and a
+    /// default-configured new peer produce byte-identical metadata, keeping the
+    /// canonical-encoding handshake check backward-compatible (no flag-day).
+    public let maxFrameSize: UInt32
 
-    public init(listenAddresses: [ListenAddress] = []) {
+    public init(
+        listenAddresses: [ListenAddress] = [],
+        maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
+    ) {
         self.listenAddresses = Array(Set(listenAddresses)).sorted()
+        self.maxFrameSize = maxFrameSize
     }
 
     func encode() -> Data? {
@@ -37,6 +47,9 @@ public struct PeerMetadata: Sendable, Equatable {
         for address in listenAddresses {
             guard bytes.appendSessionString(address.host) else { return nil }
             bytes.appendUInt16(address.port)
+        }
+        if maxFrameSize != IvyConfig.defaultProtocolMaxFrameSize {
+            bytes.appendUInt32(maxFrameSize)
         }
         return bytes.count <= Self.maxEncodedSize ? bytes : nil
     }
@@ -56,8 +69,20 @@ public struct PeerMetadata: Sendable, Equatable {
             addresses.append(ListenAddress(host: host, port: port))
         }
 
+        // A trailing UInt32, when present, is the peer's advertised frame size;
+        // its absence means the default (a legacy peer never encodes it).
+        let maxFrameSize: UInt32
+        if reader.isAtEnd {
+            maxFrameSize = IvyConfig.defaultProtocolMaxFrameSize
+        } else {
+            guard let advertised = reader.readUInt32() else { throw SessionProtocolError.malformed }
+            maxFrameSize = advertised
+        }
+
         guard reader.isAtEnd else { throw SessionProtocolError.malformed }
-        let metadata = PeerMetadata(listenAddresses: addresses)
+        let metadata = PeerMetadata(listenAddresses: addresses, maxFrameSize: maxFrameSize)
+        // Enforces "present iff non-default": a peer that redundantly encodes the
+        // default value is rejected as non-canonical.
         guard metadata.encode() == data else { throw SessionProtocolError.nonCanonicalMetadata }
         return metadata
     }
@@ -365,7 +390,7 @@ enum SessionWireRecord: Sendable, Equatable {
     case finish(SessionFinish)
     case data(SessionDataRecord)
 
-    func serialize(maxPayload: UInt32 = IvyConfig.protocolMaxFrameSize) -> Data {
+    func serialize(maxPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize) -> Data {
         var bytes = Self.magic
         switch self {
         case .helloInitiator(let signed):
@@ -396,7 +421,7 @@ enum SessionWireRecord: Sendable, Equatable {
         return bytes.count <= Int(maxPayload) ? bytes : Data()
     }
 
-    static func deserialize(_ data: Data, maxPayload: UInt32 = IvyConfig.protocolMaxFrameSize) throws -> Self {
+    static func deserialize(_ data: Data, maxPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize) throws -> Self {
         var reader = SessionReader(data)
         guard reader.read(count: magic.count) == magic, let tag = reader.readUInt8() else {
             throw SessionProtocolError.malformed

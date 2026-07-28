@@ -1477,7 +1477,7 @@ struct ContentExchangeTests {
         #expect(requests.first?.cids == ["root", "child-a", "child-b"])
         #expect(requests.first?.maxDataBytes == Message.contentResponseDataBudget(
             for: ["root", "child-a", "child-b"],
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: IvyConfig.defaultProtocolMaxFrameSize,
             relayed: false))
     }
 
@@ -1499,7 +1499,7 @@ struct ContentExchangeTests {
         #expect(request?.cids == ["root"])
         #expect(request?.maxDataBytes == Message.contentResponseDataBudget(
             for: ["root"],
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: IvyConfig.defaultProtocolMaxFrameSize,
             relayed: false))
         #expect(request?.maxDataBytes != .max)
     }

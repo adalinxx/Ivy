@@ -798,7 +798,7 @@ struct RelayIntegrationTests {
         await target.setTestDelegate(targetRecorder)
         let volumeBytes = Data(
             repeating: 0xa5,
-            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+            count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
         )
         await target.setContentSource(RelayVolumeSource(entries: [
             ContentEntry(cid: "relay-root", data: volumeBytes),
@@ -865,7 +865,7 @@ struct RelayIntegrationTests {
 
         let tooLargeForRelay = Data(
             repeating: 0xaa,
-            count: Int(IvyConfig.protocolMaxFrameSize) - 180)
+            count: Int(IvyConfig.defaultProtocolMaxFrameSize) - 180)
         #expect(await source.sendMessage(
             to: targetID,
             topic: "node.large",

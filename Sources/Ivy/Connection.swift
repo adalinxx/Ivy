@@ -155,11 +155,15 @@ private final class WritabilityWaiter: @unchecked Sendable {
 
 final class PeerConnection: @unchecked Sendable {
     static let maxInboundBufferedRecords = 4
-    static let maxInboundBufferedBytes = 2 * Int(IvyConfig.protocolMaxFrameSize) + 4
+    static let maxInboundBufferedBytes = 2 * Int(IvyConfig.defaultProtocolMaxFrameSize) + 4
 
     let connectionID = UUID()
     var endpoint: PeerEndpoint
     var observedHost: String?
+    /// Max frame the PEER advertised it will accept (set from the handshake
+    /// metadata). Outbound frames are capped here so we never send more than the
+    /// peer will take. Defaults to the protocol default until the handshake lands.
+    var peerMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
 
     enum Transport {
         case direct(Channel)
@@ -252,7 +256,8 @@ final class PeerConnection: @unchecked Sendable {
     static func dial(
         endpoint: PeerEndpoint,
         group: EventLoopGroup,
-        inboundByteBudget: InboundByteBudget
+        inboundByteBudget: InboundByteBudget,
+        maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) async throws -> PeerConnection {
         let connectionInboundByteBudget = InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         let bootstrap = ClientBootstrap(group: group)
@@ -263,6 +268,7 @@ final class PeerConnection: @unchecked Sendable {
         ) { channel in
             do {
                 try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
+                    maxFrameSize: maxFrameSize,
                     budget: inboundByteBudget,
                     connectionBudget: connectionInboundByteBudget))
                 let inbound = try NIOAsyncChannel<InboundFrame, Never>(
@@ -295,7 +301,7 @@ final class PeerConnection: @unchecked Sendable {
     @discardableResult
     func sendSerializedRecord(_ payload: Data) -> SendResult {
         guard !payload.isEmpty,
-              payload.count <= Int(IvyConfig.protocolMaxFrameSize) else {
+              payload.count <= Int(peerMaxFrameSize) else {
             return .locallyRejected
         }
         switch sendReadiness() {
@@ -413,7 +419,7 @@ final class PeerConnection: @unchecked Sendable {
         let reservation = InboundByteReservation(
             budgets: [connectionInboundByteBudget, inboundByteBudget])
         guard !data.isEmpty,
-              data.count <= Int(IvyConfig.protocolMaxFrameSize),
+              data.count <= Int(IvyConfig.defaultProtocolMaxFrameSize),
               reservation.acquire(data.count) else {
             cancel()
             return false
@@ -470,7 +476,7 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
     private var bodyReservation: InboundByteReservation?
 
     init(
-        maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize,
+        maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         budget: InboundByteBudget,
         connectionBudget: InboundByteBudget
     ) {

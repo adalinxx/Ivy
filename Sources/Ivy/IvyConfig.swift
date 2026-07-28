@@ -3,7 +3,10 @@ import Foundation
 import Tally
 
 public struct IvyConfig: Sendable {
-    public static let protocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
+    /// Default maximum wire frame this node will accept. Operator-tunable via the
+    /// `protocolMaxFrameSize` instance field, and negotiated per connection (a
+    /// node never sends a frame larger than the peer advertised it will accept).
+    public static let defaultProtocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
     public static let defaultMaxConnections = 256
     public static let defaultMaxInboundBufferedBytes = 64 * 1024 * 1024
     public static let defaultMaxRoutesPerIdentity = 3
@@ -48,6 +51,10 @@ public struct IvyConfig: Sendable {
     public let maxRoutesPerIdentity: Int
     public let maxProviderTTLSeconds: UInt64
     public let maxInFlightVolumeBytes: Int
+    /// Max wire frame this node will ACCEPT (inbound). Advertised in the handshake
+    /// so peers cap what they send us; outbound is capped at the peer's advertised
+    /// value. Operator-tunable; the default is the safe framing DoS bound.
+    public let protocolMaxFrameSize: UInt32
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
     /// Enables direct exact-CID request/response messages on a private network.
@@ -79,6 +86,7 @@ public struct IvyConfig: Sendable {
         maxRoutesPerIdentity: Int = IvyConfig.defaultMaxRoutesPerIdentity,
         maxProviderTTLSeconds: UInt64 = IvyConfig.defaultMaxProviderTTLSeconds,
         maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
+        protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
         privateContentExchangeEnabled: Bool = false,
@@ -114,6 +122,7 @@ public struct IvyConfig: Sendable {
         self.maxRoutesPerIdentity = maxRoutesPerIdentity
         self.maxProviderTTLSeconds = maxProviderTTLSeconds
         self.maxInFlightVolumeBytes = maxInFlightVolumeBytes
+        self.protocolMaxFrameSize = protocolMaxFrameSize
         self.externalAddress = externalAddress
     }
 
@@ -130,7 +139,7 @@ public struct IvyConfig: Sendable {
             throw IvyModeError.invalidConfiguration(
                 "reserved outbound connection slots must fit within maxConnections")
         }
-        guard maxInboundBufferedBytes >= Int(IvyConfig.protocolMaxFrameSize) + 4 else {
+        guard maxInboundBufferedBytes >= Int(protocolMaxFrameSize) + 4 else {
             throw IvyModeError.invalidConfiguration(
                 "inbound byte budget must hold one maximum frame")
         }

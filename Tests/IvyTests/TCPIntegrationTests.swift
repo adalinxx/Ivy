@@ -413,7 +413,7 @@ struct TCPIntegrationTests {
         await client.setTestDelegate(clientRecorder)
         let rootBytes = Data(
             repeating: 0xa5,
-            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+            count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
         )
         let childBytes = Data("child".utf8)
         await server.setContentSource(TransportVolumeSource(entries: [
@@ -466,7 +466,7 @@ struct TCPIntegrationTests {
                 cid: "root",
                 data: Data(
                     repeating: 0xa5,
-                    count: Int(IvyConfig.protocolMaxFrameSize) + 1
+                    count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
                 )
             ),
         ]))
@@ -1113,7 +1113,7 @@ struct TCPIntegrationTests {
         let clientPort = TransportTestHarness.nextPort()
         let budget = try #require(Message.contentResponseDataBudget(
             for: ["root"],
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: IvyConfig.defaultProtocolMaxFrameSize,
             relayed: false))
         let source = TransportTestContentSource([
             "root": Data(repeating: 0xaa, count: budget + 1),

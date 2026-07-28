@@ -269,7 +269,7 @@ struct IvyTopologyTests {
 
         let serialized = wireRecord.serialize()
         #expect(!serialized.isEmpty)
-        #expect(serialized.count <= Int(IvyConfig.protocolMaxFrameSize))
+        #expect(serialized.count <= Int(IvyConfig.defaultProtocolMaxFrameSize))
         guard case .data(let decodedCarrier) = try SessionWireRecord.deserialize(serialized),
               case .relayPacket(_, let opaqueRecord) = Message.deserialize(decodedCarrier.payload) else {
             Issue.record("Expected a nested responder record")
@@ -297,7 +297,7 @@ struct IvyTopologyTests {
 
         let undersizedInboundBudget = IvyConfig(
             signingKey: identity(1),
-            maxInboundBufferedBytes: Int(IvyConfig.protocolMaxFrameSize))
+            maxInboundBufferedBytes: Int(IvyConfig.defaultProtocolMaxFrameSize))
         #expect(throws: IvyModeError.invalidConfiguration(
             "inbound byte budget must hold one maximum frame")) {
             try undersizedInboundBudget.validate()
