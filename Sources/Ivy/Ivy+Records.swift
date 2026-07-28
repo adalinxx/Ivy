@@ -72,7 +72,8 @@ extension Ivy {
                 publicKey: key.hex,
                 host: endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: endpoint.port,
-                transport: endpoint.transport)
+                transport: endpoint.transport,
+                carrierKey: endpoint.carrierKey)
             accepted.append(ProviderHint(
                 peer: key.peerID,
                 endpoint: canonical,
@@ -448,20 +449,69 @@ extension Ivy {
     }
 
     func localProviderEndpoint() -> PeerEndpoint? {
-        guard let address = advertisedListenAddresses(observedLocalHost: nil).first else { return nil }
-        return PeerEndpoint(
-            publicKey: localKey.hex,
-            host: address.host,
-            port: address.port,
-            transport: address.transport)
+        if let address = advertisedListenAddresses(observedLocalHost: nil).first,
+           isDirectlyReachable {
+            return PeerEndpoint(
+                publicKey: localKey.hex,
+                host: address.host,
+                port: address.port,
+                transport: address.transport)
+        }
+        // Undialable from outside, so point seekers at a carrier instead.
+        return localRelayProviderEndpoint()
+    }
+
+    /// True once any transport has proven reachable, or while reachability is
+    /// still unknown, so a node that has not finished probing keeps advertising
+    /// the direct address it may well have.
+    private var isDirectlyReachable: Bool {
+        installedTransportKinds.contains { reachabilityStatus(for: $0) != .unreachable }
+    }
+
+    private func localRelayProviderEndpoint() -> PeerEndpoint? {
+        guard config.mode.usesOverlayServices else { return nil }
+        for carrier in liveCarrierKeys.sorted() {
+            guard let endpoint = carrierRelayEndpoint(target: localKey.hex, carrier: carrier) else {
+                continue
+            }
+            return endpoint
+        }
+        return nil
     }
 
     func providerEndpoint(for peer: PeerID) -> PeerEndpoint? {
-        guard let endpoint = endpointConnection(for: peer)?.endpoint,
-              !endpoint.host.isEmpty,
+        guard let connection = endpointConnection(for: peer) else { return nil }
+        // A peer that reached us through a carrier has no address of its own to
+        // store. The carrier is not taken on trust: it is the one that actually
+        // delivered this session, and its address is one we already hold.
+        if case .relayed(_, let carrier) = connection.transport {
+            return carrierRelayEndpoint(target: peer.publicKey, carrier: carrier)
+        }
+        let endpoint = connection.endpoint
+        guard !endpoint.host.isEmpty,
               endpoint.host != "unknown",
-              endpoint.port != 0 else { return nil }
+              endpoint.port != 0,
+              endpoint.transport.isDirectlyDialable else { return nil }
         return endpoint
+    }
+
+    /// Names `carrier` as the way to reach `target`, addressed by the carrier
+    /// endpoint this node already holds a live direct session with.
+    private func carrierRelayEndpoint(target: String, carrier: PeerKey) -> PeerEndpoint? {
+        guard let session = liveSession(for: carrier),
+              session.connection.isDirect,
+              session.connection.isLive else { return nil }
+        let endpoint = session.connection.endpoint
+        guard !endpoint.host.isEmpty,
+              endpoint.host != "unknown",
+              endpoint.port != 0,
+              endpoint.transport.isDirectlyDialable else { return nil }
+        return PeerEndpoint(
+            publicKey: target,
+            host: endpoint.host,
+            port: endpoint.port,
+            transport: .relay,
+            carrierKey: carrier.hex)
     }
 
     func nowUnix() -> UInt64 {

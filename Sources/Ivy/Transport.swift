@@ -4,6 +4,13 @@ import NIOCore
 public enum TransportKind: UInt8, Sendable, Hashable, CaseIterable {
     case tcp = 1
     case quic = 2
+    /// Reached through a carrier rather than dialed directly. Only valid in
+    /// provider records: it names where to find a peer, not a socket to open,
+    /// and never enters the routing table.
+    case relay = 3
+
+    /// Whether a node can open a connection of this kind itself.
+    var isDirectlyDialable: Bool { self != .relay }
 }
 
 /// A bound listener owned by a transport.

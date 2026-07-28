@@ -252,6 +252,8 @@ extension IvyConfig {
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        maxRelayedInboundConnections: Int = 32,
+        maxRelayedInboundPerCarrier: Int = 8,
         privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
@@ -284,6 +286,8 @@ extension IvyConfig {
             maxContentCandidates: maxContentCandidates,
             externalAddress: externalAddress,
             relayEnabled: relayEnabled,
+            maxRelayedInboundConnections: maxRelayedInboundConnections,
+            maxRelayedInboundPerCarrier: maxRelayedInboundPerCarrier,
             privateContentExchangeEnabled: privateContentExchangeEnabled,
             carriers: carriers,
             mode: mode)

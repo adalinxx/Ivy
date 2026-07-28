@@ -447,12 +447,22 @@ public struct PeerEndpoint: Sendable, Equatable, Hashable {
     public let host: String
     public let port: UInt16
     public let transport: TransportKind
+    /// The carrier to reach `publicKey` through. Present only for `.relay`
+    /// endpoints, where `host` and `port` address the carrier, not the peer.
+    public let carrierKey: String?
 
-    public init(publicKey: String, host: String, port: UInt16, transport: TransportKind = .tcp) {
+    public init(
+        publicKey: String,
+        host: String,
+        port: UInt16,
+        transport: TransportKind = .tcp,
+        carrierKey: String? = nil
+    ) {
         self.publicKey = publicKey
         self.host = host
         self.port = port
         self.transport = transport
+        self.carrierKey = transport == .relay ? carrierKey : nil
     }
 }
 
@@ -460,22 +470,27 @@ private extension Data {
     mutating func appendEndpoints(_ endpoints: [PeerEndpoint]) -> Bool {
         guard appendCount(endpoints.count, max: MessageLimits.maxNeighborCount) else { return false }
         for endpoint in endpoints {
-            guard appendLengthPrefixedString(endpoint.publicKey),
-                  appendLengthPrefixedString(endpoint.host) else { return false }
-            appendUInt16(endpoint.port)
-            append(endpoint.transport.rawValue)
+            guard appendEndpointBody(endpoint) else { return false }
         }
+        return true
+    }
+
+    /// Shared by neighbour lists and provider records so both stay canonical.
+    mutating func appendEndpointBody(_ endpoint: PeerEndpoint) -> Bool {
+        guard appendLengthPrefixedString(endpoint.publicKey),
+              appendLengthPrefixedString(endpoint.host) else { return false }
+        appendUInt16(endpoint.port)
+        append(endpoint.transport.rawValue)
+        guard endpoint.transport == .relay else { return endpoint.carrierKey == nil }
+        guard let carrierKey = endpoint.carrierKey,
+              appendLengthPrefixedString(carrierKey) else { return false }
         return true
     }
 
     mutating func appendProviderRecords(_ records: [ProviderRecord]) -> Bool {
         guard appendCount(records.count, max: MessageLimits.maxNeighborCount) else { return false }
         for record in records {
-            let endpoint = record.endpoint
-            guard appendLengthPrefixedString(endpoint.publicKey),
-                  appendLengthPrefixedString(endpoint.host) else { return false }
-            appendUInt16(endpoint.port)
-            append(endpoint.transport.rawValue)
+            guard appendEndpointBody(record.endpoint) else { return false }
             appendUInt64(record.expiresAt)
         }
         return true
@@ -488,15 +503,8 @@ private extension DataReader {
         var endpoints: [PeerEndpoint] = []
         endpoints.reserveCapacity(Int(count))
         for _ in 0..<count {
-            guard let publicKey = readString(),
-                  let host = readString(),
-                  let port = readUInt16(),
-                  let transport = readTransportKind() else { return nil }
-            endpoints.append(PeerEndpoint(
-                publicKey: publicKey,
-                host: host,
-                port: port,
-                transport: transport))
+            guard let endpoint = readEndpointBody() else { return nil }
+            endpoints.append(endpoint)
         }
         return endpoints
     }
@@ -506,20 +514,28 @@ private extension DataReader {
         var records: [ProviderRecord] = []
         records.reserveCapacity(Int(count))
         for _ in 0..<count {
-            guard let publicKey = readString(),
-                  let host = readString(),
-                  let port = readUInt16(),
-                  let transport = readTransportKind(),
+            guard let endpoint = readEndpointBody(),
                   let expiresAt = readUInt64() else { return nil }
-            records.append(ProviderRecord(
-                endpoint: PeerEndpoint(
-                    publicKey: publicKey,
-                    host: host,
-                    port: port,
-                    transport: transport),
-                expiresAt: expiresAt))
+            records.append(ProviderRecord(endpoint: endpoint, expiresAt: expiresAt))
         }
         return records
+    }
+
+    mutating func readEndpointBody() -> PeerEndpoint? {
+        guard let publicKey = readString(),
+              let host = readString(),
+              let port = readUInt16(),
+              let transport = readTransportKind() else { return nil }
+        guard transport == .relay else {
+            return PeerEndpoint(publicKey: publicKey, host: host, port: port, transport: transport)
+        }
+        guard let carrierKey = readString() else { return nil }
+        return PeerEndpoint(
+            publicKey: publicKey,
+            host: host,
+            port: port,
+            transport: .relay,
+            carrierKey: carrierKey)
     }
 
     mutating func readTransportKind() -> TransportKind? {
