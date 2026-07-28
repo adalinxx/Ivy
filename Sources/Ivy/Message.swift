@@ -323,7 +323,7 @@ enum Message: Sendable {
             guard let requestID = reader.readUInt64(), requestID != 0,
                   let count = reader.readUInt16(), count <= MessageLimits.maxContentEntryCount else { return nil }
             var entries: [ContentEntry] = []
-            entries.reserveCapacity(Int(count))
+            entries.reserveCapacity(min(Int(count), 64))
             for _ in 0..<count {
                 guard let cid = reader.readString(), let data = reader.readData() else { return nil }
                 entries.append(ContentEntry(cid: cid, data: data))
@@ -435,7 +435,7 @@ private extension DataReader {
     mutating func readEndpoints() -> [PeerEndpoint]? {
         guard let count = readUInt16(), count <= MessageLimits.maxNeighborCount else { return nil }
         var endpoints: [PeerEndpoint] = []
-        endpoints.reserveCapacity(Int(count))
+        endpoints.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let publicKey = readString(), let host = readString(), let port = readUInt16() else { return nil }
             endpoints.append(PeerEndpoint(publicKey: publicKey, host: host, port: port))
@@ -446,7 +446,7 @@ private extension DataReader {
     mutating func readProviderRecords() -> [ProviderRecord]? {
         guard let count = readUInt16(), count <= MessageLimits.maxNeighborCount else { return nil }
         var records: [ProviderRecord] = []
-        records.reserveCapacity(Int(count))
+        records.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let publicKey = readString(),
                   let host = readString(),
@@ -462,7 +462,7 @@ private extension DataReader {
     mutating func readStrings(max: UInt16) -> [String]? {
         guard let count = readUInt16(), count <= max else { return nil }
         var strings: [String] = []
-        strings.reserveCapacity(Int(count))
+        strings.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let value = readString() else { return nil }
             strings.append(value)
