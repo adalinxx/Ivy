@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import Ivy
 
-@Suite("Reachability", .serialized)
+@Suite("Reachability")
 struct ReachabilityTests {
     @Test("a dial-back frame roundtrips and rejects malformed input")
     func probeFrameCodec() throws {
@@ -77,10 +77,6 @@ struct ReachabilityTests {
         await ivy.stop()
     }
 
-    // Known flake: this occasionally never confirms when the whole suite runs,
-    // while passing consistently on its own. Serializing the suite and widening
-    // the budget both failed to settle it, and it stops reproducing under
-    // logging, so the cause is still unidentified.
     @Test("a peer dials back the address it observes, proving reachability")
     func dialBackConfirmsReachabilityOverLoopback() async throws {
         let proverKey = deterministicTestSigningKey("prover")
@@ -127,10 +123,25 @@ struct ReachabilityTests {
             on: session)
 
         // A real dial-back round trip is slower than an in-process assertion, and
-        // slower still when the whole suite is running.
-        #expect(try await TransportTestHarness.eventually(attempts: 400) {
+        // slower still with the rest of the suite running alongside it.
+        let confirmed = try await TransportTestHarness.eventually(attempts: 200) {
             await prover.reachabilityStatus(for: .tcp) == .publiclyReachable
-        })
+        }
+        if !confirmed {
+            let proverState = await prover.reachabilityStateForTesting
+            let pending = await prover.pendingReachabilityProbeCountForTesting
+            let proverPeers = await prover.connectedPeers.count
+            let proverPendingSessions = await prover.pendingSessionCountForTesting
+            let helperAttempts = await helper.dialBackAttemptCountForTesting
+            let helperPeers = await helper.connectedPeers.count
+            Issue.record("""
+                dial-back never confirmed
+                prover: \(proverState) pendingProbes=\(pending) peers=\(proverPeers) \
+                pendingSessions=\(proverPendingSessions) port=\(proverPort)
+                helper: dialBackAttempts=\(helperAttempts) peers=\(helperPeers)
+                """)
+        }
+        #expect(confirmed)
 
         await prover.stop()
         await helper.stop()
