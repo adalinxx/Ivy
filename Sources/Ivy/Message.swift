@@ -48,6 +48,10 @@ enum Message: Sendable {
 
     case peerMessage(topic: String, payload: Data)
 
+    /// Bytes a `relayPacket` adds around its opaque endpoint record: the message
+    /// tag, the 32-byte route ID, and the 4-byte length prefix on the record.
+    static let relayPacketEnvelopeOverhead = 1 + 32 + 4
+
     private enum Tag: UInt8 {
         case ping = 0
         case pong = 1
@@ -115,7 +119,7 @@ enum Message: Sendable {
         return remaining
     }
 
-    func serialize(maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize) -> Data {
+    func serialize(maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize) -> Data {
         var bytes = Data()
         guard encode(into: &bytes, maxDataPayload: maxFrameSize),
               bytes.count <= Int(maxFrameSize) else { return Data() }
@@ -291,7 +295,7 @@ enum Message: Sendable {
 
     static func deserialize(
         _ data: Data,
-        maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize
+        maxDataPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) -> Message? {
         guard let message = decode(data, maxDataPayload: maxDataPayload),
               message.serialize(maxFrameSize: maxDataPayload) == data else { return nil }
@@ -323,7 +327,7 @@ enum Message: Sendable {
             guard let requestID = reader.readUInt64(), requestID != 0,
                   let count = reader.readUInt16(), count <= MessageLimits.maxContentEntryCount else { return nil }
             var entries: [ContentEntry] = []
-            entries.reserveCapacity(Int(count))
+            entries.reserveCapacity(min(Int(count), 64))
             for _ in 0..<count {
                 guard let cid = reader.readString(), let data = reader.readData() else { return nil }
                 entries.append(ContentEntry(cid: cid, data: data))
@@ -435,7 +439,7 @@ private extension DataReader {
     mutating func readEndpoints() -> [PeerEndpoint]? {
         guard let count = readUInt16(), count <= MessageLimits.maxNeighborCount else { return nil }
         var endpoints: [PeerEndpoint] = []
-        endpoints.reserveCapacity(Int(count))
+        endpoints.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let publicKey = readString(), let host = readString(), let port = readUInt16() else { return nil }
             endpoints.append(PeerEndpoint(publicKey: publicKey, host: host, port: port))
@@ -446,7 +450,7 @@ private extension DataReader {
     mutating func readProviderRecords() -> [ProviderRecord]? {
         guard let count = readUInt16(), count <= MessageLimits.maxNeighborCount else { return nil }
         var records: [ProviderRecord] = []
-        records.reserveCapacity(Int(count))
+        records.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let publicKey = readString(),
                   let host = readString(),
@@ -462,7 +466,7 @@ private extension DataReader {
     mutating func readStrings(max: UInt16) -> [String]? {
         guard let count = readUInt16(), count <= max else { return nil }
         var strings: [String] = []
-        strings.reserveCapacity(Int(count))
+        strings.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
             guard let value = readString() else { return nil }
             strings.append(value)
@@ -527,7 +531,7 @@ extension Data {
     @inline(__always)
     mutating func appendLengthPrefixedData(
         _ data: Data,
-        maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize
+        maxDataPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) -> Bool {
         guard data.count <= Int(maxDataPayload) else { return false }
         appendUInt32(UInt32(data.count))
@@ -541,7 +545,7 @@ struct DataReader {
     private let maxDataPayload: UInt32
     private var offset = 0
 
-    init(_ data: Data, maxDataPayload: UInt32 = IvyConfig.protocolMaxFrameSize) {
+    init(_ data: Data, maxDataPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize) {
         self.data = data
         self.maxDataPayload = maxDataPayload
     }

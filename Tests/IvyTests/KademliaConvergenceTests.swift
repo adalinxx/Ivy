@@ -559,11 +559,11 @@ struct KademliaConvergenceTests {
                     host: "8.8.8.\(index + 1)",
                     port: UInt16(4100 + index)),
                     source: .referral(deterministicTestPeerKey("kad-route-flooder")))],
-                preferred: trusted)
+                preferred: trusted, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity)
         }
 
         #expect(routes.first?.endpoint == trusted)
-        #expect(routes.count == Ivy.maxRoutesPerIdentity)
+        #expect(routes.count == IvyConfig.defaultMaxRoutesPerIdentity)
     }
 
     @Test("route source diversity survives lookup rounds")
@@ -578,24 +578,24 @@ struct KademliaConvergenceTests {
 
         var selected = selectedLookupRoutes(
             [LookupRoute(endpoint: live, source: .referral(honest))],
-            preferred: nil)
+            preferred: nil, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity)
         for endpoint in poisoned {
             selected = selectedLookupRoutes(
                 selected + [LookupRoute(endpoint: endpoint, source: .referral(flooding))],
-                preferred: nil)
+                preferred: nil, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity)
         }
 
-        #expect(selected.count == Ivy.maxRoutesPerIdentity)
+        #expect(selected.count == IvyConfig.defaultMaxRoutesPerIdentity)
         #expect(selected.contains { $0.endpoint == live })
 
         let retired = LookupRoute(endpoint: live, source: .authenticated)
         let alternative = LookupRoute(endpoint: poisoned[0], source: .referral(honest))
         #expect(selectedLookupRoutes(
             [retired, alternative],
-            preferred: live).first?.endpoint == live)
+            preferred: live, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity).first?.endpoint == live)
         #expect(selectedLookupRoutes(
             [retired, alternative],
-            preferred: nil).first?.endpoint == alternative.endpoint)
+            preferred: nil, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity).first?.endpoint == alternative.endpoint)
 
         let attacker = "0" + String(repeating: "0", count: honest.count - 1)
         let repeated = [LookupRoute(endpoint: live, source: .referral(attacker))]
@@ -609,11 +609,11 @@ struct KademliaConvergenceTests {
             }
         let deduplicated = selectedLookupRoutes(
             [LookupRoute(endpoint: live, source: .referral(honest))] + repeated,
-            preferred: nil)
+            preferred: nil, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity)
         #expect(deduplicated.contains { $0.endpoint == live && $0.source == .referral(honest) })
         #expect(selectedLookupRoutes(
             [LookupRoute(endpoint: live, source: .authenticated)] + repeated,
-            preferred: live).first?.source == .authenticated)
+            preferred: live, maxRoutesPerIdentity: IvyConfig.defaultMaxRoutesPerIdentity).first?.source == .authenticated)
     }
 
     @Test("later lookup rounds cannot replace every route from an earlier source")

@@ -299,7 +299,7 @@ extension Ivy {
         let key = ContentRequestKey(rootCID: rootCID, cids: cids)
         guard let maxDataBytes = Message.contentResponseDataBudget(
             for: key.requestedCIDs,
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: config.protocolMaxFrameSize,
             relayed: session.map { !$0.connection.isDirect }
                 ?? (endpointConnection(for: peer)?.isDirect == false)
         ) else {
@@ -517,7 +517,8 @@ extension Ivy {
               ),
               let payloadBytes = Message.volumeChunkDataBudget(
                 rootCID: rootCID,
-                maxFrameSize: IvyConfig.protocolMaxFrameSize,
+                maxFrameSize: effectiveOutboundFrameSize(
+                    for: session?.connection ?? endpointConnection(for: peer)),
                 relayed: session.map { !$0.connection.isDirect }
                     ?? (endpointConnection(for: peer)?.isDirect == false)
               ),
@@ -572,7 +573,7 @@ extension Ivy {
 
     private func reserveServingVolumeCapacity() -> Bool {
         guard MessageLimits.maxVolumeArchiveBytes
-                <= MessageLimits.maxInFlightVolumeBytes - reservedServingVolumeBytes else {
+                <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes else {
             return false
         }
         reservedServingVolumeBytes += MessageLimits.maxVolumeArchiveBytes
@@ -725,7 +726,7 @@ extension Ivy {
         let key = ContentRequestKey(rootCID: rootCID, cids: cids)
         guard Message.contentResponseDataBudget(
             for: key.requestedCIDs,
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: config.protocolMaxFrameSize,
             relayed: false
         ) != nil else { return .empty }
         return await fetchContentCoalesced(key, generation: generation)
@@ -746,7 +747,7 @@ extension Ivy {
         let key = ContentRequestKey(rootCID: rootCID, cids: cids)
         guard Message.contentResponseDataBudget(
             for: key.requestedCIDs,
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: config.protocolMaxFrameSize,
             relayed: peer.route != .direct
         ) != nil else { return .empty }
         return await fetchContent(
@@ -1005,7 +1006,7 @@ extension Ivy {
               !payload.isEmpty,
               let maxChunkBytes = Message.volumeChunkDataBudget(
                 rootCID: rootCID,
-                maxFrameSize: IvyConfig.protocolMaxFrameSize,
+                maxFrameSize: config.protocolMaxFrameSize,
                 relayed: relayed
               ),
               payload.count <= maxChunkBytes else {
@@ -1040,7 +1041,7 @@ extension Ivy {
                 )
                 return
             }
-            guard byteCount <= MessageLimits.maxInFlightVolumeBytes
+            guard byteCount <= config.maxInFlightVolumeBytes
                     - reservedVolumeBytes else {
                 markVolumeCandidateDone(
                     requestID: requestID,
@@ -1062,7 +1063,7 @@ extension Ivy {
             rejectVolumeCandidate(requestID: requestID, peer: peer)
             return
         }
-        guard payload.count <= MessageLimits.maxInFlightVolumeBytes
+        guard payload.count <= config.maxInFlightVolumeBytes
                 - inFlightVolumeBytes else {
             markVolumeCandidateDone(
                 requestID: requestID,
@@ -1156,7 +1157,7 @@ extension Ivy {
         guard let source = contentSource else { return nil }
         guard let maxDataBytes = Message.contentResponseDataBudget(
             for: key.requestedCIDs,
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: config.protocolMaxFrameSize,
             relayed: false
         ) else { return nil }
         guard servingContentRequests.count + activeLocalContentRequestCount

@@ -131,6 +131,34 @@ struct SessionProtocolTests {
         #expect(try PeerMetadata.decodeCanonical(encoded) == metadata)
     }
 
+    @Test("metadata advertises a non-default frame size and omits the default")
+    func frameSizeNegotiation() throws {
+        let addr = ListenAddress(host: "a.example", port: 4001)
+
+        // The default frame size is OMITTED, so metadata is byte-identical to a
+        // legacy peer's — the canonical handshake check stays backward-compatible.
+        let dflt = try #require(PeerMetadata(listenAddresses: [addr]).encode())
+        let explicit = try #require(PeerMetadata(
+            listenAddresses: [addr],
+            maxFrameSize: IvyConfig.defaultProtocolMaxFrameSize).encode())
+        #expect(dflt == explicit)
+        #expect(try PeerMetadata.decodeCanonical(dflt).maxFrameSize
+            == IvyConfig.defaultProtocolMaxFrameSize)
+
+        // A non-default frame size round-trips and costs exactly a trailing UInt32.
+        let customEncoded = try #require(PeerMetadata(
+            listenAddresses: [addr], maxFrameSize: 8 * 1024 * 1024).encode())
+        #expect(customEncoded.count == dflt.count + 4)
+        #expect(try PeerMetadata.decodeCanonical(customEncoded).maxFrameSize == 8 * 1024 * 1024)
+
+        // Redundantly encoding the default value is non-canonical → rejected.
+        var redundant = dflt
+        redundant.appendUInt32(IvyConfig.defaultProtocolMaxFrameSize)
+        #expect(throws: SessionProtocolError.self) {
+            try PeerMetadata.decodeCanonical(redundant)
+        }
+    }
+
     @Test("signed responder hello and initiator finish authenticate one transcript")
     func handshake() throws {
         let (helloI, helloR, sessionID, initiatorIdentity, responderIdentity) = try transcript()
