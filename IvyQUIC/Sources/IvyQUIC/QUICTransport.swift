@@ -68,10 +68,13 @@ public struct QUICTransport: IvyTransport {
             peerCertificateVerification: .noVerification)
     }
 
+    /// - Parameter boundToPort: Local UDP port to dial from, so a hole punch
+    ///   leaves through the mapping this node advertises.
     public func dial(
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
+        boundToPort: UInt16?,
         initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> Channel {
         let remote = try await resolve(host: host, port: port, group: group)
@@ -79,7 +82,8 @@ public struct QUICTransport: IvyTransport {
         let logger = self.logger
 
         let (datagramChannel, multiplexer) = try await DatagramBootstrap(group: group)
-            .bind(host: "0.0.0.0", port: 0) { channel in
+            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .bind(host: "0.0.0.0", port: Int(boundToPort ?? 0)) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     let (handler, multiplexer) = try QUICHandler.makeHandlerAndConnectionMultiplexer(
                         channel: channel,

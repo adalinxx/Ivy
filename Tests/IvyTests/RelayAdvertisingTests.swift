@@ -79,6 +79,23 @@ struct RelayAdvertisingTests {
             from: source))
     }
 
+    @Test("a carrier named for one peer gains no authority over others")
+    func advertisedCarrierGrantIsScopedToItsTarget() async throws {
+        let ivy = Ivy(config: IvyConfig(publicKey: deterministicTestPeerKey("scoped")))
+        let carrier = try PeerKey(deterministicTestPeerKey("scoped-carrier"))
+        let target = try PeerKey(deterministicTestPeerKey("scoped-target"))
+        let other = try PeerKey(deterministicTestPeerKey("scoped-other"))
+
+        await ivy.grantAdvertisedCarrierForTesting(carrier, for: target)
+        #expect(await ivy.mayRequestRelay(via: carrier, to: target))
+        // The hint said nothing about anyone else, so it grants nothing else.
+        #expect(await !ivy.mayRequestRelay(via: carrier, to: other))
+
+        // The grant lasts only as long as the target is worth reaching.
+        await ivy.revokeAdvertisedCarriers(for: target)
+        #expect(await !ivy.mayRequestRelay(via: carrier, to: target))
+    }
+
     @Test("relayed inbound sessions are capped overall and per carrier")
     func relayedInboundIsCapped() async throws {
         let ivy = Ivy(config: IvyConfig(

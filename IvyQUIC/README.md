@@ -39,6 +39,10 @@ assumptions, so the code here is not speculative:
 
 ## Known gaps in the 0.1.0 API
 
+- Dialing from the listener's own UDP port shares one socket between the listener
+  and the dial, which this code does not yet arrange; a punch therefore leaves
+  from whatever port the bind yields.
+
 - No TLS exporter is exposed, so mixing a channel binding into `routeBinding` is not
   possible yet; QUIC dials use the same zero binding as direct TCP.
 - Connection migration cannot be disabled through `QUICConfiguration`.

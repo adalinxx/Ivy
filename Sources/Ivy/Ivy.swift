@@ -51,6 +51,8 @@ final class AuthenticatedSession: @unchecked Sendable {
     let role: AuthenticatedPeerRole
     let sessionID: SessionID
     let metadata: PeerMetadata
+    /// Whether this node accepted the session rather than dialing it.
+    let acceptedInbound: Bool
     var sequenceState = SessionSequenceState()
     var didNotifyConnect = false
 
@@ -59,13 +61,15 @@ final class AuthenticatedSession: @unchecked Sendable {
         peerKey: PeerKey,
         role: AuthenticatedPeerRole,
         sessionID: SessionID,
-        metadata: PeerMetadata
+        metadata: PeerMetadata,
+        acceptedInbound: Bool = false
     ) {
         self.connection = connection
         self.peerKey = peerKey
         self.role = role
         self.sessionID = sessionID
         self.metadata = metadata
+        self.acceptedInbound = acceptedInbound
     }
 }
 
@@ -165,9 +169,11 @@ public actor Ivy {
     var runGeneration: UInt64 = 0
     private var inboundAdmissionGate: InboundAdmissionGate?
 
-    /// Peers a provider record named as a carrier for someone, which we may send
-    /// relay requests to even though they are not configured carriers.
-    var advertisedCarriers: Set<PeerKey> = []
+    /// Carriers a peer named for itself, mapped to the targets they were named
+    /// for. A hint is unsigned, so the grant is narrow: it permits relay requests
+    /// towards that one target and is dropped when the attempt or session ends.
+    var advertisedCarriers: [PeerKey: Set<PeerKey>] = [:]
+    static let maxAdvertisedCarriers = 16
     var holePunches: [PeerKey: PendingHolePunch] = [:]
     var holePunchCooldowns: [PeerKey: ContinuousClock.Instant] = [:]
     var holePunchStartTasks: [PeerKey: Task<Void, Never>] = [:]
@@ -534,6 +540,13 @@ public actor Ivy {
         }
     }
 
+    /// True when this connection was accepted by our listener rather than dialed.
+    func isAcceptedPendingConnection(_ connectionID: UUID) -> Bool {
+        guard let pending = pendingSessions[connectionID] else { return false }
+        if case .responder = pending.direction { return true }
+        return false
+    }
+
     func liveSession(for key: PeerKey) -> AuthenticatedSession? {
         sessions[key]
     }
@@ -639,9 +652,9 @@ public actor Ivy {
               carrier != localKey,
               (try? PeerKey(route.publicKey)) != carrier,
               config.allowsEndpoint(carrier) else { return false }
+        guard let target = try? PeerKey(route.publicKey) else { return false }
         if liveSession(for: carrier) != nil {
-            advertisedCarriers.insert(carrier)
-            return true
+            return grantAdvertisedCarrier(carrier, for: target)
         }
         let endpoint = PeerEndpoint(
             publicKey: carrier.hex,
@@ -660,8 +673,22 @@ public actor Ivy {
         } catch {
             return false
         }
-        advertisedCarriers.insert(carrier)
+        return grantAdvertisedCarrier(carrier, for: target)
+    }
+
+    private func grantAdvertisedCarrier(_ carrier: PeerKey, for target: PeerKey) -> Bool {
+        guard advertisedCarriers[carrier] != nil
+                || advertisedCarriers.count < Self.maxAdvertisedCarriers else { return false }
+        advertisedCarriers[carrier, default: []].insert(target)
         return true
+    }
+
+    func revokeAdvertisedCarriers(for target: PeerKey) {
+        for (carrier, targets) in advertisedCarriers where targets.contains(target) {
+            var remaining = targets
+            remaining.remove(target)
+            advertisedCarriers[carrier] = remaining.isEmpty ? nil : remaining
+        }
     }
 
     private func connectCarrier(to endpoint: PeerEndpoint) async throws {
@@ -1123,10 +1150,13 @@ public actor Ivy {
 
     private var inboundRelayedConnections: [PeerConnection] {
         let pending = pendingSessions.values.lazy
-            .filter { !$0.connection.isDirect }
+            .filter { pending in
+                guard case .responder = pending.direction else { return false }
+                return !pending.connection.isDirect
+            }
             .map(\.connection)
         let authenticated = sessions.values.lazy
-            .filter { !$0.connection.isDirect }
+            .filter { !$0.connection.isDirect && $0.acceptedInbound }
             .map(\.connection)
         return Array(pending) + Array(authenticated)
     }
@@ -1302,11 +1332,16 @@ public actor Ivy {
 
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
         // A dial-back proving our reachability arrives as the only frame on a
-        // fresh inbound connection, before any session exists. An unmatched nonce
-        // is not evidence of misbehaviour, so the socket closes without blame.
+        // connection we accepted, before any session exists. Only an accepted
+        // direct connection counts: a nonce arriving on a connection we dialed
+        // proves nothing about whether strangers can reach us, and would let a
+        // peer we dial talk us into believing we are publicly reachable. An
+        // unmatched nonce is not misbehaviour, so the socket closes without blame.
         if session(for: connection.connectionID) == nil,
+           connection.isDirect,
+           isAcceptedPendingConnection(connection.connectionID),
            let nonce = ReachabilityProbe.decode(bytes) {
-            _ = confirmReachability(nonce: nonce)
+            _ = confirmReachability(nonce: nonce, arrivingOn: connection.endpoint.transport)
             failPendingSession(connection.connectionID)
             return
         }
@@ -1447,7 +1482,7 @@ public actor Ivy {
         }
     }
 
-    private func peerMeetsDifficulty(_ key: PeerKey) -> Bool {
+    func peerMeetsDifficulty(_ key: PeerKey) -> Bool {
         config.minPeerKeyBits == 0
             || KeyDifficulty.trailingZeroBits(of: key.hex) >= config.minPeerKeyBits
     }
@@ -1503,12 +1538,15 @@ public actor Ivy {
         // Role is local policy: configured carrier identities stay carrier-only.
         let role: AuthenticatedPeerRole = config.isConfiguredCarrier(peerKey) ? .carrier : .endpoint
 
+        let accepted: Bool
+        if case .responder = pending.direction { accepted = true } else { accepted = false }
         let session = AuthenticatedSession(
             connection: pending.connection,
             peerKey: peerKey,
             role: role,
             sessionID: sessionID,
-            metadata: metadata)
+            metadata: metadata,
+            acceptedInbound: accepted)
         let existing = sessions[peerKey]
 
         if let existing,
@@ -1525,12 +1563,7 @@ public actor Ivy {
             return
         }
 
-        let isInbound: Bool
-        if case .responder = pending.direction {
-            isInbound = true
-        } else {
-            isInbound = false
-        }
+        let isInbound = accepted
         if !canPromote(
             pending.connection,
             peerKey: peerKey,
@@ -1566,6 +1599,10 @@ public actor Ivy {
                 from: peerKey.peerID) {
                 route = endpoint
             } else if case .initiator = pending.direction,
+                      pending.connection.isDirect,
+                      // A relayed connection's endpoint addresses the carrier, so
+                      // it must never be routed as the peer's own address.
+                      pending.connection.endpoint.transport.isDirectlyDialable,
                       !pending.connection.endpoint.host.isEmpty,
                       pending.connection.endpoint.host != "unknown",
                       pending.connection.endpoint.port != 0 {
@@ -1712,6 +1749,11 @@ public actor Ivy {
         }
 
         removeRoutes(involving: key)
+        cancelHolePunch(with: key)
+        holePunchCooldowns.removeValue(forKey: key)
+        lastDialBack.removeValue(forKey: key)
+        advertisedCarriers.removeValue(forKey: key)
+        revokeAdvertisedCarriers(for: key)
         if let monitor = healthMonitor {
             let peer = key.peerID
             let sessionID = session.sessionID
@@ -2255,10 +2297,11 @@ public actor Ivy {
 
     private func endpointMayReceiveRelayControl(_ message: Message, peer: PeerKey) -> Bool {
         switch message {
-        case .relayOpen:
-            // Only towards a peer the target named as its carrier, and only while
-            // we are actually opening a route through it.
-            return advertisedCarriers.contains(peer)
+        case .relayOpen(let routeID, let targetKey):
+            // Only towards a peer that this very target named as its carrier, and
+            // only for the route we are opening through it right now.
+            return advertisedCarriers[peer]?.contains(targetKey) == true
+                && pendingRelayOpens[routeID]?.carrier == peer
         case .relayOffer(let routeID, _):
             return config.relayEnabled && relayRoutes[routeID]?.target == peer
         case .relayReady(let routeID, _):
@@ -2312,16 +2355,23 @@ public actor Ivy {
               !Task.isCancelled,
               !reconnectSuppressed.contains(target.peerID) else { throw IvyError.notRunning }
         if endpointSession(for: target)?.connection.isLive == true { return }
-        // Configured carriers first, then any peer the target itself named as its
-        // carrier and we already hold a session with.
-        let candidates = sessions.values
+        // Configured carriers first, then any peer named as a carrier for this
+        // target specifically, so an unsigned hint never displaces configuration.
+        let configured = sessions.values
+            .filter { $0.connection.isDirect && $0.role == .carrier }
+            .map(\.peerKey)
+            .sorted()
+        let advertised = sessions.values
             .filter {
                 $0.connection.isDirect
-                    && ($0.role == .carrier || advertisedCarriers.contains($0.peerKey))
+                    && $0.role != .carrier
+                    && advertisedCarriers[$0.peerKey]?.contains(target) == true
             }
             .map(\.peerKey)
+            .sorted()
+        let candidates = configured + advertised
 
-        for carrier in candidates.sorted() {
+        for carrier in candidates {
             guard isCurrentRun(generation),
                   !Task.isCancelled,
                   !reconnectSuppressed.contains(target.peerID) else {
@@ -3617,6 +3667,14 @@ public actor Ivy {
     /// there is no session.
     func routeForTesting(to peer: PeerKey) -> Bool? {
         sessions[peer]?.connection.isDirect
+    }
+
+    func grantAdvertisedCarrierForTesting(_ carrier: PeerKey, for target: PeerKey) {
+        advertisedCarriers[carrier, default: []].insert(target)
+    }
+
+    func mayRequestRelay(via carrier: PeerKey, to target: PeerKey) -> Bool {
+        advertisedCarriers[carrier]?.contains(target) == true
     }
 
     func seedRelayedInboundForTesting(carrier: PeerKey) {
