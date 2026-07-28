@@ -154,6 +154,19 @@ public actor Ivy {
         return endpointSession(for: key)?.connection
     }
 
+    /// Effective outbound frame size over a (possibly relayed) route: the peer's
+    /// advertised accept, capped by the carrier connection's capacity on a relayed
+    /// route so we never build a frame the carrier cannot forward.
+    func effectiveOutboundFrameSize(for connection: PeerConnection?) -> UInt32 {
+        guard let connection else { return IvyConfig.defaultProtocolMaxFrameSize }
+        var limit = connection.peerMaxFrameSize
+        if case .relayed(_, let carrier) = connection.transport,
+           let carrierConnection = endpointConnection(for: carrier.peerID) {
+            limit = min(limit, carrierConnection.peerMaxFrameSize)
+        }
+        return limit
+    }
+
     var connectedEndpointPeers: [PeerID] {
         sessions.values.compactMap { $0.role == .endpoint ? $0.peerKey.peerID : nil }
     }
@@ -1133,7 +1146,8 @@ public actor Ivy {
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
         let record: SessionWireRecord
         do {
-            record = try SessionWireRecord.deserialize(bytes)
+            // Inbound: accept up to what THIS node advertised it accepts.
+            record = try SessionWireRecord.deserialize(bytes, maxPayload: config.protocolMaxFrameSize)
         } catch {
             rejectRecord(on: connection)
             return
@@ -1733,7 +1747,7 @@ public actor Ivy {
         on session: AuthenticatedSession,
         bypassAdmission: Bool
     ) -> SendMessageResult {
-        let payload = message.serialize()
+        let payload = message.serialize(maxFrameSize: effectiveOutboundFrameSize(for: session.connection))
         guard !payload.isEmpty else { return .locallyRejected }
         return enqueuePayload(
             payload,
@@ -1838,7 +1852,7 @@ public actor Ivy {
         _ record: SessionWireRecord,
         on connection: PeerConnection
     ) -> SessionRecordSendResult {
-        let payload = record.serialize()
+        let payload = record.serialize(maxPayload: effectiveOutboundFrameSize(for: connection))
         guard !payload.isEmpty else { return .locallyRejected }
         switch connection.transport {
         case .direct:
@@ -1928,7 +1942,7 @@ public actor Ivy {
         }
         tally.recordReceived(peer: session.peerKey.peerID, bytes: record.payload.count)
 
-        guard let message = Message.deserialize(record.payload) else {
+        guard let message = Message.deserialize(record.payload, maxDataPayload: config.protocolMaxFrameSize) else {
             rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
                 session.peerKey,
                 direct: session.connection.isDirect,
@@ -2369,7 +2383,7 @@ public actor Ivy {
             }
 
             guard let firstRecord = try? SessionWireRecord.deserialize(
-                    opaqueRecord),
+                    opaqueRecord, maxPayload: config.protocolMaxFrameSize),
                   case .helloInitiator(let hello) = firstRecord,
                   hello.isValid(),
                   hello.hello.initiator == installed.remote,
@@ -2548,7 +2562,8 @@ public actor Ivy {
             endpoint: endpoint,
             routeID: routeID,
             carrier: carrier,
-            inboundByteBudget: inboundByteBudget)
+            inboundByteBudget: inboundByteBudget,
+            localMaxFrameSize: config.protocolMaxFrameSize)
     }
 
     // MARK: - Message Handling
@@ -3040,7 +3055,8 @@ public actor Ivy {
             endpoint: endpoint,
             routeID: Data(repeating: marker, count: 32),
             carrier: peerKey,
-            inboundByteBudget: inboundByteBudget)
+            inboundByteBudget: inboundByteBudget,
+            localMaxFrameSize: config.protocolMaxFrameSize)
         let session = AuthenticatedSession(
             connection: connection,
             peerKey: peerKey,
@@ -3262,7 +3278,8 @@ public actor Ivy {
             endpoint: endpoint,
             routeID: Data(repeating: marker, count: 32),
             carrier: peer,
-            inboundByteBudget: inboundByteBudget)
+            inboundByteBudget: inboundByteBudget,
+            localMaxFrameSize: config.protocolMaxFrameSize)
         pendingSessions[connection.connectionID] = PendingSession(
             connection: connection,
             direction: .responder,
@@ -3314,7 +3331,7 @@ public actor Ivy {
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
                 let connectionBudget = InboundByteBudget(
-                    limit: PeerConnection.maxInboundBufferedBytes)
+                    limit: PeerConnection.inboundByteBudgetLimit(for: self.config.protocolMaxFrameSize))
                 do {
                     try channel.pipeline.syncOperations.addHandler(SessionFrameDecoder(
                         maxFrameSize: self.config.protocolMaxFrameSize,
@@ -3331,7 +3348,8 @@ public actor Ivy {
                         admissionGate: gate,
                         inboundByteBudget: inboundByteBudget,
                         connectionInboundByteBudget: connectionBudget,
-                        directInbound: directInbound)
+                        directInbound: directInbound,
+                        localMaxFrameSize: self.config.protocolMaxFrameSize)
                     return channel.pipeline.addHandler(acceptor)
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)

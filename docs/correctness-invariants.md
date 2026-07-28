@@ -12,7 +12,7 @@ Authentication proves a peer key, never application authority.
 | IVY-006 | Endpoint and carrier identities are disjoint; carriers never enter endpoint routing. |
 | IVY-007 | Work from an old run, operation, or authenticated session cannot mutate or reply through successor state. |
 | IVY-008 | Frames, fields, connections, pending work, routing, hints, routes, and all partial or queued inbound bytes are bounded. |
-| IVY-009 | One 4 MiB frame-body cap and one 64 KiB metadata cap apply on every route. |
+| IVY-009 | Each node enforces its own frame-body cap (4 MiB default, operator-tunable, handshake-advertised); outbound never exceeds the peer's advertised cap (carrier-minimum on relay). One 64 KiB metadata cap applies on every route. |
 | IVY-010 | Exact route overhead is removed before a content source materializes bytes. |
 | IVY-011 | Content is request-correlated and exact, or unavailable; partial success is impossible. |
 | IVY-012 | Ivy treats non-empty ASCII wire identifiers and bytes as opaque and never traverses or stores a DAG. |

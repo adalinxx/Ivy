@@ -442,7 +442,8 @@ extension Ivy {
 
     func providerExpiryIsValid(_ expiresAt: UInt64) -> Bool {
         let now = nowUnix()
-        return expiresAt > now && expiresAt <= now + config.maxProviderTTLSeconds
+        let (ceiling, overflow) = now.addingReportingOverflow(config.maxProviderTTLSeconds)
+        return expiresAt > now && (overflow || expiresAt <= ceiling)
     }
 
     func localProviderEndpoint() -> PeerEndpoint? {
