@@ -34,6 +34,12 @@ established the design's load-bearing assumptions:
 
 ## Known gaps in the 0.1.0 API
 
+- No way to close a QUIC connection is exposed, so one that completes the
+  handshake and never opens a stream cannot be torn down. This transport bounds
+  how many such connections it services (`maxInboundConnections`); the rest are
+  left to the idle timeout. A QUIC connection reaches Ivy's admission gate only
+  when it opens its stream.
+
 - Dialing from the listener's own UDP port shares one socket between the listener
   and the dial, which this code does not yet arrange; a punch therefore leaves
   from whatever port the bind yields.

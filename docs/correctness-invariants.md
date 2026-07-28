@@ -27,7 +27,7 @@ Authentication proves a peer key, never application authority.
 | IVY-021 | A complete Volume is bounded, request/root/session/run-bound, globally reservation-capped on receive and serve, sequentially assembled per provider, and visible only after exact complete decoding. |
 | IVY-022 | Every transport delivers ordered bounded frames into the same admission gate, byte budgets, and signed-session state machine; identity is never asserted by transport-layer credentials. |
 | IVY-023 | A node advertises an address for a transport only when it has bound that transport, and never dials or routes an address for a transport it has not installed. |
-| IVY-024 | A reachability dial-back targets only the requester's observed address, is rate-limited per peer and in total, and confirms reachability only when its nonce arrives inbound. |
+| IVY-024 | A reachability dial-back targets only the requester's observed address, is rate-limited per peer and in total, releases its slot on a deadline the peer cannot extend, and confirms reachability only for the transport it arrives on, inbound. |
 | IVY-025 | Hole punching coordinates timing only: punched connections face unchanged admission, netgroup, handshake, and Tally policy; dials are bounded per peer and node-wide; and a failed punch keeps the relayed session and blames nobody. |
 | IVY-026 | Relay endpoints are expiring self-advertised hints naming a carrier that delivered the peer's own session; they appear only in provider records and grant no authority beyond that carrier's own limits. |
 

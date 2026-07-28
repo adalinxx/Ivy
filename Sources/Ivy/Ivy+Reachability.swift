@@ -250,14 +250,28 @@ extension Ivy {
     static let dialBackCloseGrace: Duration = .seconds(2)
 
     private static func awaitPeerClose(_ channel: Channel, within grace: Duration) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { try? await channel.closeFuture.get() }
-            group.addTask { try? await Task.sleep(for: grace) }
-            await group.next()
-            group.cancelAll()
+        // The close must be driven from the event loop rather than by cancelling
+        // a waiting task: `EventLoopFuture.get()` ignores cancellation, so racing
+        // it against a sleep would wait for a peer that never closes and hold the
+        // dial-back slot for good.
+        let deadline = channel.eventLoop.scheduleTask(in: TimeAmount(grace)) {
+            channel.close(promise: nil)
         }
-        channel.close(promise: nil)
+        try? await channel.closeFuture.get()
+        deadline.cancel()
     }
+
+#if DEBUG || IVY_TESTING
+    func dialBackForTesting(host: String, port: UInt16) async {
+        activeDialBacks += 1
+        defer { activeDialBacks -= 1 }
+        _ = await performDialBack(
+            host: host,
+            port: port,
+            transport: .tcp,
+            nonce: Data(repeating: 0x01, count: ReachabilityProbe.nonceByteCount))
+    }
+#endif
 
     private func respondToReachabilityRequest(
         _ requestID: UInt64,
