@@ -258,10 +258,10 @@ public actor Ivy {
         transports: [any IvyTransport]? = nil
     ) {
         self.config = config
-        // The default transport is built from the config so a punch can dial from
-        // the listening port, which is what makes the NAT mapping match.
+        // The default transport is built from the config, since only the config
+        // says whether this node may share its listening port with a punch dial.
         let installed = transports
-            ?? [TCPTransport(reusePort: config.holePunchEnabled)]
+            ?? [TCPTransport(reusePort: config.reusesListenPortForHolePunch)]
         self.transports = Dictionary(
             installed.map { ($0.kind, $0) },
             uniquingKeysWith: { first, _ in first })
@@ -405,6 +405,7 @@ public actor Ivy {
         pendingReachabilityProbes.removeAll()
         reachability.removeAll()
         lastDialBack.removeAll()
+        activeDialBacks = 0
         advertisedCarriers.removeAll()
         for punch in holePunches.values {
             punch.timeoutTask?.cancel()
@@ -3694,6 +3695,7 @@ public actor Ivy {
             generation: runGeneration)
     }
 
+    var activeDialBacksForTesting: Int { activeDialBacks }
     var pendingReachabilityProbeCountForTesting: Int { pendingReachabilityProbes.count }
     var dialBackAttemptCountForTesting: Int { lastDialBack.count }
     var reachabilityStateForTesting: String {

@@ -188,9 +188,6 @@ extension Ivy {
     /// it is the point. Every other limit a referral dial faces still applies,
     /// because the address came from the peer itself.
     private func punchDialIsPermitted(to endpoint: PeerEndpoint) -> Bool {
-        // Candidates are addresses the peer chose, so bound the aggregate: the
-        // per-peer cooldown alone would still let many peers sum into a scan.
-        guard recordPunchDialAllowance() else { return false }
         // The host itself was already screened for routability by
         // `acceptablePunchCandidates`, which is where the private-address policy
         // lives; a candidate is still only ever an address the peer chose, so the
@@ -201,7 +198,12 @@ extension Ivy {
               !reconnectSuppressed.contains(key.peerID),
               connectionCapacityUsed < config.maxConnections else { return false }
         let group = NetGroup.group(endpoint.host)
-        return directConnectionCount(inNetgroup: group) < config.maxConnectionsPerNetgroup
+        guard directConnectionCount(inNetgroup: group)
+                < config.maxConnectionsPerNetgroup else { return false }
+        // Charged last, so a refusal never spends budget an honest dial could use.
+        // Candidates are addresses the peer chose, and the per-peer cooldown alone
+        // would still let many peers sum into a scan.
+        return recordPunchDialAllowance()
     }
 
     // MARK: - Candidates

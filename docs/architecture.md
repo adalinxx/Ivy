@@ -49,8 +49,9 @@ records; routing and session metadata stay direct-only.
 Once two peers share a relayed session, the side that accepted it offers its
 addresses, measures the round trip, and both dial at the same moment. Those dials
 leave from the listening port, so the mapping a NAT creates is the one this node
-advertises; that requires the listener to permit port reuse, which it does only
-while punching is enabled. A punched connection is an ordinary connection: it
+advertises. That requires the listener to share its port, which also lets any
+process able to bind as this user absorb inbound connections, so it is off unless
+configured; without it a punch still leaves from an ephemeral port. A punched connection is an ordinary connection: it
 faces the same admission, netgroup, handshake, and scoring policy, and only the
 timing is coordinated. A punch that
 fails keeps the relay and is held against nobody. Candidates on private or

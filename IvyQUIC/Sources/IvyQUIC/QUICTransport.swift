@@ -20,6 +20,8 @@ public struct QUICTransport: IvyTransport {
     private let connectTimeout: Duration
     private let idleTimeout: Duration
     private let sendRetry: Bool
+    private let reusePort: Bool
+    private let maxInboundConnections: Int
     private let logger: Logger
 
     /// - Parameters:
@@ -28,11 +30,17 @@ public struct QUICTransport: IvyTransport {
     ///     path from stalling a dial that could fall back to TCP.
     ///   - sendRetry: Sends stateless retry packets, forcing address validation
     ///     before the server keeps connection state.
+    ///   - reusePort: Lets a hole-punch dial leave from the listening port. It
+    ///     also lets another process bind that port, so it is off by default.
+    ///   - maxInboundConnections: Connections held before any stream reaches
+    ///     Ivy's admission gate.
     public init(
         alpn: String = "ivy/9",
         connectTimeout: Duration = .seconds(3),
         idleTimeout: Duration = .seconds(30),
         sendRetry: Bool = true,
+        reusePort: Bool = false,
+        maxInboundConnections: Int = 256,
         logger: Logger = Logger(label: "ivy.quic")
     ) throws {
         self.certificate = try EphemeralCertificate()
@@ -40,6 +48,8 @@ public struct QUICTransport: IvyTransport {
         self.connectTimeout = connectTimeout
         self.idleTimeout = idleTimeout
         self.sendRetry = sendRetry
+        self.reusePort = reusePort
+        self.maxInboundConnections = maxInboundConnections
         self.logger = logger
     }
 
@@ -81,9 +91,15 @@ public struct QUICTransport: IvyTransport {
         let configuration = clientConfiguration()
         let logger = self.logger
 
-        let (datagramChannel, multiplexer) = try await DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .bind(host: "0.0.0.0", port: Int(boundToPort ?? 0)) { channel in
+        func bind(to localPort: UInt16) async throws -> (Channel, QUICHandler.ConnectionMultiplexer<Never>) {
+            var bootstrap = DatagramBootstrap(group: group)
+                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            if localPort != 0, reusePort {
+                bootstrap = bootstrap
+                    .channelOption(ChannelOptions.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
+            }
+            return try await bootstrap
+            .bind(host: "0.0.0.0", port: Int(localPort)) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     let (handler, multiplexer) = try QUICHandler.makeHandlerAndConnectionMultiplexer(
                         channel: channel,
@@ -98,6 +114,21 @@ public struct QUICTransport: IvyTransport {
                     return (channel, multiplexer)
                 }
             }
+        }
+
+        let (datagramChannel, multiplexer): (Channel, QUICHandler.ConnectionMultiplexer<Never>)
+        if let boundToPort, boundToPort != 0, reusePort {
+            do {
+                (datagramChannel, multiplexer) = try await bind(to: boundToPort)
+            } catch {
+                // Sharing the listening port is best effort; an ordinary dial from
+                // an ephemeral port still punches, just without matching the
+                // mapping this node advertises.
+                (datagramChannel, multiplexer) = try await bind(to: 0)
+            }
+        } else {
+            (datagramChannel, multiplexer) = try await bind(to: 0)
+        }
 
         do {
             return try await withDeadline(connectTimeout) {
@@ -134,8 +165,13 @@ public struct QUICTransport: IvyTransport {
         let configuration = serverConfiguration()
         let logger = self.logger
 
-        let (datagramChannel, multiplexer) = try await DatagramBootstrap(group: group)
+        var listenerBootstrap = DatagramBootstrap(group: group)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+        if reusePort {
+            listenerBootstrap = listenerBootstrap
+                .channelOption(ChannelOptions.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
+        }
+        let (datagramChannel, multiplexer) = try await listenerBootstrap
             .bind(host: host, port: Int(port)) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     let (handler, multiplexer) = try QUICHandler.makeHandlerAndConnectionMultiplexer(
@@ -157,10 +193,21 @@ public struct QUICTransport: IvyTransport {
                 }
             }
 
+        let live = InboundConnectionCount(limit: maxInboundConnections)
         let acceptor = Task {
             await withDiscardingTaskGroup { group in
                 for await connection in multiplexer.inboundConnections {
+                    // A QUIC connection only reaches Ivy's admission gate once it
+                    // opens a stream, so bound how many this transport services
+                    // before then. swift-nio-quic 0.1.0 exposes no way to close a
+                    // connection, so one over the limit is left to its idle timeout
+                    // rather than torn down.
+                    guard live.acquire() else {
+                        logger.warning("Not servicing a QUIC connection: at the inbound limit")
+                        continue
+                    }
                     group.addTask {
+                        defer { live.release() }
                         var accepted = false
                         for await stream in connection.inboundStreams {
                             // One stream per connection; anything further is a
@@ -224,6 +271,29 @@ private final class QUICStreamLifecycleHandler: ChannelInboundHandler, @unchecke
     func channelInactive(context: ChannelHandlerContext) {
         datagramChannel.close(promise: nil)
         context.fireChannelInactive()
+    }
+}
+
+/// Bounds connections that have not yet opened the stream Ivy admits.
+final class InboundConnectionCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var count = 0
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func acquire() -> Bool {
+        lock.withLock {
+            guard count < limit else { return false }
+            count += 1
+            return true
+        }
+    }
+
+    func release() {
+        lock.withLock { count -= 1 }
     }
 }
 

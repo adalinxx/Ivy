@@ -1,4 +1,6 @@
 import Foundation
+import NIOCore
+import NIOPosix
 import Testing
 @testable import Ivy
 
@@ -180,5 +182,51 @@ struct ReachabilityTests {
         #expect(Ivy.dialBackHost(role: .carrier, isDirect: true, observedHost: "1.1.1.1") == nil)
         #expect(Ivy.dialBackHost(role: .endpoint, isDirect: true, observedHost: "") == nil)
         #expect(Ivy.dialBackHost(role: .endpoint, isDirect: true, observedHost: nil) == nil)
+    }
+}
+
+@Suite("Dial-back slots")
+struct DialBackSlotTests {
+    /// A peer that accepts a dial-back and never closes must not keep its slot:
+    /// the grace period has to be enforced from the event loop, because awaiting
+    /// a close future ignores task cancellation.
+    @Test("a peer that never closes cannot hold a dial-back slot")
+    func silentPeerReleasesTheSlot() async throws {
+        let group = MultiThreadedEventLoopGroup.singleton
+        // A listener that accepts and then does nothing at all.
+        let silent = try await ServerBootstrap(group: group)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { $0.eventLoop.makeSucceededVoidFuture() }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        let silentPort = try #require(silent.localAddress?.port)
+
+        let prober = Ivy(config: IvyConfig(
+            publicKey: deterministicTestPeerKey("slot-prober"),
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false)))
+        try await prober.start()
+
+        // It must return once the grace expires rather than waiting on the peer,
+        // so race it against a deadline instead of trusting it to finish.
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await prober.dialBackForTesting(host: "127.0.0.1", port: UInt16(silentPort))
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: Ivy.dialBackCloseGrace * 5)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(finished)
+        #expect(await prober.activeDialBacksForTesting == 0)
+
+        await prober.stop()
+        try? await silent.close().get()
     }
 }
