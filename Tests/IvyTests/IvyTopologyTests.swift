@@ -60,6 +60,30 @@ struct IvyTopologyTests {
         }
     }
 
+    @Test("operator-tunable route/TTL/volume/frame knobs are validated at startup")
+    func operatorKnobValidation() {
+        let invalidMessage = "route, provider-TTL, volume, or frame-size limits are invalid"
+        // A baseline valid config; each variant below flips one knob to an unusable value.
+        #expect(throws: Never.self) {
+            try IvyConfig(signingKey: identity(1)).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxRoutesPerIdentity: 0).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxProviderTTLSeconds: 0).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxInFlightVolumeBytes: 0).validate()
+        }
+        // A frame too small to carry the largest handshake record breaks every
+        // connection before it starts, so it must be rejected up front. A tiny
+        // frame also trips the inbound-budget guard first; assert either rejects.
+        #expect(throws: (any Error).self) {
+            try IvyConfig(signingKey: identity(1), protocolMaxFrameSize: 16).validate()
+        }
+    }
+
     @Test("inbound admission bypass is pinned to a private bootstrap peer")
     func inboundAdmissionBypassValidation() throws {
         let local = identity(1)

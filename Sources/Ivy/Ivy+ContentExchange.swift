@@ -517,9 +517,8 @@ extension Ivy {
               ),
               let payloadBytes = Message.volumeChunkDataBudget(
                 rootCID: rootCID,
-                maxFrameSize: session?.connection.peerMaxFrameSize
-                    ?? endpointConnection(for: peer)?.peerMaxFrameSize
-                    ?? IvyConfig.defaultProtocolMaxFrameSize,
+                maxFrameSize: effectiveOutboundFrameSize(
+                    for: session?.connection ?? endpointConnection(for: peer)),
                 relayed: session.map { !$0.connection.isDirect }
                     ?? (endpointConnection(for: peer)?.isDirect == false)
               ),

@@ -52,7 +52,8 @@ enum TransportTestHarness {
         tallyConfig: TallyConfig = .default,
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxContentCandidates: Int = 8,
-        privateContentExchangeEnabled: Bool = false
+        privateContentExchangeEnabled: Bool = false,
+        protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
@@ -67,6 +68,7 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
+            protocolMaxFrameSize: protocolMaxFrameSize,
             externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
             privateContentExchangeEnabled: privateContentExchangeEnabled,
@@ -323,6 +325,50 @@ struct TCPIntegrationTests {
         #expect(clientRecorder.authenticatedPeers.map(\.key) == [
             TransportTestHarness.key(serverIdentity),
         ])
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("a single authenticated frame above 4 MiB crosses TCP once both peers raise the limit")
+    func largeNegotiatedFrameCrossesTCP() async throws {
+        let bigFrame: UInt32 = 8 * 1024 * 1024
+        let serverIdentity = TransportTestHarness.identity("tcp-bigframe-server")
+        let clientIdentity = TransportTestHarness.identity("tcp-bigframe-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity, port: serverPort, protocolMaxFrameSize: bigFrame))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity, port: clientPort, protocolMaxFrameSize: bigFrame))
+        let serverRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+        await client.setTestDelegate(TransportTestRecorder())
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
+        })
+
+        // 5 MiB — above the 4 MiB default, below the negotiated 8 MiB. Without the
+        // negotiation wired into serialize/deserialize AND the connection budgets,
+        // this frame is dropped on encode or rejected on decode/reservation.
+        let payload = Data(repeating: 0x5A, count: 5 * 1024 * 1024)
+        _ = await client.sendMessage(
+            to: TransportTestHarness.key(serverIdentity).peerID,
+            topic: "big-frame",
+            payload: payload)
+
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.receivedMessage(
+                topic: "big-frame",
+                payload: payload,
+                from: TransportTestHarness.key(clientIdentity).peerID)
+        })
 
         await client.stop()
         await server.stop()

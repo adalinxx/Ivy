@@ -143,6 +143,18 @@ public struct IvyConfig: Sendable {
             throw IvyModeError.invalidConfiguration(
                 "inbound byte budget must hold one maximum frame")
         }
+        // Operator-tunable frame/route/volume/TTL knobs must be usable: a route
+        // count of 0 traps range construction, a zero TTL/volume budget is inert,
+        // and a frame size too small to carry the largest handshake record would
+        // break every connection before it starts.
+        guard maxRoutesPerIdentity > 0,
+              maxProviderTTLSeconds > 0,
+              maxInFlightVolumeBytes > 0,
+              Int(protocolMaxFrameSize)
+                >= PeerMetadata.maxEncodedSize + SessionHelloInitiator.encodedOverhead else {
+            throw IvyModeError.invalidConfiguration(
+                "route, provider-TTL, volume, or frame-size limits are invalid")
+        }
         guard (1...Int(MessageLimits.maxNeighborCount)).contains(kBucketSize),
               (0...256).contains(minPeerKeyBits),
               requestTimeout > .zero,
