@@ -1485,7 +1485,11 @@ public actor Ivy {
 
         if let existing,
            existing.connection.isLive,
-           existing.sessionID == Self.preferredSessionID(existing.sessionID, sessionID) {
+           Self.prefersExistingSession(
+            existingID: existing.sessionID,
+            existingIsDirect: existing.connection.isDirect,
+            incomingID: sessionID,
+            incomingIsDirect: pending.connection.isDirect) {
             pending.continuation?.resume(returning: true)
             resolvePeerConnectionWaiter(for: peerKey, result: true)
             removeRouteConnection(pending.connection)
@@ -3161,6 +3165,23 @@ public actor Ivy {
 
     static func preferredSessionID(_ first: SessionID, _ second: SessionID) -> SessionID {
         min(first, second)
+    }
+
+    /// Resolves duplicate sessions for one peer. A direct session always beats a
+    /// relayed one, so a connection punched through a NAT replaces the relay that
+    /// arranged it; otherwise the smaller session ID wins.
+    ///
+    /// Both peers see the same session IDs and the same transport class for each
+    /// session, so both reach the same answer and cannot end up each keeping a
+    /// different session.
+    static func prefersExistingSession(
+        existingID: SessionID,
+        existingIsDirect: Bool,
+        incomingID: SessionID,
+        incomingIsDirect: Bool
+    ) -> Bool {
+        guard existingIsDirect == incomingIsDirect else { return existingIsDirect }
+        return preferredSessionID(existingID, incomingID) == existingID
     }
 
 #if DEBUG || IVY_TESTING
