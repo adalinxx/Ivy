@@ -16,13 +16,28 @@ public struct TCPTransport: IvyTransport {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
+        boundToPort: UInt16?,
         initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> Channel {
-        try await ClientBootstrap(group: group)
-            .connectTimeout(connectTimeout)
-            .channelInitializer(initializer)
-            .connect(host: host, port: Int(port))
-            .get()
+        func bootstrap() -> ClientBootstrap {
+            ClientBootstrap(group: group)
+                .connectTimeout(connectTimeout)
+                .channelInitializer(initializer)
+        }
+        if let boundToPort, boundToPort != 0 {
+            do {
+                return try await bootstrap()
+                    .channelOption(.socketOption(.so_reuseaddr), value: 1)
+                    .channelOption(.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
+                    .bind(to: try SocketAddress(ipAddress: "0.0.0.0", port: Int(boundToPort)))
+                    .connect(host: host, port: Int(port))
+                    .get()
+            } catch {
+                // The listening port may be unusable for an outbound socket on
+                // this platform; an ordinary dial is still worth trying.
+            }
+        }
+        return try await bootstrap().connect(host: host, port: Int(port)).get()
     }
 
     public func listen(

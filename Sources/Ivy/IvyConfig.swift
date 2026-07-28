@@ -49,6 +49,18 @@ public struct IvyConfig: Sendable {
     /// unobservable, so the netgroup cap cannot bound it and this does instead.
     public let maxRelayedInboundConnections: Int
     public let maxRelayedInboundPerCarrier: Int
+    /// Tries to replace a relayed session with a direct one by dialing at the
+    /// same moment as the peer.
+    public let holePunchEnabled: Bool
+    public let holePunchAttempts: Int
+    public let holePunchTimeout: Duration
+    /// Punches running at once, across all peers.
+    public let maxConcurrentHolePunches: Int
+    public let holePunchPerPeerCooldown: Duration
+    /// Allows private and loopback punch candidates. Off by default: a peer
+    /// names its own addresses, so accepting them lets it aim dials at hosts
+    /// inside this node's network. Useful on a LAN and in tests.
+    public let allowPrivateHolePunchCandidates: Bool
     /// Probes peers to learn whether this node is dialable from outside its NAT.
     public let reachabilityEnabled: Bool
     public let reachabilityProbeInterval: Duration
@@ -91,6 +103,12 @@ public struct IvyConfig: Sendable {
         relayEnabled: Bool = false,
         maxRelayedInboundConnections: Int = 32,
         maxRelayedInboundPerCarrier: Int = 8,
+        holePunchEnabled: Bool = true,
+        holePunchAttempts: Int = 3,
+        holePunchTimeout: Duration = .seconds(10),
+        maxConcurrentHolePunches: Int = 2,
+        holePunchPerPeerCooldown: Duration = .seconds(300),
+        allowPrivateHolePunchCandidates: Bool = false,
         reachabilityEnabled: Bool = true,
         reachabilityProbeInterval: Duration = .seconds(900),
         reachabilityProbeSampleSize: Int = 4,
@@ -113,6 +131,12 @@ public struct IvyConfig: Sendable {
         self.relayEnabled = relayEnabled
         self.maxRelayedInboundConnections = maxRelayedInboundConnections
         self.maxRelayedInboundPerCarrier = maxRelayedInboundPerCarrier
+        self.holePunchEnabled = holePunchEnabled && mode.usesOverlayServices
+        self.holePunchAttempts = holePunchAttempts
+        self.holePunchTimeout = holePunchTimeout
+        self.maxConcurrentHolePunches = maxConcurrentHolePunches
+        self.holePunchPerPeerCooldown = holePunchPerPeerCooldown
+        self.allowPrivateHolePunchCandidates = allowPrivateHolePunchCandidates
         // Reachability is an overlay service: a private plane has no NAT story
         // to discover and no strangers to prove reachability to.
         self.reachabilityEnabled = reachabilityEnabled && mode.usesOverlayServices
@@ -173,6 +197,14 @@ public struct IvyConfig: Sendable {
               relayTimeout > .zero,
               routingRefreshInterval > .zero else {
             throw IvyModeError.invalidConfiguration("routing and timeout limits are invalid")
+        }
+        if holePunchEnabled {
+            guard holePunchAttempts > 0,
+                  holePunchTimeout > .zero,
+                  maxConcurrentHolePunches > 0,
+                  holePunchPerPeerCooldown > .zero else {
+                throw IvyModeError.invalidConfiguration("hole punch limits are invalid")
+            }
         }
         guard maxRelayedInboundConnections > 0, maxRelayedInboundPerCarrier > 0 else {
             throw IvyModeError.invalidConfiguration("relayed inbound limits must be positive")

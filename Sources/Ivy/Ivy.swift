@@ -168,6 +168,16 @@ public actor Ivy {
     /// Peers a provider record named as a carrier for someone, which we may send
     /// relay requests to even though they are not configured carriers.
     var advertisedCarriers: Set<PeerKey> = []
+    var holePunches: [PeerKey: PendingHolePunch] = [:]
+    var holePunchCooldowns: [PeerKey: ContinuousClock.Instant] = [:]
+    var holePunchStartTasks: [PeerKey: Task<Void, Never>] = [:]
+    private var nextHolePunchIDValue: UInt64 = 0
+
+    func nextHolePunchID() -> UInt64 {
+        nextHolePunchIDValue &+= 1
+        return nextHolePunchIDValue
+    }
+
     var reachability: [TransportKind: ReachabilityState] = [:]
     var pendingReachabilityProbes: [Data: PendingReachabilityProbe] = [:]
     var reachabilityTimers: [TransportKind: IvyTimer] = [:]
@@ -199,7 +209,7 @@ public actor Ivy {
     private var outgoingDials: [PeerID: PendingOutgoingDial] = [:]
     var reconnectAttempts: [PeerID: Int] = [:]
     var reconnectTasks: [PeerID: PendingReconnect] = [:]
-    private var reconnectSuppressed: Set<PeerID> = []
+    var reconnectSuppressed: Set<PeerID> = []
     private var nextReconnectToken: UInt64 = 0
     static let reconnectBaseDelayMs: UInt64 = 500
     static let reconnectMaxDelayMs: UInt64 = 30_000
@@ -378,6 +388,14 @@ public actor Ivy {
         reachability.removeAll()
         lastDialBack.removeAll()
         advertisedCarriers.removeAll()
+        for punch in holePunches.values {
+            punch.timeoutTask?.cancel()
+            punch.dialTask?.cancel()
+        }
+        for task in holePunchStartTasks.values { task.cancel() }
+        holePunchStartTasks.removeAll()
+        holePunches.removeAll()
+        holePunchCooldowns.removeAll()
         await healthMonitor?.stopMonitoring()
         cleanupAllPending()
 
@@ -662,16 +680,19 @@ public actor Ivy {
         }
     }
 
-    private func connectDirect(
+    func connectDirect(
         to endpoint: PeerEndpoint,
         key: PeerKey,
         role: AuthenticatedPeerRole,
-        generation: UInt64
+        generation: UInt64,
+        punchingFromPort: UInt16? = nil
     ) async throws -> Bool {
+        let isPunch = punchingFromPort != nil
         guard !reconnectSuppressed.contains(key.peerID) else { return false }
-        if sessions[key]?.role == role,
+        if !isPunch,
+           sessions[key]?.role == role,
            sessions[key]?.connection.isLive == true { return true }
-        guard reserveOutgoingDial(to: endpoint) else {
+        guard reserveOutgoingDial(to: endpoint, replacingRelayedSession: isPunch) else {
             return sessions[key]?.role == role && sessions[key]?.connection.isLive == true
         }
 
@@ -697,7 +718,8 @@ public actor Ivy {
                     transport: rewritten.transport),
                 transport: try transport(for: rewritten.transport),
                 group: group,
-                inboundByteBudget: inboundByteBudget)
+                inboundByteBudget: inboundByteBudget,
+                boundToPort: punchingFromPort)
         } catch {
             let connected = await finishOutgoingDialOrAwaitCompetingResponder(
                 for: key,
@@ -758,9 +780,15 @@ public actor Ivy {
         return true
     }
 
-    func reserveOutgoingDial(to endpoint: PeerEndpoint) -> Bool {
+    func reserveOutgoingDial(
+        to endpoint: PeerEndpoint,
+        replacingRelayedSession: Bool = false
+    ) -> Bool {
         guard let key = try? PeerKey(endpoint.publicKey),
-              sessions[key] == nil,
+              // A hole punch dials a peer we already have a session with, because
+              // replacing that relayed session is the whole point.
+              sessions[key] == nil
+                || (replacingRelayedSession && sessions[key]?.connection.isDirect == false),
               outgoingDials[key.peerID] == nil,
               pendingPeerConnectionWaiters[key] == nil,
               connectionCapacityUsed < config.maxConnections else { return false }
@@ -1077,7 +1105,7 @@ public actor Ivy {
         }
     }
 
-    private var connectionCapacityUsed: Int {
+    var connectionCapacityUsed: Int {
         sessions.count + pendingSessions.count + unrepresentedOutgoingDials.count
     }
 
@@ -1103,7 +1131,7 @@ public actor Ivy {
         return Array(pending) + Array(authenticated)
     }
 
-    private func directConnectionCount(inNetgroup group: String) -> Int {
+    func directConnectionCount(inNetgroup group: String) -> Int {
         let authenticated = sessions.values.lazy.filter {
             $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
         }.count
@@ -1146,7 +1174,7 @@ public actor Ivy {
         return true
     }
 
-    private func authenticateInitiator(
+    func authenticateInitiator(
         _ connection: PeerConnection,
         expected: PeerKey,
         routeBinding: Data
@@ -1235,7 +1263,7 @@ public actor Ivy {
         pending.connection.cancel()
     }
 
-    private func startInboundTask(_ connection: PeerConnection) {
+    func startInboundTask(_ connection: PeerConnection) {
         let task: Task<Void, Never>
         if let directInbound = connection.directInboundStream {
             task = Task { [weak self, weak connection] in
@@ -1576,6 +1604,27 @@ public actor Ivy {
         }
         let selected = sessions[peerKey]
         pending.continuation?.resume(returning: selected?.connection.isLive == true)
+
+        if isCurrent(session), role == .endpoint {
+            if session.connection.isDirect {
+                // Whatever the punch was arranging, we have it now.
+                completeHolePunch(with: peerKey)
+            } else if isInbound {
+                // We accepted this relayed session, so we coordinate the attempt
+                // to replace it, matching how DCUtR picks the side behind the NAT.
+                scheduleHolePunch(with: peerKey, generation: pending.generation)
+            }
+        }
+    }
+
+    private func scheduleHolePunch(with peer: PeerKey, generation: UInt64) {
+        guard config.holePunchEnabled, isCurrentRun(generation) else { return }
+        holePunchStartTasks[peer]?.cancel()
+        holePunchStartTasks[peer] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            await self?.startHolePunch(with: peer, generation: generation)
+        }
     }
 
     private func canPromote(
@@ -1923,6 +1972,13 @@ public actor Ivy {
                 nonce: nonce),
             on: session,
             bypassAdmission: false)
+    }
+
+    func enqueueHolePunchMessage(
+        _ message: Message,
+        on session: AuthenticatedSession
+    ) {
+        enqueue(message, on: session, bypassAdmission: false)
     }
 
     func sendReachabilityResponse(
@@ -2904,6 +2960,21 @@ public actor Ivy {
         case .announceProvider(let rootCID, let expiresAt):
             handleAnnounceProvider(rootCID: rootCID, expiresAt: expiresAt, from: peer)
 
+        case .holePunchConnect(let punchID, let candidates):
+            guard let session else { return }
+            handleHolePunchConnect(
+                punchID: punchID,
+                candidates: candidates,
+                session: session)
+
+        case .holePunchSync(let punchID):
+            guard let session else { return }
+            handleHolePunchSync(punchID: punchID, session: session)
+
+        case .holePunchAbort(let punchID, let reason):
+            guard let session else { return }
+            handleHolePunchAbort(punchID: punchID, reason: reason, from: session.peerKey)
+
         case .reachabilityRequest(let requestID, let transport, let port, let nonce):
             guard let session else { return }
             await handleReachabilityRequest(
@@ -3534,6 +3605,19 @@ public actor Ivy {
     }
 
     var pendingSessionCountForTesting: Int { pendingSessions.count }
+
+    var holePunchCountForTesting: Int { holePunches.count }
+    var holePunchPhaseForTesting: [String: String] {
+        Dictionary(uniqueKeysWithValues: holePunches.map {
+            (String($0.key.hex.prefix(8)), "\($0.value.phase) coord=\($0.value.isCoordinator)")
+        })
+    }
+
+    /// True when the session with `peer` is direct, false when relayed, nil when
+    /// there is no session.
+    func routeForTesting(to peer: PeerKey) -> Bool? {
+        sessions[peer]?.connection.isDirect
+    }
 
     func seedRelayedInboundForTesting(carrier: PeerKey) {
         let connection = makeRelayedConnection(

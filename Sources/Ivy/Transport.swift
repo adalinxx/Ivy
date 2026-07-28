@@ -36,10 +36,15 @@ public protocol TransportListenerHandle: Sendable {
 public protocol IvyTransport: Sendable {
     var kind: TransportKind { get }
 
+    /// - Parameter boundToPort: Local port to dial from, so the NAT mapping the
+    ///   peer sees matches the address this node advertises. Ignored by
+    ///   transports that cannot reuse their listening port; a conforming type
+    ///   may fall back to an ephemeral port when the bind fails.
     func dial(
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
+        boundToPort: UInt16?,
         initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> Channel
 
@@ -49,6 +54,22 @@ public protocol IvyTransport: Sendable {
         group: any EventLoopGroup,
         streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
     ) async throws -> any TransportListenerHandle
+}
+
+extension IvyTransport {
+    func dial(
+        host: String,
+        port: UInt16,
+        group: any EventLoopGroup,
+        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
+    ) async throws -> Channel {
+        try await dial(
+            host: host,
+            port: port,
+            group: group,
+            boundToPort: nil,
+            initializer: initializer)
+    }
 }
 
 enum TransportError: Error, Equatable {

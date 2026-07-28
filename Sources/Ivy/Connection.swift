@@ -270,14 +270,16 @@ final class PeerConnection: @unchecked Sendable {
         endpoint: PeerEndpoint,
         transport: any IvyTransport,
         group: EventLoopGroup,
-        inboundByteBudget: InboundByteBudget
+        inboundByteBudget: InboundByteBudget,
+        boundToPort: UInt16? = nil
     ) async throws -> PeerConnection {
         let connectionInboundByteBudget = InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         let dialed = DialedConnectionBox()
         let channel = try await transport.dial(
             host: endpoint.host,
             port: endpoint.port,
-            group: group
+            group: group,
+            boundToPort: boundToPort
         ) { channel in
             do {
                 let inbound = try Self.installFraming(

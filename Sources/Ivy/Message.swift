@@ -21,6 +21,47 @@ enum ReachabilityStatus: UInt8, Sendable, Equatable {
     case dialFailed = 2
 }
 
+enum HolePunchAbortReason: UInt8, Sendable, Equatable {
+    case busy = 0
+    case disabled = 1
+    case cooldown = 2
+    case noCandidates = 3
+}
+
+/// An address a peer offers for a hole punch, tagged with the transport to
+/// reach it on.
+struct PunchCandidate: Sendable, Equatable, Hashable, Comparable {
+    static let maxPerPunch = 4
+    static let maxPerTransport = 2
+
+    let transport: TransportKind
+    let host: String
+    let port: UInt16
+
+    static func < (lhs: PunchCandidate, rhs: PunchCandidate) -> Bool {
+        if lhs.transport != rhs.transport { return lhs.transport.rawValue < rhs.transport.rawValue }
+        if lhs.host != rhs.host { return lhs.host < rhs.host }
+        return lhs.port < rhs.port
+    }
+
+    /// Candidates are sorted and deduplicated so one list has one encoding, and
+    /// capped per transport so a peer cannot make us dial a long list.
+    static func canonical(_ candidates: [PunchCandidate]) -> [PunchCandidate]? {
+        let sorted = Array(Set(candidates)).sorted()
+        guard !sorted.isEmpty, sorted.count <= maxPerPunch else { return nil }
+        for kind in TransportKind.allCases {
+            guard sorted.filter({ $0.transport == kind }).count <= maxPerTransport else {
+                return nil
+            }
+        }
+        // A relay hint names a carrier, not a socket to punch towards.
+        guard sorted.allSatisfy({ $0.transport.isDirectlyDialable && $0.port != 0 }) else {
+            return nil
+        }
+        return sorted
+    }
+}
+
 enum Message: Sendable {
     case ping(nonce: UInt64)
     case pong(nonce: UInt64)
@@ -52,6 +93,15 @@ enum Message: Sendable {
     case relayPacket(routeID: Data, opaqueEndpointRecord: Data)
     case relayClose(routeID: Data)
 
+    /// Offers the addresses this peer believes it can be reached at, so both
+    /// sides can dial each other at once and punch through their NATs. Carried
+    /// over the relayed session the two peers already share.
+    case holePunchConnect(punchID: UInt64, candidates: [PunchCandidate])
+    /// Fires the simultaneous dial. The coordinator sends it after measuring the
+    /// round trip, so both dials leave at roughly the same moment.
+    case holePunchSync(punchID: UInt64)
+    case holePunchAbort(punchID: UInt64, reason: HolePunchAbortReason)
+
     /// Asks the receiver to dial this sender back at `port` on the address it
     /// already observes for the session, proving the sender is publicly
     /// reachable. There is deliberately no host field: the target is the
@@ -82,6 +132,9 @@ enum Message: Sendable {
         case relayReady = 63
         case relayPacket = 64
         case relayClose = 65
+        case holePunchConnect = 66
+        case holePunchSync = 67
+        case holePunchAbort = 68
         case reachabilityRequest = 70
         case reachabilityResponse = 71
     }
@@ -259,6 +312,27 @@ enum Message: Sendable {
             guard routeID.count == 32 else { return false }
             bytes.append(Tag.relayClose.rawValue)
             bytes.append(routeID)
+        case .holePunchConnect(let punchID, let candidates):
+            guard punchID != 0,
+                  let canonical = PunchCandidate.canonical(candidates),
+                  canonical == candidates else { return false }
+            bytes.append(Tag.holePunchConnect.rawValue)
+            bytes.appendUInt64(punchID)
+            bytes.appendUInt8(UInt8(canonical.count))
+            for candidate in canonical {
+                bytes.append(candidate.transport.rawValue)
+                guard bytes.appendLengthPrefixedString(candidate.host) else { return false }
+                bytes.appendUInt16(candidate.port)
+            }
+        case .holePunchSync(let punchID):
+            guard punchID != 0 else { return false }
+            bytes.append(Tag.holePunchSync.rawValue)
+            bytes.appendUInt64(punchID)
+        case .holePunchAbort(let punchID, let reason):
+            guard punchID != 0 else { return false }
+            bytes.append(Tag.holePunchAbort.rawValue)
+            bytes.appendUInt64(punchID)
+            bytes.append(reason.rawValue)
         case .reachabilityRequest(let requestID, let transport, let port, let nonce):
             guard requestID != 0,
                   port != 0,
@@ -417,6 +491,30 @@ enum Message: Sendable {
         case .relayClose:
             guard let routeID = reader.readFixedData(count: 32) else { return nil }
             return .relayClose(routeID: routeID)
+        case .holePunchConnect:
+            guard let punchID = reader.readUInt64(), punchID != 0,
+                  let count = reader.readUInt8(),
+                  count > 0, count <= UInt8(PunchCandidate.maxPerPunch) else { return nil }
+            var candidates: [PunchCandidate] = []
+            candidates.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let transport = reader.readTransportKind(),
+                      let host = reader.readString(),
+                      let port = reader.readUInt16() else { return nil }
+                candidates.append(
+                    PunchCandidate(transport: transport, host: host, port: port))
+            }
+            guard let canonical = PunchCandidate.canonical(candidates),
+                  canonical == candidates else { return nil }
+            return .holePunchConnect(punchID: punchID, candidates: canonical)
+        case .holePunchSync:
+            guard let punchID = reader.readUInt64(), punchID != 0 else { return nil }
+            return .holePunchSync(punchID: punchID)
+        case .holePunchAbort:
+            guard let punchID = reader.readUInt64(), punchID != 0,
+                  let rawReason = reader.readUInt8(),
+                  let reason = HolePunchAbortReason(rawValue: rawReason) else { return nil }
+            return .holePunchAbort(punchID: punchID, reason: reason)
         case .reachabilityRequest:
             guard let requestID = reader.readUInt64(), requestID != 0,
                   let transport = reader.readTransportKind(),
