@@ -45,6 +45,17 @@ public struct IvyConfig: Sendable {
     public let minPeerKeyBits: Int
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
+    /// Probes peers to learn whether this node is dialable from outside its NAT.
+    public let reachabilityEnabled: Bool
+    public let reachabilityProbeInterval: Duration
+    /// Peers asked per round, each in a distinct netgroup.
+    public let reachabilityProbeSampleSize: Int
+    /// Inbound nonces needed before declaring the node publicly reachable.
+    public let reachabilityConfirmations: Int
+    /// Dial-backs this node will perform for others at once.
+    public let maxConcurrentDialBacks: Int
+    /// Minimum spacing between dial-backs performed for one peer.
+    public let dialBackPerPeerInterval: Duration
     /// Enables direct exact-CID request/response messages on a private network.
     /// Public overlays always support content exchange.
     public let privateContentExchangeEnabled: Bool
@@ -74,6 +85,12 @@ public struct IvyConfig: Sendable {
         maxContentCandidates: Int = 8,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        reachabilityEnabled: Bool = true,
+        reachabilityProbeInterval: Duration = .seconds(900),
+        reachabilityProbeSampleSize: Int = 4,
+        reachabilityConfirmations: Int = 2,
+        maxConcurrentDialBacks: Int = 4,
+        dialBackPerPeerInterval: Duration = .seconds(60),
         privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
@@ -88,6 +105,14 @@ public struct IvyConfig: Sendable {
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
+        // Reachability is an overlay service: a private plane has no NAT story
+        // to discover and no strangers to prove reachability to.
+        self.reachabilityEnabled = reachabilityEnabled && mode.usesOverlayServices
+        self.reachabilityProbeInterval = reachabilityProbeInterval
+        self.reachabilityProbeSampleSize = reachabilityProbeSampleSize
+        self.reachabilityConfirmations = reachabilityConfirmations
+        self.maxConcurrentDialBacks = maxConcurrentDialBacks
+        self.dialBackPerPeerInterval = dialBackPerPeerInterval
         self.privateContentExchangeEnabled = privateContentExchangeEnabled
         self.tallyConfig = tallyConfig
         self.kBucketSize = kBucketSize
@@ -138,6 +163,15 @@ public struct IvyConfig: Sendable {
               relayTimeout > .zero,
               routingRefreshInterval > .zero else {
             throw IvyModeError.invalidConfiguration("routing and timeout limits are invalid")
+        }
+        if reachabilityEnabled {
+            guard reachabilityProbeInterval > .zero,
+                  dialBackPerPeerInterval > .zero,
+                  reachabilityProbeSampleSize > 0,
+                  maxConcurrentDialBacks > 0,
+                  (1...reachabilityProbeSampleSize).contains(reachabilityConfirmations) else {
+                throw IvyModeError.invalidConfiguration("reachability probe limits are invalid")
+            }
         }
         if healthConfig.enabled {
             guard healthConfig.keepaliveInterval > .zero,
