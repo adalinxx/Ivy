@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import NIOCore
 import Tally
 
 extension Ivy {
@@ -235,11 +236,27 @@ extension Ivy {
             buffer.writeInteger(UInt32(frame.count), endianness: .big)
             buffer.writeBytes(frame)
             try await channel.writeAndFlush(buffer).get()
-            try? await channel.close().get()
+            // Let the peer close once it has read the nonce. Closing straight
+            // after the write races its admission, which only enables reads after
+            // an actor hop, and the frame would be lost along with the connection.
+            await Self.awaitPeerClose(channel, within: Self.dialBackCloseGrace)
             return .dialed
         } catch {
             return .dialFailed
         }
+    }
+
+    /// How long a dial-back waits for the peer to close before closing itself.
+    static let dialBackCloseGrace: Duration = .seconds(2)
+
+    private static func awaitPeerClose(_ channel: Channel, within grace: Duration) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { try? await channel.closeFuture.get() }
+            group.addTask { try? await Task.sleep(for: grace) }
+            await group.next()
+            group.cancelAll()
+        }
+        channel.close(promise: nil)
     }
 
     private func respondToReachabilityRequest(

@@ -3687,6 +3687,13 @@ public actor Ivy {
             generation: runGeneration)
     }
 
+    var pendingReachabilityProbeCountForTesting: Int { pendingReachabilityProbes.count }
+    var dialBackAttemptCountForTesting: Int { lastDialBack.count }
+    var reachabilityStateForTesting: String {
+        reachability.map { "\($0.key)=\($0.value.status) out=\($0.value.outstanding) ok=\($0.value.confirmations) fail=\($0.value.failures)" }
+            .joined(separator: ",")
+    }
+
     func registerReachabilityProbeForTesting(
         requestID: UInt64,
         peer: PeerKey,
