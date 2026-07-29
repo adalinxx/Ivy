@@ -84,8 +84,7 @@ public struct TCPTransport: IvyTransport {
                 channel.eventLoop.makeCompletedFuture {
                     let connection = NIOTransportConnection(channel: channel)
                     try channel.pipeline.syncOperations.addHandler(
-                        NIOTransportHandler(connection: connection))
-                    onConnection(connection)
+                        NIOTransportHandler(connection: connection, onActive: onConnection))
                 }
             }
             .bind(host: host, port: Int(port))

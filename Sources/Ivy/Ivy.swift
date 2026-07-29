@@ -1282,10 +1282,15 @@ public actor Ivy {
                       connection.isLive else { return }
                 await self.handleSessionRecord(frame.bytes, on: connection)
                 withExtendedLifetime(frame) {}
+                connection.recordConsumed()
             }
             if connection.isLive { connection.cancel() }
         }
-        connection.installCloseHandler { task.cancel() }
+        connection.installCloseHandler { [weak self, weak connection] in
+            task.cancel()
+            guard let self, let connection else { return }
+            Task { await self.connectionEnded(connection) }
+        }
         // Reads begin only once someone is consuming them. For an accepted
         // connection this runs after admission, so an unadmitted peer is still
         // never read (IVY-001).
