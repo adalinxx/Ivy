@@ -84,9 +84,8 @@ public struct QUICTransport: IvyTransport {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        boundToPort: UInt16?,
-        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
-    ) async throws -> Channel {
+        boundToPort: UInt16?
+    ) async throws -> any TransportConnection {
         let remote = try await resolve(host: host, port: port, group: group)
         let configuration = clientConfiguration()
         let logger = self.logger
@@ -141,12 +140,17 @@ public struct QUICTransport: IvyTransport {
                 }
                 return try await connection.createBidirectionalStream { parameters in
                     let stream = parameters.channel
-                    return initializer(stream).flatMapThrowing {
+                    return stream.eventLoop.makeCompletedFuture {
+                        // Reads happen only on demand, as on every transport.
+                        try stream.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
+                        let transportConnection = NIOTransportConnection(channel: stream)
+                        try stream.pipeline.syncOperations.addHandler(
+                            NIOTransportHandler(connection: transportConnection))
                         // Tearing down the stream must tear down the connection it
                         // rides on, so a closed session releases its UDP socket.
                         try stream.pipeline.syncOperations.addHandler(
                             QUICStreamLifecycleHandler(datagramChannel: datagramChannel))
-                        return stream
+                        return transportConnection
                     }
                 }
             }
@@ -160,7 +164,7 @@ public struct QUICTransport: IvyTransport {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
+        onConnection: @Sendable @escaping (any TransportConnection) -> Void
     ) async throws -> any TransportListenerHandle {
         let configuration = serverConfiguration()
         let logger = self.logger
@@ -178,14 +182,15 @@ public struct QUICTransport: IvyTransport {
                         channel: channel,
                         quicConfiguration: configuration,
                         logger: logger,
-                        inboundStreamChannelInitializer: { stream -> EventLoopFuture<any Channel> in
+                        inboundStreamChannelInitializer: { stream -> EventLoopFuture<NIOTransportConnection> in
                             stream.eventLoop.makeCompletedFuture {
                                 // Reads stay parked until admission grants this
-                                // connection a slot and enables them (IVY-001).
+                                // connection a slot and asks for them (IVY-001).
                                 try stream.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
-                                return stream
-                            }.flatMap { stream in
-                                streamInitializer(stream).map { stream }
+                                let connection = NIOTransportConnection(channel: stream)
+                                try stream.pipeline.syncOperations.addHandler(
+                                    NIOTransportHandler(connection: connection))
+                                return connection
                             }
                         })
                     try channel.pipeline.syncOperations.addHandler(handler)
@@ -213,10 +218,11 @@ public struct QUICTransport: IvyTransport {
                             // One stream per connection; anything further is a
                             // protocol violation and costs the peer its connection.
                             guard !accepted else {
-                                stream.close(promise: nil)
+                                stream.close()
                                 continue
                             }
                             accepted = true
+                            onConnection(stream)
                         }
                     }
                 }

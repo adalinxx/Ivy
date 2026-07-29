@@ -211,6 +211,11 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     private let connectionInboundByteBudget: InboundByteBudget
     private var accumulator: FrameAccumulator?
     private var pendingFrames: [InboundFrame] = []
+    /// Frames handed to the record stream and not yet consumed. Read demand
+    /// hangs off this: the transport is asked for more bytes only when it
+    /// reaches zero, so a slow consumer stops the peer at the socket instead of
+    /// letting frames pile up here (the stream itself is unbounded).
+    private var unconsumedFrames = 0
     private let inbound: AsyncStream<InboundFrame>
     private let inboundContinuation: AsyncStream<InboundFrame>.Continuation
 
@@ -250,8 +255,11 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
             ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         self.connectionInboundByteBudget = connectionBudget
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
+        // Unbounded because demand bounds it: reads stop while frames are
+        // unconsumed, so the stream never holds more than one delivery's worth,
+        // every byte of which is charged to the budgets.
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
-            bufferingPolicy: .bufferingOldest(inboundBufferLimit))
+            bufferingPolicy: .unbounded)
         self.accumulator = FrameAccumulator(
             maxFrameSize: IvyConfig.protocolMaxFrameSize,
             budgets: [connectionBudget, inboundByteBudget])
@@ -302,8 +310,10 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         self.connectionInboundByteBudget = connectionInboundByteBudget
             ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
+        // Unbounded at the stream; `feedFrame` enforces the relayed record cap,
+        // since a relayed peer has no socket to backpressure.
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
-            bufferingPolicy: .bufferingOldest(inboundBufferLimit))
+            bufferingPolicy: .unbounded)
     }
 
     static func dial(
@@ -465,7 +475,21 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
 
     @discardableResult
     func feedFrame(_ frame: InboundFrame) -> Bool {
-        guard !isClosed else { return false }
+        let accepted = stateLock.withLock { () -> Bool in
+            guard !closed else { return false }
+            // A direct peer is bounded by read demand; a relayed one has no
+            // socket to backpressure, so overflowing the record cap costs it
+            // the connection.
+            if case .relayed = transport, unconsumedFrames >= inboundBufferLimit {
+                return false
+            }
+            unconsumedFrames += 1
+            return true
+        }
+        guard accepted else {
+            cancel()
+            return false
+        }
         switch inboundContinuation.yield(frame) {
         case .enqueued:
             return true
@@ -476,6 +500,17 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
             cancel()
             return false
         }
+    }
+
+    /// The consumer is done with one record. Reads resume only when it has
+    /// drained everything already delivered, which is what stops a peer from
+    /// outrunning a slow consumer.
+    func recordConsumed() {
+        let requestMore = stateLock.withLock { () -> Bool in
+            unconsumedFrames -= 1
+            return unconsumedFrames == 0 && !closed
+        }
+        if requestMore { directConnection?.requestBytes() }
     }
 
     // MARK: - TransportConnectionSink
@@ -498,9 +533,11 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
             cancel()
             return
         }
-        // Ask for the next delivery only once this one is handed on, so a slow
-        // session stops the peer rather than letting bytes pile up.
-        directConnection?.requestBytes()
+        // Ask for the next delivery only while the consumer has nothing waiting;
+        // otherwise `recordConsumed` re-arms the read once it drains, so a slow
+        // session stops the peer rather than letting frames pile up.
+        let requestMore = stateLock.withLock { unconsumedFrames == 0 && !closed }
+        if requestMore { directConnection?.requestBytes() }
     }
 
     func transportWritabilityChanged(isWritable: Bool) {
