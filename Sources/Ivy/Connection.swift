@@ -505,99 +505,36 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
     typealias InboundIn = ByteBuffer
     typealias InboundOut = InboundFrame
 
-    private let maxFrameSize: UInt32
-    private let budget: InboundByteBudget
-    private let connectionBudget: InboundByteBudget
-    private var header: [UInt8] = []
-    private var headerReservation: InboundByteReservation?
-    private var expectedBodyLength: Int?
-    private var body = Data()
-    private var bodyReservation: InboundByteReservation?
+    private var accumulator: FrameAccumulator
 
     init(
         maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize,
         budget: InboundByteBudget,
         connectionBudget: InboundByteBudget
     ) {
-        self.maxFrameSize = maxFrameSize
-        self.budget = budget
-        self.connectionBudget = connectionBudget
-        header.reserveCapacity(4)
+        accumulator = FrameAccumulator(
+            maxFrameSize: maxFrameSize,
+            budgets: [connectionBudget, budget])
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var incoming = unwrapInboundIn(data)
-
-        while incoming.readableBytes > 0 {
-            if expectedBodyLength == nil {
-                if header.isEmpty {
-                    let reservation = InboundByteReservation(
-                        budgets: [connectionBudget, budget])
-                    guard reservation.acquire(4) else {
-                        close(context)
-                        return
-                    }
-                    headerReservation = reservation
-                }
-                let count = min(4 - header.count, incoming.readableBytes)
-                guard let bytes = incoming.readBytes(length: count) else { return }
-                header.append(contentsOf: bytes)
-                guard header.count == 4 else { return }
-
-                let length = UInt32(header[0]) << 24
-                    | UInt32(header[1]) << 16
-                    | UInt32(header[2]) << 8
-                    | UInt32(header[3])
-                guard length > 0, length <= maxFrameSize else {
-                    close(context)
-                    return
-                }
-                expectedBodyLength = Int(length)
-                bodyReservation = InboundByteReservation(
-                    budgets: [connectionBudget, budget])
-                header.removeAll(keepingCapacity: true)
-                headerReservation = nil
-            }
-
-            guard let expectedBodyLength,
-                  let bodyReservation else { continue }
-            let count = min(expectedBodyLength - body.count, incoming.readableBytes)
-            guard bodyReservation.acquire(count) else {
-                close(context)
-                return
-            }
-            guard let bytes = incoming.readData(length: count) else { return }
-            body.append(bytes)
-            guard body.count == expectedBodyLength else { return }
-
-            let frame = InboundFrame(bytes: body, reservation: bodyReservation)
-            body = Data()
-            self.bodyReservation = nil
-            self.expectedBodyLength = nil
-            context.fireChannelRead(wrapInboundOut(frame))
+        guard let bytes = incoming.readData(length: incoming.readableBytes) else { return }
+        let outcome = accumulator.consume(bytes) { frame in
+            context.fireChannelRead(self.wrapInboundOut(frame))
+        }
+        if outcome == .failed {
+            context.close(promise: nil)
         }
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
-        reset()
+        accumulator.reset()
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        reset()
+        accumulator.reset()
         context.fireChannelInactive()
-    }
-
-    private func close(_ context: ChannelHandlerContext) {
-        reset()
-        context.close(promise: nil)
-    }
-
-    private func reset() {
-        header.removeAll(keepingCapacity: true)
-        headerReservation = nil
-        expectedBodyLength = nil
-        body = Data()
-        bodyReservation = nil
     }
 }
 
