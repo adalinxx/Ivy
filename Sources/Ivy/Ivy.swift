@@ -1273,6 +1273,25 @@ public actor Ivy {
         session.connection.cancel()
     }
 
+    func startInboundTask(_ connection: PeerConnection) {
+        let task = Task { [weak self, weak connection] in
+            guard let connection else { return }
+            for await frame in connection.records {
+                guard let self,
+                      !Task.isCancelled,
+                      connection.isLive else { return }
+                await self.handleSessionRecord(frame.bytes, on: connection)
+                withExtendedLifetime(frame) {}
+            }
+            if connection.isLive { connection.cancel() }
+        }
+        connection.installCloseHandler { task.cancel() }
+        // Reads begin only once someone is consuming them. For an accepted
+        // connection this runs after admission, so an unadmitted peer is still
+        // never read (IVY-001).
+        connection.startReading()
+    }
+
     private func schedulePendingTimeout(_ connectionID: UUID, generation: UInt64) {
         guard var pending = pendingSessions[connectionID],
               pending.generation == generation else { return }
@@ -1300,42 +1319,6 @@ public actor Ivy {
         pending.connection.cancel()
     }
 
-    func startInboundTask(_ connection: PeerConnection) {
-        let task: Task<Void, Never>
-        if let directInbound = connection.directInboundStream {
-            task = Task { [weak self, weak connection] in
-                guard let connection else { return }
-                do {
-                    try await directInbound.executeThenClose { inbound in
-                        for try await frame in inbound {
-                            guard let self,
-                                  !Task.isCancelled,
-                                  connection.isLive else { return }
-                            await self.handleSessionRecord(frame.bytes, on: connection)
-                            withExtendedLifetime(frame) {}
-                        }
-                    }
-                    if connection.isLive { connection.cancel() }
-                } catch {
-                    connection.cancel()
-                }
-            }
-        } else {
-            let records = connection.records
-            task = Task { [weak self, weak connection] in
-                for await frame in records {
-                    guard let self, let connection else { return }
-                    await self.handleSessionRecord(frame.bytes, on: connection)
-                    withExtendedLifetime(frame) {}
-                }
-            }
-        }
-        connection.installCloseHandler { [weak self, weak connection] in
-            task.cancel()
-            guard let self, let connection else { return }
-            Task { await self.connectionEnded(connection) }
-        }
-    }
 
     private func handleSessionRecord(_ bytes: Data, on connection: PeerConnection) async {
         // A dial-back proving our reachability arrives as the only frame on a
@@ -1496,7 +1479,7 @@ public actor Ivy {
 
     private func localMetadata(for connection: PeerConnection) -> PeerMetadata {
         PeerMetadata(listenAddresses: advertisedListenAddresses(
-            observedLocalHost: connection.channel?.localAddress?.ipAddress))
+            observedLocalHost: connection.localHost))
     }
 
     /// Advertises one address per installed transport (IVY-023). `externalAddress`
@@ -3733,28 +3716,43 @@ public actor Ivy {
             maxConnections: config.maxInboundConnections,
             maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
         let inboundByteBudget = self.inboundByteBudget
-        func makeStreamInitializer(
+        func makeAcceptor(
             _ kind: TransportKind
-        ) -> @Sendable (Channel) -> EventLoopFuture<Void> { { [weak self] channel in
-            guard let self else { return channel.close() }
+        ) -> @Sendable (any TransportConnection) -> Void { { [weak self] transportConnection in
+            guard let self else {
+                transportConnection.close()
+                return
+            }
             let connectionBudget = InboundByteBudget(
                 limit: PeerConnection.maxInboundBufferedBytes)
-            do {
-                let directInbound = try PeerConnection.installFraming(
-                    channel: channel,
-                    inboundByteBudget: inboundByteBudget,
-                    connectionInboundByteBudget: connectionBudget)
-                let acceptor = InboundConnectionAcceptor(
-                    ivy: self,
-                    generation: generation,
-                    transportKind: kind,
-                    admissionGate: gate,
-                    inboundByteBudget: inboundByteBudget,
-                    connectionInboundByteBudget: connectionBudget,
-                    directInbound: directInbound)
-                return channel.pipeline.addHandler(acceptor)
-            } catch {
-                return channel.eventLoop.makeFailedFuture(error)
+            // The peer is unidentified until it authenticates, but the transport
+            // that carried it is known now: a dial-back is only evidence about
+            // the transport it actually arrived on.
+            let connection = PeerConnection(
+                endpoint: PeerEndpoint(
+                    publicKey: "",
+                    host: "unknown",
+                    port: 0,
+                    transport: kind),
+                connection: transportConnection,
+                inboundByteBudget: inboundByteBudget,
+                connectionInboundByteBudget: connectionBudget,
+                isAccepted: true)
+            connection.observedHost = transportConnection.observedHost
+            Task { [weak self] in
+                guard let self,
+                      let lease = gate.reserve(observedHost: connection.observedHost) else {
+                    connection.cancel()
+                    return
+                }
+                connection.adoptInboundAdmission(lease)
+                guard await self.registerInboundConnection(
+                    connection,
+                    generation: generation
+                ) else {
+                    connection.cancel()
+                    return
+                }
             }
         } }
 
@@ -3765,7 +3763,7 @@ public actor Ivy {
                     host: "0.0.0.0",
                     port: config.listenPort(for: transport.kind),
                     group: group,
-                    streamInitializer: makeStreamInitializer(transport.kind))
+                    onConnection: makeAcceptor(transport.kind))
             }
         } catch {
             for handle in handles.values { await handle.close() }

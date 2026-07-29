@@ -237,7 +237,7 @@ extension Ivy {
     private func carrierLocalHost(for session: AuthenticatedSession) -> String? {
         guard case .relayed(_, let carrier) = session.connection.transport,
               let carrierSession = liveSession(for: carrier) else { return nil }
-        let host = carrierSession.connection.channel?.localAddress?.ipAddress
+        let host = carrierSession.connection.localHost
         guard let host, host != "0.0.0.0", host != "::" else { return nil }
         return host
     }

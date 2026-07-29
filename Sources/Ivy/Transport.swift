@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 
 /// Wire identifier for a transport. Encoded in advertised addresses.
@@ -11,6 +12,42 @@ public enum TransportKind: UInt8, Sendable, Hashable, CaseIterable {
 
     /// Whether a node can open a connection of this kind itself.
     var isDirectlyDialable: Bool { self != .relay }
+}
+
+/// Receives everything a transport connection produces.
+public protocol TransportConnectionSink: AnyObject, Sendable {
+    /// Bytes that were asked for, in order. Never more than was requested.
+    func transportDidReceive(_ bytes: Data)
+    func transportWritabilityChanged(isWritable: Bool)
+    func transportDidClose()
+}
+
+/// A live ordered byte stream to one peer.
+///
+/// Deliberately not a NIO channel: a transport may reach a peer over something
+/// else entirely, and everything that bounds a connection — framing, byte
+/// budgets, admission, the session state machine — lives above this and is the
+/// same for all of them.
+public protocol TransportConnection: Sendable {
+    /// Address the peer was observed at, which netgroup accounting keys on.
+    var observedHost: String? { get }
+    var localHost: String? { get }
+    var localPort: UInt16? { get }
+    var isActive: Bool { get }
+    var isWritable: Bool { get }
+
+    /// Installs the sink. Nothing is delivered before this, and a transport must
+    /// not deliver anything until `requestBytes()` asks for it.
+    func attach(_ sink: any TransportConnectionSink)
+
+    /// Asks for the next delivery. This is the whole flow-control contract: a
+    /// transport reads no further ahead than it has been asked to, so a slow
+    /// consumer stops the peer rather than buffering without bound.
+    func requestBytes()
+
+    /// Sends one already-framed payload.
+    func send(_ payload: Data)
+    func close()
 }
 
 /// A bound listener owned by a transport.
@@ -44,15 +81,16 @@ public protocol IvyTransport: Sendable {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        boundToPort: UInt16?,
-        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
-    ) async throws -> Channel
+        boundToPort: UInt16?
+    ) async throws -> any TransportConnection
 
+    /// `onConnection` runs for each accepted connection. Admission decides
+    /// whether to keep it, and nothing is read until it calls `requestBytes()`.
     func listen(
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
+        onConnection: @Sendable @escaping (any TransportConnection) -> Void
     ) async throws -> any TransportListenerHandle
 }
 
@@ -60,19 +98,12 @@ extension IvyTransport {
     func dial(
         host: String,
         port: UInt16,
-        group: any EventLoopGroup,
-        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
-    ) async throws -> Channel {
-        try await dial(
-            host: host,
-            port: port,
-            group: group,
-            boundToPort: nil,
-            initializer: initializer)
+        group: any EventLoopGroup
+    ) async throws -> any TransportConnection {
+        try await dial(host: host, port: port, group: group, boundToPort: nil)
     }
 }
 
 enum TransportError: Error, Equatable {
-    /// A transport completed a dial without running the supplied initializer.
-    case channelNotInitialized
+    case dialFailed
 }

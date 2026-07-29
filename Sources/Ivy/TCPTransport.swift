@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOPosix
 
@@ -26,35 +27,47 @@ public struct TCPTransport: IvyTransport {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        boundToPort: UInt16?,
-        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
-    ) async throws -> Channel {
+        boundToPort: UInt16?
+    ) async throws -> any TransportConnection {
+        let box = NIOTransportConnectionBox()
         func bootstrap() -> ClientBootstrap {
             ClientBootstrap(group: group)
                 .connectTimeout(connectTimeout)
-                .channelInitializer(initializer)
+                // Reads only happen on demand, exactly as for an accepted channel.
+                .channelOption(ChannelOptions.autoRead, value: false)
+                .channelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        let connection = NIOTransportConnection(channel: channel)
+                        try channel.pipeline.syncOperations.addHandler(
+                            NIOTransportHandler(connection: connection))
+                        box.store(connection)
+                    }
+                }
         }
         if let boundToPort, boundToPort != 0, reusePort {
             do {
-                return try await bootstrap()
+                _ = try await bootstrap()
                     .channelOption(.socketOption(.so_reuseaddr), value: 1)
                     .channelOption(.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
                     .bind(to: try SocketAddress(ipAddress: "0.0.0.0", port: Int(boundToPort)))
                     .connect(host: host, port: Int(port))
                     .get()
+                guard let connection = box.take() else { throw TransportError.dialFailed }
+                return connection
             } catch {
-                // The listening port may be unusable for an outbound socket on
-                // this platform; an ordinary dial is still worth trying.
+                // Sharing the listening port is best effort on some platforms.
             }
         }
-        return try await bootstrap().connect(host: host, port: Int(port)).get()
+        _ = try await bootstrap().connect(host: host, port: Int(port)).get()
+        guard let connection = box.take() else { throw TransportError.dialFailed }
+        return connection
     }
 
     public func listen(
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
+        onConnection: @Sendable @escaping (any TransportConnection) -> Void
     ) async throws -> any TransportListenerHandle {
         var bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(.backlog, value: backlog)
@@ -67,10 +80,34 @@ public struct TCPTransport: IvyTransport {
         }
         let channel = try await bootstrap
             .childChannelOption(ChannelOptions.autoRead, value: false)
-            .childChannelInitializer(streamInitializer)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    let connection = NIOTransportConnection(channel: channel)
+                    try channel.pipeline.syncOperations.addHandler(
+                        NIOTransportHandler(connection: connection))
+                    onConnection(connection)
+                }
+            }
             .bind(host: host, port: Int(port))
             .get()
         return TCPListenerHandle(channel: channel)
+    }
+}
+
+/// Carries the connection built inside a channel initializer back to the dialer.
+private final class NIOTransportConnectionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: NIOTransportConnection?
+
+    func store(_ connection: NIOTransportConnection) {
+        lock.withLock { self.connection = connection }
+    }
+
+    func take() -> NIOTransportConnection? {
+        lock.withLock {
+            defer { connection = nil }
+            return connection
+        }
     }
 }
 

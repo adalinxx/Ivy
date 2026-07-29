@@ -227,19 +227,15 @@ extension Ivy {
         guard let frame = ReachabilityProbe.encode(nonce: nonce),
               let transport = try? transport(for: kind) else { return .refused }
         do {
-            let channel = try await transport.dial(
-                host: host,
-                port: port,
-                group: group
-            ) { channel in channel.eventLoop.makeSucceededVoidFuture() }
-            var buffer = channel.allocator.buffer(capacity: 4 + frame.count)
-            buffer.writeInteger(UInt32(frame.count), endianness: .big)
-            buffer.writeBytes(frame)
-            try await channel.writeAndFlush(buffer).get()
+            let connection = try await transport.dial(host: host, port: port, group: group)
+            var payload = Data()
+            payload.appendUInt32(UInt32(frame.count))
+            payload.append(frame)
+            connection.send(payload)
             // Let the peer close once it has read the nonce. Closing straight
             // after the write races its admission, which only enables reads after
             // an actor hop, and the frame would be lost along with the connection.
-            await Self.awaitPeerClose(channel, within: Self.dialBackCloseGrace)
+            await Self.awaitPeerClose(connection, within: Self.dialBackCloseGrace)
             return .dialed
         } catch {
             return .dialFailed
@@ -249,16 +245,21 @@ extension Ivy {
     /// How long a dial-back waits for the peer to close before closing itself.
     static let dialBackCloseGrace: Duration = .seconds(2)
 
-    private static func awaitPeerClose(_ channel: Channel, within grace: Duration) async {
-        // The close must be driven from the event loop rather than by cancelling
-        // a waiting task: `EventLoopFuture.get()` ignores cancellation, so racing
-        // it against a sleep would wait for a peer that never closes and hold the
-        // dial-back slot for good.
-        let deadline = channel.eventLoop.scheduleTask(in: TimeAmount(grace)) {
-            channel.close(promise: nil)
+    /// Waits for the peer to close, but never longer than `grace`: a peer that
+    /// accepted the connection and never closes must not hold a dial-back slot.
+    private static func awaitPeerClose(
+        _ connection: any TransportConnection,
+        within grace: Duration
+    ) async {
+        let closed = TransportCloseWaiter()
+        connection.attach(closed)
+        let deadline = Task {
+            try? await Task.sleep(for: grace)
+            connection.close()
         }
-        try? await channel.closeFuture.get()
+        await closed.wait()
         deadline.cancel()
+        connection.close()
     }
 
 #if DEBUG || IVY_TESTING

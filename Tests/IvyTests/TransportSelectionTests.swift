@@ -18,26 +18,24 @@ final class FakeQUICTransport: IvyTransport, @unchecked Sendable {
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        boundToPort: UInt16?,
-        initializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
-    ) async throws -> Channel {
+        boundToPort: UInt16?
+    ) async throws -> any TransportConnection {
         lock.withLock { dials.append("\(host):\(port)") }
         return try await backing.dial(
             host: host,
             port: port,
             group: group,
-            boundToPort: boundToPort,
-            initializer: initializer)
+            boundToPort: boundToPort)
     }
 
     func listen(
         host: String,
         port: UInt16,
         group: any EventLoopGroup,
-        streamInitializer: @Sendable @escaping (Channel) -> EventLoopFuture<Void>
+        onConnection: @Sendable @escaping (any TransportConnection) -> Void
     ) async throws -> any TransportListenerHandle {
         try await backing.listen(
-            host: host, port: port, group: group, streamInitializer: streamInitializer)
+            host: host, port: port, group: group, onConnection: onConnection)
     }
 }
 
@@ -121,7 +119,7 @@ struct ListenPortReuseTests {
             host: "127.0.0.1",
             port: 0,
             group: group,
-            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+            onConnection: { _ in })
         let listenPort = try #require(listener.localPort)
 
         // Somewhere to dial that is not ourselves.
@@ -129,20 +127,19 @@ struct ListenPortReuseTests {
             host: "127.0.0.1",
             port: 0,
             group: group,
-            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+            onConnection: { _ in })
         let peerPort = try #require(peer.localPort)
 
-        let channel = try await transport.dial(
+        let dialed = try await transport.dial(
             host: "127.0.0.1",
             port: peerPort,
             group: group,
-            boundToPort: listenPort,
-            initializer: { $0.eventLoop.makeSucceededVoidFuture() })
+            boundToPort: listenPort)
         // This is what makes a hole punch work: the mapping the peer sees is the
         // one this node advertises.
-        #expect(channel.localAddress?.port == Int(listenPort))
+        #expect(dialed.localPort == listenPort)
 
-        try? await channel.close().get()
+        dialed.close()
         await listener.close()
         await peer.close()
     }
@@ -155,18 +152,17 @@ struct ListenPortReuseTests {
             host: "127.0.0.1",
             port: 0,
             group: group,
-            streamInitializer: { $0.eventLoop.makeSucceededVoidFuture() })
+            onConnection: { _ in })
         let peerPort = try #require(peer.localPort)
 
-        let channel = try await transport.dial(
+        let dialed = try await transport.dial(
             host: "127.0.0.1",
             port: peerPort,
             group: group,
-            boundToPort: peerPort,
-            initializer: { $0.eventLoop.makeSucceededVoidFuture() })
-        #expect(channel.localAddress?.port != Int(peerPort))
+            boundToPort: peerPort)
+        #expect(dialed.localPort != peerPort)
 
-        try? await channel.close().get()
+        dialed.close()
         await peer.close()
     }
 }
