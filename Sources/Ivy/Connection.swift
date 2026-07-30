@@ -315,10 +315,10 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         self.connectionInboundByteBudget = connectionInboundByteBudget
             ?? InboundByteBudget(limit: Self.inboundByteBudgetLimit(for: localMaxFrameSize))
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
-        // Unbounded at the stream; `feedFrame` enforces the relayed record cap,
-        // since a relayed peer has no socket to backpressure.
+        // Bounded at the stream, unlike a direct connection: there is no socket
+        // to stop, so a carrier that outruns the session loses the connection.
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
-            bufferingPolicy: .unbounded)
+            bufferingPolicy: .bufferingOldest(inboundBufferLimit))
     }
 
     static func dial(
@@ -481,12 +481,6 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     func feedFrame(_ frame: InboundFrame) -> Bool {
         let accepted = stateLock.withLock { () -> Bool in
             guard !closed else { return false }
-            // A direct peer is bounded by read demand; a relayed one has no
-            // socket to backpressure, so overflowing the record cap costs it
-            // the connection.
-            if case .relayed = transport, unconsumedFrames >= inboundBufferLimit {
-                return false
-            }
             unconsumedFrames += 1
             return true
         }
@@ -494,6 +488,11 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
             cancel()
             return false
         }
+        // A relayed peer has no socket to backpressure, so its cap is the
+        // stream's own buffer: overflowing it costs the peer its connection.
+        // The cap counts records still queued, not one being processed, which
+        // is why it cannot be `unconsumedFrames` — that would also count the
+        // record in flight and shrink the queue under a slow consumer.
         switch inboundContinuation.yield(frame) {
         case .enqueued:
             return true
