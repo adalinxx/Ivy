@@ -12,8 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: ".."),
-        .package(url: "https://github.com/apple/swift-nio-quic.git", from: "0.1.0"),
-        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.19.3"),
+        .package(url: "https://github.com/adalinxx/swift-quic", from: "0.8.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
     ],
@@ -22,8 +21,7 @@ let package = Package(
             name: "IvyQUIC",
             dependencies: [
                 .product(name: "Ivy", package: "Ivy"),
-                .product(name: "NIOQUIC", package: "swift-nio-quic"),
-                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "QUIC", package: "swift-quic"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),

@@ -2,8 +2,21 @@ import Crypto
 import Foundation
 import Ivy
 import NIOCore
+import NIOPosix
 import Testing
 @testable import IvyQUIC
+
+/// Records what arrived, so a test can wait for delivery rather than sleep.
+final class MessageRecorder: IvyDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var messages: [PeerMessage] = []
+
+    func ivy(_ ivy: Ivy, didReceiveMessage message: PeerMessage, from peer: AuthenticatedPeer) async {
+        lock.withLock { messages.append(message) }
+    }
+
+    var received: [PeerMessage] { lock.withLock { messages } }
+}
 
 @Suite("QUIC transport")
 struct QUICTransportTests {
@@ -54,5 +67,116 @@ struct QUICTransportTests {
 
         await dialer.stop()
         await listener.stop()
+    }
+
+    /// Drives the read pump hard: payloads far larger than one QUIC delivery, so
+    /// every frame is reassembled across many chunks, and enough of them that
+    /// the demand loop has to re-arm repeatedly.
+    @Test("records spanning many QUIC deliveries are reassembled in order")
+    func multiFrameExchangeOverQUIC() async throws {
+        let listenerIdentity = identity("quic-bulk-listener")
+        let dialerIdentity = identity("quic-bulk-dialer")
+
+        let listener = Ivy(
+            config: config(listenerIdentity, port: 0),
+            transports: [try QUICTransport()])
+        let dialer = Ivy(
+            config: config(dialerIdentity, port: 0),
+            transports: [try QUICTransport()])
+        let recorder = MessageRecorder()
+        await listener.setDelegate(recorder)
+
+        try await listener.start()
+        try await dialer.start()
+
+        let port = try #require(await listener.boundPort(for: .quic))
+        let listenerKey = try PeerKey(
+            rawRepresentation: listenerIdentity.publicKey.rawRepresentation)
+        try await dialer.connect(to: PeerEndpoint(
+            publicKey: listenerKey.hex,
+            host: "127.0.0.1",
+            port: port,
+            transport: .quic))
+
+        let listenerID = try #require(await dialer.connectedPeers.first)
+        let sent = (0..<8).map { index in
+            PeerMessage(
+                topic: "bulk-\(index)",
+                payload: Data(repeating: UInt8(index), count: 128 * 1024))
+        }
+        for message in sent {
+            var result = await dialer.sendMessage(
+                to: listenerID,
+                topic: message.topic,
+                payload: message.payload)
+            // The watermark stops the writer rather than queueing without bound.
+            while case .backpressured = result {
+                #expect(await dialer.waitUntilWritable(to: listenerID))
+                result = await dialer.sendMessage(
+                    to: listenerID,
+                    topic: message.topic,
+                    payload: message.payload)
+            }
+            if case .enqueued = result {} else {
+                Issue.record("send was refused: \(result)")
+            }
+        }
+
+        try await eventually { recorder.received.count == sent.count }
+        #expect(recorder.received == sent)
+
+        await dialer.stop()
+        await listener.stop()
+    }
+
+    /// A punch dial asked to leave from the listening port cannot do so yet:
+    /// swift-quic binds that socket without connecting it, so the handshake
+    /// reply is demultiplexed to the listener sharing the port and the attempt
+    /// times out. What must hold regardless is that the dial still completes
+    /// from an ephemeral port rather than failing outright — a punch that
+    /// misses its mapping is a worse route, not a dead one.
+    @Test("a hole-punch dial falls back rather than failing")
+    func holePunchDialFallsBack() async throws {
+        let group = MultiThreadedEventLoopGroup.singleton
+        let transport = try QUICTransport(reusePort: true)
+
+        let listener = try await transport.listen(
+            host: "127.0.0.1",
+            port: 0,
+            group: group,
+            onConnection: { _ in })
+        let listenPort = try #require(listener.localPort)
+
+        // Somewhere to dial that is not ourselves.
+        let peer = try await transport.listen(
+            host: "127.0.0.1",
+            port: 0,
+            group: group,
+            onConnection: { _ in })
+        let peerPort = try #require(peer.localPort)
+
+        let dialed = try await transport.dial(
+            host: "127.0.0.1",
+            port: peerPort,
+            group: group,
+            boundToPort: listenPort)
+        #expect(dialed.isActive)
+        #expect(dialed.localPort != nil)
+
+        dialed.close()
+        await listener.close()
+        await peer.close()
+    }
+
+    private func eventually(
+        timeout: Duration = .seconds(5),
+        _ condition: @Sendable () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        Issue.record("condition never became true within \(timeout)")
     }
 }
