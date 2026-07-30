@@ -23,6 +23,9 @@ public struct IvyConfig: Sendable {
     public var publicKey: String { peerKey.hex }
     public let mode: IvyMode
     public let listenPort: UInt16
+    /// UDP port for the QUIC listener. Defaults to `listenPort`; the TCP and UDP
+    /// port spaces are independent, so sharing the number is normal.
+    public let quicListenPort: UInt16?
     public let bootstrapPeers: [PeerEndpoint]
     /// Authenticated private-plane peers whose application messages must not
     /// be silently discarded by the receiver's local Tally policy.
@@ -57,6 +60,41 @@ public struct IvyConfig: Sendable {
     public let protocolMaxFrameSize: UInt32
     public let externalAddress: (host: String, port: UInt16)?
     public let relayEnabled: Bool
+    /// Inbound relayed sessions accepted at once. A relayed peer's own address is
+    /// unobservable, so the netgroup cap cannot bound it and this does instead.
+    public let maxRelayedInboundConnections: Int
+    public let maxRelayedInboundPerCarrier: Int
+    /// Tries to replace a relayed session with a direct one by dialing at the
+    /// same moment as the peer.
+    public let holePunchEnabled: Bool
+    public let holePunchAttempts: Int
+    public let holePunchTimeout: Duration
+    /// Punches running at once, across all peers.
+    public let maxConcurrentHolePunches: Int
+    public let holePunchPerPeerCooldown: Duration
+    /// Lets a hole-punch dial leave from the listening port, so the mapping a NAT
+    /// creates is the one this node advertises. Off by default: it also lets any
+    /// process that can bind as this user take the same port and absorb inbound
+    /// connections, so enable it only where every such process is trusted.
+    /// Punching still works without it, from an ephemeral port.
+    public let reusesListenPortForHolePunch: Bool
+    /// Hole-punch dials this node will make in any 60 seconds, across all peers.
+    public let maxPunchDialsPerWindow: Int
+    /// Allows private and loopback punch candidates. Off by default: a peer
+    /// names its own addresses, so accepting them lets it aim dials at hosts
+    /// inside this node's network. Useful on a LAN and in tests.
+    public let allowPrivateHolePunchCandidates: Bool
+    /// Probes peers to learn whether this node is dialable from outside its NAT.
+    public let reachabilityEnabled: Bool
+    public let reachabilityProbeInterval: Duration
+    /// Peers asked per round, each in a distinct netgroup.
+    public let reachabilityProbeSampleSize: Int
+    /// Inbound nonces needed before declaring the node publicly reachable.
+    public let reachabilityConfirmations: Int
+    /// Dial-backs this node will perform for others at once.
+    public let maxConcurrentDialBacks: Int
+    /// Minimum spacing between dial-backs performed for one peer.
+    public let dialBackPerPeerInterval: Duration
     /// Enables direct exact-CID request/response messages on a private network.
     /// Public overlays always support content exchange.
     public let privateContentExchangeEnabled: Bool
@@ -64,6 +102,7 @@ public struct IvyConfig: Sendable {
     public init(
         signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
+        quicListenPort: UInt16? = nil,
         bootstrapPeers: [PeerEndpoint] = [],
         inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         tallyConfig: TallyConfig = .default,
@@ -89,6 +128,22 @@ public struct IvyConfig: Sendable {
         protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         externalAddress: (host: String, port: UInt16)? = nil,
         relayEnabled: Bool = false,
+        maxRelayedInboundConnections: Int = 32,
+        maxRelayedInboundPerCarrier: Int = 8,
+        holePunchEnabled: Bool = true,
+        holePunchAttempts: Int = 3,
+        holePunchTimeout: Duration = .seconds(10),
+        maxConcurrentHolePunches: Int = 2,
+        holePunchPerPeerCooldown: Duration = .seconds(300),
+        reusesListenPortForHolePunch: Bool = false,
+        maxPunchDialsPerWindow: Int = 20,
+        allowPrivateHolePunchCandidates: Bool = false,
+        reachabilityEnabled: Bool = true,
+        reachabilityProbeInterval: Duration = .seconds(900),
+        reachabilityProbeSampleSize: Int = 4,
+        reachabilityConfirmations: Int = 2,
+        maxConcurrentDialBacks: Int = 4,
+        dialBackPerPeerInterval: Duration = .seconds(60),
         privateContentExchangeEnabled: Bool = false,
         carriers: [PeerEndpoint] = [],
         mode: IvyMode = .overlay
@@ -97,11 +152,31 @@ public struct IvyConfig: Sendable {
         self.peerKey = try! PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation)
         self.mode = mode
         self.listenPort = listenPort
+        self.quicListenPort = quicListenPort
         self.bootstrapPeers = bootstrapPeers
         self.inboundAdmissionBypassPeerKeys = inboundAdmissionBypassPeerKeys
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
+        self.maxRelayedInboundConnections = maxRelayedInboundConnections
+        self.maxRelayedInboundPerCarrier = maxRelayedInboundPerCarrier
+        self.holePunchEnabled = holePunchEnabled && mode.usesOverlayServices
+        self.holePunchAttempts = holePunchAttempts
+        self.holePunchTimeout = holePunchTimeout
+        self.maxConcurrentHolePunches = maxConcurrentHolePunches
+        self.holePunchPerPeerCooldown = holePunchPerPeerCooldown
+        self.reusesListenPortForHolePunch =
+            reusesListenPortForHolePunch && holePunchEnabled && mode.usesOverlayServices
+        self.maxPunchDialsPerWindow = maxPunchDialsPerWindow
+        self.allowPrivateHolePunchCandidates = allowPrivateHolePunchCandidates
+        // Reachability is an overlay service: a private plane has no NAT story
+        // to discover and no strangers to prove reachability to.
+        self.reachabilityEnabled = reachabilityEnabled && mode.usesOverlayServices
+        self.reachabilityProbeInterval = reachabilityProbeInterval
+        self.reachabilityProbeSampleSize = reachabilityProbeSampleSize
+        self.reachabilityConfirmations = reachabilityConfirmations
+        self.maxConcurrentDialBacks = maxConcurrentDialBacks
+        self.dialBackPerPeerInterval = dialBackPerPeerInterval
         self.privateContentExchangeEnabled = privateContentExchangeEnabled
         self.tallyConfig = tallyConfig
         self.kBucketSize = kBucketSize
@@ -124,6 +199,15 @@ public struct IvyConfig: Sendable {
         self.maxInFlightVolumeBytes = maxInFlightVolumeBytes
         self.protocolMaxFrameSize = protocolMaxFrameSize
         self.externalAddress = externalAddress
+    }
+
+    public func listenPort(for kind: TransportKind) -> UInt16 {
+        switch kind {
+        case .tcp: return listenPort
+        case .quic: return quicListenPort ?? listenPort
+        // A relay endpoint names a carrier to reach, not a socket to bind.
+        case .relay: return 0
+        }
     }
 
     public func validate() throws {
@@ -160,6 +244,27 @@ public struct IvyConfig: Sendable {
               relayTimeout > .zero,
               routingRefreshInterval > .zero else {
             throw IvyModeError.invalidConfiguration("routing and timeout limits are invalid")
+        }
+        if holePunchEnabled {
+            guard holePunchAttempts > 0,
+                  holePunchTimeout > .zero,
+                  maxConcurrentHolePunches > 0,
+                  maxPunchDialsPerWindow > 0,
+                  holePunchPerPeerCooldown > .zero else {
+                throw IvyModeError.invalidConfiguration("hole punch limits are invalid")
+            }
+        }
+        guard maxRelayedInboundConnections > 0, maxRelayedInboundPerCarrier > 0 else {
+            throw IvyModeError.invalidConfiguration("relayed inbound limits must be positive")
+        }
+        if reachabilityEnabled {
+            guard reachabilityProbeInterval > .zero,
+                  dialBackPerPeerInterval > .zero,
+                  reachabilityProbeSampleSize > 0,
+                  maxConcurrentDialBacks > 0,
+                  (1...reachabilityProbeSampleSize).contains(reachabilityConfirmations) else {
+                throw IvyModeError.invalidConfiguration("reachability probe limits are invalid")
+            }
         }
         if healthConfig.enabled {
             guard healthConfig.keepaliveInterval > .zero,

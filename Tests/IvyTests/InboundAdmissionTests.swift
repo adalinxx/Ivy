@@ -39,7 +39,7 @@ struct InboundAdmissionTests {
             reservedOutboundConnectionSlots: 1,
             maxConnectionsPerNetgroup: 2))
         try await ivy.start()
-        let port = try #require(await ivy.serverChannel?.localAddress?.port)
+        let port = Int(try #require(await ivy.boundPort(for: .tcp)))
 
         let first = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connect(host: "127.0.0.1", port: port).get()
@@ -223,7 +223,7 @@ struct InboundAdmissionTests {
         try await restarting.value
 
         #expect(await ivy.running)
-        #expect(await ivy.serverChannel != nil)
+        #expect(await ivy.boundPort(for: .tcp) != nil)
         await ivy.stop()
     }
 
@@ -747,6 +747,36 @@ struct InboundAdmissionTests {
             carrier: try! PeerKey(rawRepresentation: Data(repeating: 7, count: 32)))
     }
 
+    /// A peer that connects and drops immediately must give its slot back. The
+    /// lease is released explicitly rather than by the connection deallocating,
+    /// so a retained dead connection cannot hold admission capacity.
+    @Test("a connection that closes before registering releases its slot")
+    func closedConnectionReleasesItsSlot() async throws {
+        let gate = InboundAdmissionGate(maxConnections: 1, maxConnectionsPerNetgroup: 1)
+        let lease = try #require(gate.reserve(observedHost: "10.1.0.1"))
+        let channel = EmbeddedChannel()
+        try await channel.connect(to: SocketAddress(ipAddress: "10.1.0.1", port: 4001)).get()
+
+        let connection = PeerConnection(
+            endpoint: PeerEndpoint(publicKey: "", host: "unknown", port: 0),
+            channel: channel,
+            inboundAdmission: lease,
+            isAccepted: true)
+        connection.observedHost = "10.1.0.1"
+        // The slot is taken while the connection lives.
+        #expect(gate.reserve(observedHost: "10.1.0.1") == nil)
+
+        // The peer drops before it ever authenticates, then something refuses
+        // the already-dead connection.
+        connection.transportDidClose()
+        connection.cancel()
+
+        // The connection is still retained here, so a slot only comes back if it
+        // was released outright.
+        #expect(gate.reserve(observedHost: "10.1.0.1") != nil)
+        withExtendedLifetime(connection) {}
+        _ = try? channel.finish()
+    }
 }
 
 private extension Ivy {

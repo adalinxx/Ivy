@@ -52,6 +52,9 @@ enum TransportTestHarness {
         tallyConfig: TallyConfig = .default,
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxContentCandidates: Int = 8,
+        allowPrivateHolePunchCandidates: Bool = false,
+        logger: any IvyLogger = NullLogger(),
+        holePunchEnabled: Bool = true,
         privateContentExchangeEnabled: Bool = false,
         protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) -> IvyConfig {
@@ -65,12 +68,15 @@ enum TransportTestHarness {
             relayTimeout: relayTimeout,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
+            logger: logger,
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
             protocolMaxFrameSize: protocolMaxFrameSize,
             externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
+            holePunchEnabled: holePunchEnabled,
+            allowPrivateHolePunchCandidates: allowPrivateHolePunchCandidates,
             privateContentExchangeEnabled: privateContentExchangeEnabled,
             carriers: carriers,
             mode: mode)

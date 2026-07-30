@@ -36,6 +36,25 @@ jobs:
           IVY_TEST_SEED: "0x5eedcafe"
         run: swift test --skip-build --filter seeded
 
+  quic:
+    # IvyQUIC is a separate package: swift-nio-quic needs a newer toolchain and
+    # platform than Ivy itself targets, and pulls a prerelease swift-crypto that
+    # swift-certificates gates behind an opt-in.
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SWIFT_CERTIFICATES_ALLOW_SWIFT_CRYPTO_BETA: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+      - run: swift --version
+      - name: Build and test IvyQUIC
+        working-directory: IvyQUIC
+        run: |
+          swift build
+          swift test
+
   sanitizer:
     strategy:
       fail-fast: false

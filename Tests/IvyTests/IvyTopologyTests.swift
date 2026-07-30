@@ -274,7 +274,7 @@ struct IvyTopologyTests {
         let responder = try PeerKey(rawRepresentation: responderIdentity.publicKey.rawRepresentation)
         let carrier = try PeerKey(rawRepresentation: carrierIdentity.publicKey.rawRepresentation)
         let addresses = (0..<8).map { index in
-            let length = index < 6 ? 8_186 : 8_185
+            let length = index < 6 ? 8_185 : 8_184
             let suffix = "\(index)"
             return ListenAddress(
                 host: String(repeating: "a", count: length - suffix.count) + suffix,

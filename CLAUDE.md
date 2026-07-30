@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> **Project:** Ivy — reputation-routed P2P/DHT networking for content-addressed blockchains (per-chain Kademlia overlays, WANT/Volume fetch, Tally-scored peers, NAT traversal). Standalone and host-agnostic; Lattice is one consumer, not a dependency. Build/test: `swift build` / `swift test`.
+> **Project:** Ivy — reputation-routed P2P/DHT networking for content-addressed blockchains (per-chain Kademlia overlays, WANT/Volume fetch, Tally-scored peers, pluggable transports, NAT traversal). Standalone and host-agnostic; Lattice is one consumer, not a dependency. Build/test: `swift build` / `swift test`.
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 

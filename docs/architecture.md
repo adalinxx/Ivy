@@ -8,8 +8,57 @@ caller: authority, validation, storage, protocol meaning
                          |
 Ivy: admission, sessions, routing, content, relay
                          |
-SwiftNIO: direct TCP or configured carrier
+SwiftNIO: direct transport (TCP, QUIC) or configured carrier
 ```
+
+## Transports
+
+A transport supplies ordered, reliable byte-stream channels and nothing else.
+Dialing and listening sit behind `IvyTransport`; everything above it — framing,
+admission, byte budgets, backpressure, and the signed session state machine — is
+shared, so a new transport cannot weaken the model. Every listener feeds one
+admission gate, so capacity and netgroup diversity are accounted across
+transports rather than per transport.
+
+Advertised addresses carry the transport they belong to, and a node advertises a
+transport only once it has bound one. A peer offering several is dialed QUIC
+first, then TCP; a transport this node has not installed is neither dialed nor
+routable.
+
+QUIC (see `IvyQUIC`) maps one connection to one bidirectional stream carrying the
+same framed records as TCP, with reads parked until admission grants a slot. Its
+TLS layer is plumbing: certificates are ephemeral and unverified, identity still
+comes only from the signed handshake, and QUIC dials use the same zero route
+binding as direct TCP.
+
+## Reachability and hole punching
+
+A node learns whether peers can dial it by asking a few of them, each in a
+different netgroup, to dial it back at a port it names. The request carries no
+host: the responder dials the address it already observes for the session, so the
+exchange cannot be aimed at a third party, and the dial-back frame is smaller
+than the request. Only that nonce arriving inbound confirms reachability, so a
+peer that lies can withhold a confirmation but never invent one.
+
+A node that cannot be dialed publishes provider records naming a carrier to reach
+it through, so strangers can find it without having configured the same carrier.
+The named carrier is the one that delivered the peer's own session, addressed by
+an endpoint the storing node already holds. Relay hints live only in provider
+records; routing and session metadata stay direct-only.
+
+Once two peers share a relayed session, the side that accepted it offers its
+addresses, measures the round trip, and both dial at the same moment. Those dials
+leave from the listening port, so the mapping a NAT creates is the one this node
+advertises. That requires the listener to share its port, which also lets any
+process able to bind as this user absorb inbound connections, so it is off unless
+configured; without it a punch still leaves from an ephemeral port. A punched connection is an ordinary connection: it
+faces the same admission, netgroup, handshake, and scoring policy, and only the
+timing is coordinated. A punch that
+fails keeps the relay and is held against nobody. Candidates on private or
+loopback addresses are refused unless configured otherwise, since a peer names
+its own addresses and could otherwise aim dials inside the network. Because those
+addresses stay peer-chosen, punch dials are additionally bounded node-wide, not
+just per peer, so many peers cannot sum into a scan.
 
 ## Connections
 
@@ -24,13 +73,14 @@ nonces, route binding, and bounded metadata, followed by the initiator's signed
 finish.
 
 Application records bind sender, receiver, session ID, sequence, and payload.
-Receive sequences strictly increase. Simultaneous sessions for one peer and
-role converge on the smaller session ID. Records are signed but not encrypted;
+Receive sequences strictly increase. Simultaneous sessions for one peer and role
+converge on a direct session over a relayed one, and on the smaller session ID
+between two of the same kind. Records are signed but not encrypted;
 confidentiality and forward secrecy belong above or below Ivy.
 
 Wire/session protocol v9 rejects v8 during authentication. V9 introduces
 multi-frame complete-Volume replies, which cannot safely share the older
-one-frame Volume contract.
+one-frame Volume contract, and tags every advertised address with its transport.
 
 Treat every authenticated endpoint connection as an independent availability
 zone, not a verdict about the peer. Application timeouts, unavailable content,

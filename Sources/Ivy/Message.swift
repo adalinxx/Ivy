@@ -15,6 +15,53 @@ struct ProviderRecord: Sendable, Equatable {
     let expiresAt: UInt64
 }
 
+enum ReachabilityStatus: UInt8, Sendable, Equatable {
+    case dialed = 0
+    case refused = 1
+    case dialFailed = 2
+}
+
+enum HolePunchAbortReason: UInt8, Sendable, Equatable {
+    case busy = 0
+    case disabled = 1
+    case cooldown = 2
+    case noCandidates = 3
+}
+
+/// An address a peer offers for a hole punch, tagged with the transport to
+/// reach it on.
+struct PunchCandidate: Sendable, Equatable, Hashable, Comparable {
+    static let maxPerPunch = 4
+    static let maxPerTransport = 2
+
+    let transport: TransportKind
+    let host: String
+    let port: UInt16
+
+    static func < (lhs: PunchCandidate, rhs: PunchCandidate) -> Bool {
+        if lhs.transport != rhs.transport { return lhs.transport.rawValue < rhs.transport.rawValue }
+        if lhs.host != rhs.host { return lhs.host < rhs.host }
+        return lhs.port < rhs.port
+    }
+
+    /// Candidates are sorted and deduplicated so one list has one encoding, and
+    /// capped per transport so a peer cannot make us dial a long list.
+    static func canonical(_ candidates: [PunchCandidate]) -> [PunchCandidate]? {
+        let sorted = Array(Set(candidates)).sorted()
+        guard !sorted.isEmpty, sorted.count <= maxPerPunch else { return nil }
+        for kind in TransportKind.allCases {
+            guard sorted.filter({ $0.transport == kind }).count <= maxPerTransport else {
+                return nil
+            }
+        }
+        // A relay hint names a carrier, not a socket to punch towards.
+        guard sorted.allSatisfy({ $0.transport.isDirectlyDialable && $0.port != 0 }) else {
+            return nil
+        }
+        return sorted
+    }
+}
+
 enum Message: Sendable {
     case ping(nonce: UInt64)
     case pong(nonce: UInt64)
@@ -46,6 +93,23 @@ enum Message: Sendable {
     case relayPacket(routeID: Data, opaqueEndpointRecord: Data)
     case relayClose(routeID: Data)
 
+    /// Offers the addresses this peer believes it can be reached at, so both
+    /// sides can dial each other at once and punch through their NATs. Carried
+    /// over the relayed session the two peers already share.
+    case holePunchConnect(punchID: UInt64, candidates: [PunchCandidate])
+    /// Fires the simultaneous dial. The coordinator sends it after measuring the
+    /// round trip, so both dials leave at roughly the same moment.
+    case holePunchSync(punchID: UInt64)
+    case holePunchAbort(punchID: UInt64, reason: HolePunchAbortReason)
+
+    /// Asks the receiver to dial this sender back at `port` on the address it
+    /// already observes for the session, proving the sender is publicly
+    /// reachable. There is deliberately no host field: the target is the
+    /// observed source address, which the sender cannot forge, so the exchange
+    /// cannot be aimed at a third party (IVY-024).
+    case reachabilityRequest(requestID: UInt64, transport: TransportKind, port: UInt16, nonce: Data)
+    case reachabilityResponse(requestID: UInt64, status: ReachabilityStatus)
+
     case peerMessage(topic: String, payload: Data)
 
     /// Bytes a `relayPacket` adds around its opaque endpoint record: the message
@@ -72,6 +136,11 @@ enum Message: Sendable {
         case relayReady = 63
         case relayPacket = 64
         case relayClose = 65
+        case holePunchConnect = 66
+        case holePunchSync = 67
+        case holePunchAbort = 68
+        case reachabilityRequest = 70
+        case reachabilityResponse = 71
     }
 
     var isKeepalive: Bool {
@@ -247,6 +316,43 @@ enum Message: Sendable {
             guard routeID.count == 32 else { return false }
             bytes.append(Tag.relayClose.rawValue)
             bytes.append(routeID)
+        case .holePunchConnect(let punchID, let candidates):
+            guard punchID != 0,
+                  let canonical = PunchCandidate.canonical(candidates),
+                  canonical == candidates else { return false }
+            bytes.append(Tag.holePunchConnect.rawValue)
+            bytes.appendUInt64(punchID)
+            bytes.appendUInt8(UInt8(canonical.count))
+            for candidate in canonical {
+                bytes.append(candidate.transport.rawValue)
+                guard bytes.appendLengthPrefixedString(candidate.host) else { return false }
+                bytes.appendUInt16(candidate.port)
+            }
+        case .holePunchSync(let punchID):
+            guard punchID != 0 else { return false }
+            bytes.append(Tag.holePunchSync.rawValue)
+            bytes.appendUInt64(punchID)
+        case .holePunchAbort(let punchID, let reason):
+            guard punchID != 0 else { return false }
+            bytes.append(Tag.holePunchAbort.rawValue)
+            bytes.appendUInt64(punchID)
+            bytes.append(reason.rawValue)
+        case .reachabilityRequest(let requestID, let transport, let port, let nonce):
+            guard requestID != 0,
+                  // A relay hint names a carrier, not a socket anyone can dial back.
+                  transport.isDirectlyDialable,
+                  port != 0,
+                  nonce.count == ReachabilityProbe.nonceByteCount else { return false }
+            bytes.append(Tag.reachabilityRequest.rawValue)
+            bytes.appendUInt64(requestID)
+            bytes.append(transport.rawValue)
+            bytes.appendUInt16(port)
+            bytes.append(nonce)
+        case .reachabilityResponse(let requestID, let status):
+            guard requestID != 0 else { return false }
+            bytes.append(Tag.reachabilityResponse.rawValue)
+            bytes.appendUInt64(requestID)
+            bytes.append(status.rawValue)
         case .peerMessage(let topic, let payload):
             guard !topic.isEmpty else { return false }
             bytes.append(Tag.peerMessage.rawValue)
@@ -391,6 +497,48 @@ enum Message: Sendable {
         case .relayClose:
             guard let routeID = reader.readFixedData(count: 32) else { return nil }
             return .relayClose(routeID: routeID)
+        case .holePunchConnect:
+            guard let punchID = reader.readUInt64(), punchID != 0,
+                  let count = reader.readUInt8(),
+                  count > 0, count <= UInt8(PunchCandidate.maxPerPunch) else { return nil }
+            var candidates: [PunchCandidate] = []
+            candidates.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let transport = reader.readTransportKind(),
+                      let host = reader.readString(),
+                      let port = reader.readUInt16() else { return nil }
+                candidates.append(
+                    PunchCandidate(transport: transport, host: host, port: port))
+            }
+            guard let canonical = PunchCandidate.canonical(candidates),
+                  canonical == candidates else { return nil }
+            return .holePunchConnect(punchID: punchID, candidates: canonical)
+        case .holePunchSync:
+            guard let punchID = reader.readUInt64(), punchID != 0 else { return nil }
+            return .holePunchSync(punchID: punchID)
+        case .holePunchAbort:
+            guard let punchID = reader.readUInt64(), punchID != 0,
+                  let rawReason = reader.readUInt8(),
+                  let reason = HolePunchAbortReason(rawValue: rawReason) else { return nil }
+            return .holePunchAbort(punchID: punchID, reason: reason)
+        case .reachabilityRequest:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let transport = reader.readTransportKind(),
+                  transport.isDirectlyDialable,
+                  let port = reader.readUInt16(), port != 0,
+                  let nonce = reader.readFixedData(count: ReachabilityProbe.nonceByteCount) else {
+                return nil
+            }
+            return .reachabilityRequest(
+                requestID: requestID,
+                transport: transport,
+                port: port,
+                nonce: nonce)
+        case .reachabilityResponse:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let rawStatus = reader.readUInt8(),
+                  let status = ReachabilityStatus(rawValue: rawStatus) else { return nil }
+            return .reachabilityResponse(requestID: requestID, status: status)
         case .peerMessage:
             guard let topic = reader.readString(), let payload = reader.readData() else { return nil }
             return .peerMessage(topic: topic, payload: payload)
@@ -403,11 +551,23 @@ public struct PeerEndpoint: Sendable, Equatable, Hashable {
     public let publicKey: String
     public let host: String
     public let port: UInt16
+    public let transport: TransportKind
+    /// The carrier to reach `publicKey` through. Present only for `.relay`
+    /// endpoints, where `host` and `port` address the carrier, not the peer.
+    public let carrierKey: String?
 
-    public init(publicKey: String, host: String, port: UInt16) {
+    public init(
+        publicKey: String,
+        host: String,
+        port: UInt16,
+        transport: TransportKind = .tcp,
+        carrierKey: String? = nil
+    ) {
         self.publicKey = publicKey
         self.host = host
         self.port = port
+        self.transport = transport
+        self.carrierKey = transport == .relay ? carrierKey : nil
     }
 }
 
@@ -415,20 +575,27 @@ private extension Data {
     mutating func appendEndpoints(_ endpoints: [PeerEndpoint]) -> Bool {
         guard appendCount(endpoints.count, max: MessageLimits.maxNeighborCount) else { return false }
         for endpoint in endpoints {
-            guard appendLengthPrefixedString(endpoint.publicKey),
-                  appendLengthPrefixedString(endpoint.host) else { return false }
-            appendUInt16(endpoint.port)
+            guard appendEndpointBody(endpoint) else { return false }
         }
+        return true
+    }
+
+    /// Shared by neighbour lists and provider records so both stay canonical.
+    mutating func appendEndpointBody(_ endpoint: PeerEndpoint) -> Bool {
+        guard appendLengthPrefixedString(endpoint.publicKey),
+              appendLengthPrefixedString(endpoint.host) else { return false }
+        appendUInt16(endpoint.port)
+        append(endpoint.transport.rawValue)
+        guard endpoint.transport == .relay else { return endpoint.carrierKey == nil }
+        guard let carrierKey = endpoint.carrierKey,
+              appendLengthPrefixedString(carrierKey) else { return false }
         return true
     }
 
     mutating func appendProviderRecords(_ records: [ProviderRecord]) -> Bool {
         guard appendCount(records.count, max: MessageLimits.maxNeighborCount) else { return false }
         for record in records {
-            let endpoint = record.endpoint
-            guard appendLengthPrefixedString(endpoint.publicKey),
-                  appendLengthPrefixedString(endpoint.host) else { return false }
-            appendUInt16(endpoint.port)
+            guard appendEndpointBody(record.endpoint) else { return false }
             appendUInt64(record.expiresAt)
         }
         return true
@@ -441,8 +608,8 @@ private extension DataReader {
         var endpoints: [PeerEndpoint] = []
         endpoints.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
-            guard let publicKey = readString(), let host = readString(), let port = readUInt16() else { return nil }
-            endpoints.append(PeerEndpoint(publicKey: publicKey, host: host, port: port))
+            guard let endpoint = readEndpointBody() else { return nil }
+            endpoints.append(endpoint)
         }
         return endpoints
     }
@@ -452,15 +619,33 @@ private extension DataReader {
         var records: [ProviderRecord] = []
         records.reserveCapacity(min(Int(count), 64))
         for _ in 0..<count {
-            guard let publicKey = readString(),
-                  let host = readString(),
-                  let port = readUInt16(),
+            guard let endpoint = readEndpointBody(),
                   let expiresAt = readUInt64() else { return nil }
-            records.append(ProviderRecord(
-                endpoint: PeerEndpoint(publicKey: publicKey, host: host, port: port),
-                expiresAt: expiresAt))
+            records.append(ProviderRecord(endpoint: endpoint, expiresAt: expiresAt))
         }
         return records
+    }
+
+    mutating func readEndpointBody() -> PeerEndpoint? {
+        guard let publicKey = readString(),
+              let host = readString(),
+              let port = readUInt16(),
+              let transport = readTransportKind() else { return nil }
+        guard transport == .relay else {
+            return PeerEndpoint(publicKey: publicKey, host: host, port: port, transport: transport)
+        }
+        guard let carrierKey = readString() else { return nil }
+        return PeerEndpoint(
+            publicKey: publicKey,
+            host: host,
+            port: port,
+            transport: .relay,
+            carrierKey: carrierKey)
+    }
+
+    mutating func readTransportKind() -> TransportKind? {
+        guard let tag = readUInt8() else { return nil }
+        return TransportKind(rawValue: tag)
     }
 
     mutating func readStrings(max: UInt16) -> [String]? {

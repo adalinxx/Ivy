@@ -246,6 +246,24 @@ extension Ivy {
         let discovered = key.peerID
         guard discovered != localID else { return false }
 
+        if endpoint.transport == .relay {
+            // A carrier hint, not a socket: it is only usable where a provider
+            // record can carry it, and only if it names a usable third party.
+            guard case .referral(let referral) = provenance, referral.hasPrefix("provider"),
+                  config.mode.usesOverlayServices,
+                  let carrierText = endpoint.carrierKey,
+                  let carrier = try? PeerKey(carrierText),
+                  carrier != key,
+                  carrier != localKey,
+                  config.allowsEndpoint(carrier) else {
+                config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: unusable relay hint")
+                return false
+            }
+        } else if !hasTransport(endpoint.transport) {
+            config.logger.warning("Rejecting \(source) endpoint \(endpoint.publicKey.prefix(16))… from \(peer.publicKey.prefix(16))…: no \(endpoint.transport) transport installed")
+            return false
+        }
+
         let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty,
               host != "0.0.0.0",
