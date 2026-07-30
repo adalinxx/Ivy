@@ -22,6 +22,7 @@ final class QUICStreamConnection: TransportConnection, @unchecked Sendable {
     private var sink: (any TransportConnectionSink)?
     private var closed = false
     private var closeDelivered = false
+    private var pumpsStarted = false
     private var writable = true
     private var queuedBytes = 0
     private var pumps: [Task<Void, Never>] = []
@@ -58,16 +59,24 @@ final class QUICStreamConnection: TransportConnection, @unchecked Sendable {
     func attach(_ sink: any TransportConnectionSink) {
         // The stream can die between being handed over and the sink arriving; a
         // close that already happened must still reach it.
-        let alreadyClosed = lock.withLock { () -> Bool in
-            guard !closeDelivered else { return true }
+        enum Outcome { case alreadyClosed, start, alreadyAttached }
+        let outcome = lock.withLock { () -> Outcome in
+            guard !closeDelivered else { return .alreadyClosed }
+            guard !pumpsStarted else { return .alreadyAttached }
             self.sink = sink
-            return false
+            pumpsStarted = true
+            return .start
         }
-        guard !alreadyClosed else {
+        switch outcome {
+        case .alreadyClosed:
             sink.transportDidClose()
-            return
+        case .start:
+            startPumps()
+        case .alreadyAttached:
+            // A second sink would orphan the first and leave two readers
+            // competing for the same demand tokens.
+            break
         }
-        startPumps()
     }
 
     /// One delivery per request. `inbound` is a backpressured producer, so not
@@ -78,18 +87,21 @@ final class QUICStreamConnection: TransportConnection, @unchecked Sendable {
     }
 
     func send(_ payload: Data) {
-        let becameUnwritable = lock.withLock { () -> Bool in
-            guard !closed else { return false }
+        let outcome = lock.withLock { () -> (queued: Bool, becameUnwritable: Bool) in
+            guard !closed else { return (false, false) }
             let wasWritable = writable
             queuedBytes += payload.count
-            if wasWritable, queuedBytes >= Self.highWaterMark {
-                writable = false
-                return true
-            }
-            return false
+            let crossed = wasWritable && queuedBytes >= Self.highWaterMark
+            if crossed { writable = false }
+            return (true, crossed)
         }
+        // Nothing is queued once closed, so a late send cannot retain a payload
+        // on a connection whose pump has already gone.
+        guard outcome.queued else { return }
         outboundContinuation.yield(payload)
-        if becameUnwritable { currentSink?.transportWritabilityChanged(isWritable: false) }
+        if outcome.becameUnwritable {
+            currentSink?.transportWritabilityChanged(isWritable: false)
+        }
     }
 
     func close() {
@@ -124,21 +136,36 @@ final class QUICStreamConnection: TransportConnection, @unchecked Sendable {
                 do {
                     try await stream.send(ByteBuffer(bytes: payload))
                 } catch {
-                    break
+                    // A stream that will not take writes cannot carry the
+                    // session. Failing the connection is what releases the
+                    // peer's slot and frees anyone waiting on writability;
+                    // returning quietly would leave both stuck for good.
+                    self?.streamEnded()
+                    return
                 }
-                guard let self else { break }
+                guard let self else { return }
                 self.didSend(payload.count)
             }
         }
 
+        // Death has to be observable without being asked for. The read pump
+        // only looks at the stream while it holds demand, so a peer that dies
+        // while the session is busy would otherwise go unnoticed.
+        let connection = self.connection
+        let deathPump = Task { [weak self] in
+            await connection.waitUntilClosed()
+            self?.streamEnded()
+        }
+
         let started = lock.withLock { () -> Bool in
             guard !closed else { return false }
-            pumps = [readPump, writePump]
+            pumps = [readPump, writePump, deathPump]
             return true
         }
         if !started {
             readPump.cancel()
             writePump.cancel()
+            deathPump.cancel()
         }
     }
 
@@ -167,6 +194,7 @@ final class QUICStreamConnection: TransportConnection, @unchecked Sendable {
             guard !closed else { return nil }
             closed = true
             writable = false
+            queuedBytes = 0
             defer { self.pumps = [] }
             return self.pumps
         }

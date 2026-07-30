@@ -102,10 +102,13 @@ struct QUICTransportTests {
             transport: .quic))
 
         let listenerID = try #require(await dialer.connectedPeers.first)
-        let sent = (0..<8).map { index in
+        // Each record is larger than the initial flow-control window, so this
+        // only completes if credit is returned as the receiver consumes. A
+        // record that had to fit the window would deadlock here.
+        let sent = (0..<4).map { index in
             PeerMessage(
                 topic: "bulk-\(index)",
-                payload: Data(repeating: UInt8(index), count: 128 * 1024))
+                payload: Data(repeating: UInt8(index), count: 1024 * 1024))
         }
         for message in sent {
             var result = await dialer.sendMessage(
