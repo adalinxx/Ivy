@@ -448,10 +448,6 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         if invokeNow { handler() }
     }
 
-    func adoptInboundAdmission(_ lease: InboundAdmissionLease) {
-        stateLock.withLock { inboundAdmission = lease }
-    }
-
     func releaseInboundAdmission() {
         let lease = stateLock.withLock { () -> InboundAdmissionLease? in
             defer { inboundAdmission = nil }

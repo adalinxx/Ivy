@@ -142,7 +142,7 @@ public struct QUICTransport: IvyTransport {
                     let stream = parameters.channel
                     return stream.eventLoop.makeCompletedFuture {
                         // Reads happen only on demand, as on every transport.
-                        try stream.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
+                        try Self.disableAutoRead(on: stream)
                         let transportConnection = NIOTransportConnection(channel: stream)
                         try stream.pipeline.syncOperations.addHandler(
                             NIOTransportHandler(connection: transportConnection))
@@ -186,7 +186,7 @@ public struct QUICTransport: IvyTransport {
                             stream.eventLoop.makeCompletedFuture {
                                 // Reads stay parked until admission grants this
                                 // connection a slot and asks for them (IVY-001).
-                                try stream.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
+                                try Self.disableAutoRead(on: stream)
                                 let connection = NIOTransportConnection(channel: stream)
                                 try stream.pipeline.syncOperations.addHandler(
                                     NIOTransportHandler(connection: connection))
@@ -232,6 +232,16 @@ public struct QUICTransport: IvyTransport {
         return QUICListenerHandle(datagramChannel: datagramChannel, acceptor: acceptor)
     }
 
+    /// Parks reads until the layer above asks for them. A stream that cannot be
+    /// switched off autoRead would read from an unadmitted peer (IVY-001), so
+    /// that is a refusal to serve the stream rather than something to skip.
+    private static func disableAutoRead(on stream: Channel) throws {
+        guard let options = stream.syncOptions else {
+            throw QUICTransportError.demandReadsUnavailable
+        }
+        try options.setOption(ChannelOptions.autoRead, value: false)
+    }
+
     private func resolve(
         host: String,
         port: UInt16,
@@ -247,6 +257,7 @@ public struct QUICTransport: IvyTransport {
 enum QUICTransportError: Error, Equatable {
     case unexpectedStream
     case handshakeTimedOut
+    case demandReadsUnavailable
 }
 
 private func withDeadline<T: Sendable>(

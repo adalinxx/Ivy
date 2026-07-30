@@ -3728,6 +3728,15 @@ public actor Ivy {
                 transportConnection.close()
                 return
             }
+            // Reserve before building anything: a refused peer must not cost a
+            // connection's worth of state, and the lease has to be owned by the
+            // connection from birth so that closing it always gives the slot
+            // back (IVY-001).
+            let observedHost = transportConnection.observedHost
+            guard let lease = gate.reserve(observedHost: observedHost) else {
+                transportConnection.close()
+                return
+            }
             let connectionBudget = InboundByteBudget(
                 limit: PeerConnection.maxInboundBufferedBytes)
             // The peer is unidentified until it authenticates, but the transport
@@ -3740,17 +3749,16 @@ public actor Ivy {
                     port: 0,
                     transport: kind),
                 connection: transportConnection,
+                inboundAdmission: lease,
                 inboundByteBudget: inboundByteBudget,
                 connectionInboundByteBudget: connectionBudget,
                 isAccepted: true)
-            connection.observedHost = transportConnection.observedHost
+            connection.observedHost = observedHost
             Task { [weak self] in
-                guard let self,
-                      let lease = gate.reserve(observedHost: connection.observedHost) else {
+                guard let self else {
                     connection.cancel()
                     return
                 }
-                connection.adoptInboundAdmission(lease)
                 guard await self.registerInboundConnection(
                     connection,
                     generation: generation
