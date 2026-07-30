@@ -93,15 +93,9 @@ public struct QUICTransport: IvyTransport {
                 localAddress: localAddress,
                 eventLoopGroup: group)
         } catch {
-            // Sharing the listening port is best effort; an ordinary dial from
-            // an ephemeral port still punches, just without matching the
-            // mapping this node advertises.
-            //
-            // Today this always falls back: swift-quic binds the dialing socket
-            // but leaves it unconnected, so with the listener on the same port
-            // the handshake reply is demultiplexed to the listener and the dial
-            // times out. Binding *and connecting* the socket would fix it, since
-            // the connected 4-tuple wins that match.
+            // Sharing the listening port is best effort — another process may
+            // hold it — and an ordinary dial from an ephemeral port still
+            // punches, just without matching the mapping this node advertises.
             guard localAddress != nil else { throw error }
             connection = try await QUICClient.connect(
                 to: host,

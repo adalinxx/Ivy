@@ -63,7 +63,10 @@ struct QUICTransportTests {
             transport: .quic))
 
         #expect(await dialer.connectedPeers.count == 1)
-        #expect(await listener.connectedPeers.count == 1)
+        // The dial returns once the initiator is satisfied; the responder
+        // promotes its own session an actor hop later, so converge rather than
+        // assume the two happen together.
+        try await eventually { await listener.connectedPeers.count == 1 }
 
         await dialer.stop()
         await listener.stop()
@@ -129,14 +132,12 @@ struct QUICTransportTests {
         await listener.stop()
     }
 
-    /// A punch dial asked to leave from the listening port cannot do so yet:
-    /// swift-quic binds that socket without connecting it, so the handshake
-    /// reply is demultiplexed to the listener sharing the port and the attempt
-    /// times out. What must hold regardless is that the dial still completes
-    /// from an ephemeral port rather than failing outright — a punch that
-    /// misses its mapping is a worse route, not a dead one.
-    @Test("a hole-punch dial falls back rather than failing")
-    func holePunchDialFallsBack() async throws {
+    /// The mapping the peer sees has to be the one this node advertises, or a
+    /// punch lands on a port nothing is listening on. This works because the
+    /// dialing socket is connected to the remote, so its 4-tuple wins demux
+    /// against the listener sharing the port.
+    @Test("a hole-punch dial leaves from the port this node advertises")
+    func holePunchDialUsesAdvertisedPort() async throws {
         let group = MultiThreadedEventLoopGroup.singleton
         let transport = try QUICTransport(reusePort: true)
 
@@ -161,7 +162,7 @@ struct QUICTransportTests {
             group: group,
             boundToPort: listenPort)
         #expect(dialed.isActive)
-        #expect(dialed.localPort != nil)
+        #expect(dialed.localPort == listenPort)
 
         dialed.close()
         await listener.close()

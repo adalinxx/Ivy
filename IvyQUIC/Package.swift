@@ -12,7 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: ".."),
-        .package(url: "https://github.com/adalinxx/swift-quic", from: "0.8.0"),
+        .package(url: "https://github.com/adalinxx/swift-quic", from: "0.9.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
     ],
