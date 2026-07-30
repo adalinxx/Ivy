@@ -141,6 +141,9 @@ public actor Ivy {
     private let transports: [TransportKind: any IvyTransport]
 
     public weak var delegate: IvyDelegate?
+    /// Actor isolation makes the property itself unassignable from outside, so
+    /// this is the only way a consumer can install a delegate.
+    public func setDelegate(_ delegate: IvyDelegate?) { self.delegate = delegate }
     var contentSource: (any IvyContentSource)?
     public func setContentSource(_ source: IvyContentSource?) { contentSource = source }
 

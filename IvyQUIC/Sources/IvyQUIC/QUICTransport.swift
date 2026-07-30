@@ -3,9 +3,9 @@ import Ivy
 import Logging
 import NIOCore
 import NIOPosix
-import NIOQUIC
+import QUIC
 
-/// QUIC transport for Ivy, backed by SwiftNIO QUIC.
+/// QUIC transport for Ivy, backed by swift-quic.
 ///
 /// One QUIC connection carries exactly one bidirectional stream, and that stream
 /// carries the same length-prefixed session records the TCP transport carries, so
@@ -15,7 +15,6 @@ import NIOQUIC
 public struct QUICTransport: IvyTransport {
     public let kind: TransportKind = .quic
 
-    private let certificate: EphemeralCertificate
     private let alpn: String
     private let connectTimeout: Duration
     private let idleTimeout: Duration
@@ -43,7 +42,6 @@ public struct QUICTransport: IvyTransport {
         maxInboundConnections: Int = 256,
         logger: Logger = Logger(label: "ivy.quic")
     ) throws {
-        self.certificate = try EphemeralCertificate()
         self.alpn = alpn
         self.connectTimeout = connectTimeout
         self.idleTimeout = idleTimeout
@@ -55,27 +53,12 @@ public struct QUICTransport: IvyTransport {
 
     // Streams are capped at one bidirectional and no unidirectional stream, so a
     // peer cannot flood stream state on a connection Ivy treats as single-stream.
-    private func serverConfiguration() -> QUICConfiguration {
-        .server(
-            serverName: "ivy",
-            authenticationConfiguration: .x509Certificates(
-                certificateChainFilePath: certificate.certificateChainPath,
-                privateKeyFilePath: certificate.privateKeyPath),
-            applicationProtocols: [alpn],
-            maxIdleTimeout: idleTimeout,
-            initialMaxStreamsBidi: 1,
-            initialMaxStreamsUni: 0,
-            sendRetry: sendRetry)
-    }
-
-    private func clientConfiguration() -> QUICConfiguration {
-        .client(
-            verificationConfiguration: .x509Certificates(trustRootsFilePath: nil),
-            applicationProtocols: [alpn],
-            maxIdleTimeout: idleTimeout,
-            initialMaxStreamsBidi: 1,
-            initialMaxStreamsUni: 0,
-            peerCertificateVerification: .noVerification)
+    private func transportConfiguration() -> QUICTransportConfiguration {
+        var configuration = QUICTransportConfiguration()
+        configuration.maxIdleTimeout = idleTimeout
+        configuration.maxBidirectionalStreams = 1
+        configuration.maxUnidirectionalStreams = 0
+        return configuration
     }
 
     /// - Parameter boundToPort: Local UDP port to dial from, so a hole punch
@@ -86,76 +69,53 @@ public struct QUICTransport: IvyTransport {
         group: any EventLoopGroup,
         boundToPort: UInt16?
     ) async throws -> any TransportConnection {
-        let remote = try await resolve(host: host, port: port, group: group)
-        let configuration = clientConfiguration()
-        let logger = self.logger
+        var configuration = QUICClient.Configuration(applicationProtocols: [alpn])
+        // Peer identity comes from the signed session handshake, so the
+        // certificate here is unverified transport plumbing.
+        configuration.certificateVerification = .none
+        configuration.transport = transportConfiguration()
+        configuration.connectTimeout = connectTimeout
+        configuration.logger = logger
 
-        func bind(to localPort: UInt16) async throws -> (Channel, QUICHandler.ConnectionMultiplexer<Never>) {
-            var bootstrap = DatagramBootstrap(group: group)
-                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            if localPort != 0, reusePort {
-                bootstrap = bootstrap
-                    .channelOption(ChannelOptions.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
-            }
-            return try await bootstrap
-            .bind(host: "0.0.0.0", port: Int(localPort)) { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    let (handler, multiplexer) = try QUICHandler.makeHandlerAndConnectionMultiplexer(
-                        channel: channel,
-                        quicConfiguration: configuration,
-                        logger: logger,
-                        inboundStreamChannelInitializer: { stream -> EventLoopFuture<Never> in
-                            // A dialer never expects the peer to open a stream.
-                            stream.close(promise: nil)
-                            return stream.eventLoop.makeFailedFuture(QUICTransportError.unexpectedStream)
-                        })
-                    try channel.pipeline.syncOperations.addHandler(handler)
-                    return (channel, multiplexer)
-                }
-            }
+        let localAddress: SocketAddress?
+        if let boundToPort, boundToPort != 0, reusePort {
+            localAddress = try? SocketAddress(ipAddress: "0.0.0.0", port: Int(boundToPort))
+        } else {
+            localAddress = nil
         }
 
-        let (datagramChannel, multiplexer): (Channel, QUICHandler.ConnectionMultiplexer<Never>)
-        if let boundToPort, boundToPort != 0, reusePort {
-            do {
-                (datagramChannel, multiplexer) = try await bind(to: boundToPort)
-            } catch {
-                // Sharing the listening port is best effort; an ordinary dial from
-                // an ephemeral port still punches, just without matching the
-                // mapping this node advertises.
-                (datagramChannel, multiplexer) = try await bind(to: 0)
-            }
-        } else {
-            (datagramChannel, multiplexer) = try await bind(to: 0)
+        let connection: QUICConnection
+        do {
+            connection = try await QUICClient.connect(
+                to: host,
+                port: Int(port),
+                configuration: configuration,
+                localAddress: localAddress,
+                eventLoopGroup: group)
+        } catch {
+            // Sharing the listening port is best effort; an ordinary dial from
+            // an ephemeral port still punches, just without matching the
+            // mapping this node advertises.
+            //
+            // Today this always falls back: swift-quic binds the dialing socket
+            // but leaves it unconnected, so with the listener on the same port
+            // the handshake reply is demultiplexed to the listener and the dial
+            // times out. Binding *and connecting* the socket would fix it, since
+            // the connected 4-tuple wins that match.
+            guard localAddress != nil else { throw error }
+            connection = try await QUICClient.connect(
+                to: host,
+                port: Int(port),
+                configuration: configuration,
+                localAddress: nil,
+                eventLoopGroup: group)
         }
 
         do {
-            return try await withDeadline(connectTimeout) {
-                let connection = try await multiplexer.createNewConnection(
-                    serverName: host,
-                    remoteAddress: remote
-                ) { stream -> EventLoopFuture<Never> in
-                    stream.close(promise: nil)
-                    return stream.eventLoop.makeFailedFuture(QUICTransportError.unexpectedStream)
-                }
-                return try await connection.createBidirectionalStream { parameters in
-                    let stream = parameters.channel
-                    return stream.eventLoop.makeCompletedFuture {
-                        // Reads happen only on demand, as on every transport.
-                        try Self.disableAutoRead(on: stream)
-                        let transportConnection = NIOTransportConnection(channel: stream)
-                        try stream.pipeline.syncOperations.addHandler(
-                            NIOTransportHandler(connection: transportConnection))
-                        // Tearing down the stream must tear down the connection it
-                        // rides on, so a closed session releases its UDP socket.
-                        try stream.pipeline.syncOperations.addHandler(
-                            QUICStreamLifecycleHandler(datagramChannel: datagramChannel))
-                        return transportConnection
-                    }
-                }
-            }
+            let stream = try await connection.openBidirectionalStream()
+            return QUICStreamConnection(connection: connection, stream: stream)
         } catch {
-            datagramChannel.close(promise: nil)
+            await connection.close()
             throw error
         }
     }
@@ -166,128 +126,55 @@ public struct QUICTransport: IvyTransport {
         group: any EventLoopGroup,
         onConnection: @Sendable @escaping (any TransportConnection) -> Void
     ) async throws -> any TransportListenerHandle {
-        let configuration = serverConfiguration()
-        let logger = self.logger
+        let selfSigned = try QUICIdentity.selfSigned(commonName: "ivy")
+        var configuration = QUICServer.Configuration(
+            identity: selfSigned.identity,
+            applicationProtocols: [alpn])
+        configuration.serverName = "ivy"
+        configuration.sendRetry = sendRetry
+        configuration.transport = transportConfiguration()
+        configuration.logger = logger
 
-        var listenerBootstrap = DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        if reusePort {
-            listenerBootstrap = listenerBootstrap
-                .channelOption(ChannelOptions.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
-        }
-        let (datagramChannel, multiplexer) = try await listenerBootstrap
-            .bind(host: host, port: Int(port)) { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    let (handler, multiplexer) = try QUICHandler.makeHandlerAndConnectionMultiplexer(
-                        channel: channel,
-                        quicConfiguration: configuration,
-                        logger: logger,
-                        inboundStreamChannelInitializer: { stream -> EventLoopFuture<NIOTransportConnection> in
-                            stream.eventLoop.makeCompletedFuture {
-                                // Reads stay parked until admission grants this
-                                // connection a slot and asks for them (IVY-001).
-                                try Self.disableAutoRead(on: stream)
-                                let connection = NIOTransportConnection(channel: stream)
-                                try stream.pipeline.syncOperations.addHandler(
-                                    NIOTransportHandler(connection: connection))
-                                return connection
-                            }
-                        })
-                    try channel.pipeline.syncOperations.addHandler(handler)
-                    return (channel, multiplexer)
-                }
-            }
+        let server = try await QUICServer.bind(
+            host: host,
+            port: Int(port),
+            configuration: configuration,
+            eventLoopGroup: group)
 
         let live = InboundConnectionCount(limit: maxInboundConnections)
+        let logger = self.logger
         let acceptor = Task {
             await withDiscardingTaskGroup { group in
-                for await connection in multiplexer.inboundConnections {
+                for await connection in server.connections {
                     // A QUIC connection only reaches Ivy's admission gate once it
                     // opens a stream, so bound how many this transport services
-                    // before then. swift-nio-quic 0.1.0 exposes no way to close a
-                    // connection, so one over the limit is left to its idle timeout
-                    // rather than torn down.
+                    // before then.
                     guard live.acquire() else {
                         logger.warning("Not servicing a QUIC connection: at the inbound limit")
+                        await connection.close()
                         continue
                     }
                     group.addTask {
                         defer { live.release() }
                         var accepted = false
-                        for await stream in connection.inboundStreams {
+                        for await stream in connection.incomingStreams {
                             // One stream per connection; anything further is a
                             // protocol violation and costs the peer its connection.
                             guard !accepted else {
-                                stream.close()
+                                await stream.close()
                                 continue
                             }
                             accepted = true
-                            onConnection(stream)
+                            onConnection(QUICStreamConnection(
+                                connection: connection,
+                                stream: stream))
                         }
                     }
                 }
             }
         }
 
-        return QUICListenerHandle(datagramChannel: datagramChannel, acceptor: acceptor)
-    }
-
-    /// Parks reads until the layer above asks for them. A stream that cannot be
-    /// switched off autoRead would read from an unadmitted peer (IVY-001), so
-    /// that is a refusal to serve the stream rather than something to skip.
-    private static func disableAutoRead(on stream: Channel) throws {
-        guard let options = stream.syncOptions else {
-            throw QUICTransportError.demandReadsUnavailable
-        }
-        try options.setOption(ChannelOptions.autoRead, value: false)
-    }
-
-    private func resolve(
-        host: String,
-        port: UInt16,
-        group: any EventLoopGroup
-    ) async throws -> SocketAddress {
-        if let literal = try? SocketAddress(ipAddress: host, port: Int(port)) { return literal }
-        return try await group.next().submit {
-            try SocketAddress.makeAddressResolvingHost(host, port: Int(port))
-        }.get()
-    }
-}
-
-enum QUICTransportError: Error, Equatable {
-    case unexpectedStream
-    case handshakeTimedOut
-    case demandReadsUnavailable
-}
-
-private func withDeadline<T: Sendable>(
-    _ duration: Duration,
-    operation: @escaping @Sendable () async throws -> T
-) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask { try await operation() }
-        group.addTask {
-            try await Task.sleep(for: duration)
-            throw QUICTransportError.handshakeTimedOut
-        }
-        defer { group.cancelAll() }
-        return try await group.next()!
-    }
-}
-
-/// Closes the QUIC connection's UDP socket once its stream goes away.
-private final class QUICStreamLifecycleHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
-
-    private let datagramChannel: Channel
-
-    init(datagramChannel: Channel) {
-        self.datagramChannel = datagramChannel
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        datagramChannel.close(promise: nil)
-        context.fireChannelInactive()
+        return QUICListenerHandle(server: server, acceptor: acceptor)
     }
 }
 
@@ -315,20 +202,21 @@ final class InboundConnectionCount: @unchecked Sendable {
 }
 
 struct QUICListenerHandle: TransportListenerHandle {
-    let datagramChannel: Channel
+    let server: QUICServer
     let acceptor: Task<Void, Never>
 
     var localPort: UInt16? {
-        datagramChannel.localAddress?.port.map(UInt16.init)
+        server.localAddress.port.map(UInt16.init)
     }
 
     func close() async {
         acceptor.cancel()
-        try? await datagramChannel.close().get()
+        await server.close()
     }
 
     func closeImmediately() {
         acceptor.cancel()
-        datagramChannel.close(promise: nil)
+        let server = self.server
+        Task { await server.close() }
     }
 }
