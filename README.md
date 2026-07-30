@@ -95,11 +95,12 @@ partial success. `servedBy` identifies the authenticated remote endpoint and is
 `nil` for a local result. The caller validates identifiers and bytes before
 storage.
 
-Selections must fit one fixed 4 MiB frame body. Larger application objects must
-be split by caller-defined boundaries.
+Selections must fit one frame body — 4 MiB by default, or the larger size a
+connection negotiates when both peers raise their local `protocolMaxFrameSize`.
+Larger application objects must be split by caller-defined boundaries.
 
 `fetchVolume(rootCID:)` is the complete-boundary counterpart. Ivy streams one
-Volume across ordered 4 MiB frames, up to 64 MiB and 65,535 entries, and returns
+Volume across ordered frames (4 MiB each by default), up to 64 MiB and 65,535 entries, and returns
 only after the whole archive is present. This does not make Ivy a DAG layer:
 the caller still validates every identifier and byte before storage.
 

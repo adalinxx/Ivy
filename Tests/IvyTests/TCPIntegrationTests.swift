@@ -55,7 +55,8 @@ enum TransportTestHarness {
         allowPrivateHolePunchCandidates: Bool = false,
         logger: any IvyLogger = NullLogger(),
         holePunchEnabled: Bool = true,
-        privateContentExchangeEnabled: Bool = false
+        privateContentExchangeEnabled: Bool = false,
+        protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
@@ -71,6 +72,7 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
+            protocolMaxFrameSize: protocolMaxFrameSize,
             externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
             holePunchEnabled: holePunchEnabled,
@@ -334,6 +336,50 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
+    @Test("a single authenticated frame above 4 MiB crosses TCP once both peers raise the limit")
+    func largeNegotiatedFrameCrossesTCP() async throws {
+        let bigFrame: UInt32 = 8 * 1024 * 1024
+        let serverIdentity = TransportTestHarness.identity("tcp-bigframe-server")
+        let clientIdentity = TransportTestHarness.identity("tcp-bigframe-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let clientPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity, port: serverPort, protocolMaxFrameSize: bigFrame))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity, port: clientPort, protocolMaxFrameSize: bigFrame))
+        let serverRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+        await client.setTestDelegate(TransportTestRecorder())
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        #expect(try await TransportTestHarness.eventually {
+            let serverCount = await server.peerConnectionCount
+            let clientCount = await client.peerConnectionCount
+            return serverCount == 1 && clientCount == 1
+        })
+
+        // 5 MiB — above the 4 MiB default, below the negotiated 8 MiB. Without the
+        // negotiation wired into serialize/deserialize AND the connection budgets,
+        // this frame is dropped on encode or rejected on decode/reservation.
+        let payload = Data(repeating: 0x5A, count: 5 * 1024 * 1024)
+        _ = await client.sendMessage(
+            to: TransportTestHarness.key(serverIdentity).peerID,
+            topic: "big-frame",
+            payload: payload)
+
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.receivedMessage(
+                topic: "big-frame",
+                payload: payload,
+                from: TransportTestHarness.key(clientIdentity).peerID)
+        })
+
+        await client.stop()
+        await server.stop()
+    }
+
     @Test("a solicited Volume reply survives responder admission exhaustion")
     func solicitedVolumeReplyBypassesOutboundAdmission() async throws {
         let serverIdentity = TransportTestHarness.identity("volume-reply-server")
@@ -419,7 +465,7 @@ struct TCPIntegrationTests {
         await client.setTestDelegate(clientRecorder)
         let rootBytes = Data(
             repeating: 0xa5,
-            count: Int(IvyConfig.protocolMaxFrameSize) + 1
+            count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
         )
         let childBytes = Data("child".utf8)
         await server.setContentSource(TransportVolumeSource(entries: [
@@ -472,7 +518,7 @@ struct TCPIntegrationTests {
                 cid: "root",
                 data: Data(
                     repeating: 0xa5,
-                    count: Int(IvyConfig.protocolMaxFrameSize) + 1
+                    count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
                 )
             ),
         ]))
@@ -1119,7 +1165,7 @@ struct TCPIntegrationTests {
         let clientPort = TransportTestHarness.nextPort()
         let budget = try #require(Message.contentResponseDataBudget(
             for: ["root"],
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: IvyConfig.defaultProtocolMaxFrameSize,
             relayed: false))
         let source = TransportTestContentSource([
             "root": Data(repeating: 0xaa, count: budget + 1),
