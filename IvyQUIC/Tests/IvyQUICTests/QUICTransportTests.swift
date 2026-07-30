@@ -169,6 +169,53 @@ struct QUICTransportTests {
         await peer.close()
     }
 
+    /// Tearing down while records are still in flight is where a close race
+    /// shows up: the read pump, the write pump, and the session teardown all
+    /// run at once. The surviving end must settle rather than hang or trap.
+    ///
+    /// The idle timeout is deliberately short here because it is what bounds
+    /// this: a QUIC peer that stops answering sends no FIN, so the stream ends
+    /// only when the idle timer fires, and the session — with its admission
+    /// slot — is held until then. On TCP the same teardown is immediate.
+    @Test("a QUIC session torn down mid-transfer settles on both ends")
+    func teardownDuringTransfer() async throws {
+        let listenerIdentity = identity("quic-teardown-listener")
+        let dialerIdentity = identity("quic-teardown-dialer")
+
+        let listener = Ivy(
+            config: config(listenerIdentity, port: 0),
+            transports: [try QUICTransport(idleTimeout: .seconds(2))])
+        let dialer = Ivy(
+            config: config(dialerIdentity, port: 0),
+            transports: [try QUICTransport(idleTimeout: .seconds(2))])
+
+        try await listener.start()
+        try await dialer.start()
+
+        let port = try #require(await listener.boundPort(for: .quic))
+        let listenerKey = try PeerKey(
+            rawRepresentation: listenerIdentity.publicKey.rawRepresentation)
+        try await dialer.connect(to: PeerEndpoint(
+            publicKey: listenerKey.hex,
+            host: "127.0.0.1",
+            port: port,
+            transport: .quic))
+        let listenerID = try #require(await dialer.connectedPeers.first)
+
+        // Keep records moving, then pull the listener out from under them.
+        for index in 0..<16 {
+            _ = await dialer.sendMessage(
+                to: listenerID,
+                topic: "teardown-\(index)",
+                payload: Data(repeating: 0xAB, count: 64 * 1024))
+        }
+        await listener.stop()
+
+        try await eventually { await dialer.connectedPeers.isEmpty }
+        await dialer.stop()
+        #expect(await dialer.connectedPeers.isEmpty)
+    }
+
     private func eventually(
         timeout: Duration = .seconds(5),
         _ condition: @Sendable () async -> Bool
