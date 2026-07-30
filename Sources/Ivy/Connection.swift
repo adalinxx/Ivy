@@ -126,23 +126,6 @@ struct InboundFrame: Sendable {
     }
 }
 
-/// Carries the connection built inside a transport's channel initializer back to the dialer.
-private final class DialedConnectionBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var connection: PeerConnection?
-
-    func store(_ connection: PeerConnection) {
-        lock.withLock { self.connection = connection }
-    }
-
-    func take() -> PeerConnection? {
-        lock.withLock {
-            defer { connection = nil }
-            return connection
-        }
-    }
-}
-
 private final class WritabilityWaiter: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Bool, Never>?
@@ -172,7 +155,6 @@ private final class WritabilityWaiter: @unchecked Sendable {
 
 final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     static let maxInboundBufferedRecords = 4
-    static let maxInboundBufferedBytes = 2 * Int(IvyConfig.protocolMaxFrameSize) + 4
 
     let connectionID = UUID()
     var endpoint: PeerEndpoint
@@ -180,6 +162,19 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     /// Whether this node accepted the connection rather than dialing it. Fixed at
     /// construction, so it cannot race with session bookkeeping.
     let isAccepted: Bool
+    /// Max frame the PEER advertised it will accept (set from the handshake
+    /// metadata). Outbound frames are capped here so we never send more than the
+    /// peer will take. Defaults to the protocol default until the handshake lands.
+    var peerMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
+    /// Max frame THIS node accepts inbound on this connection (the operator's
+    /// configured `protocolMaxFrameSize`). Bounds `feedRecord`, the frame
+    /// accumulator, and the connection byte budget so all three scale with the
+    /// configured size, not the default.
+    let localMaxFrameSize: UInt32
+    /// Inbound byte budget that holds one maximum local frame plus its header.
+    static func inboundByteBudgetLimit(for maxFrameSize: UInt32) -> Int {
+        2 * Int(maxFrameSize) + 4
+    }
 
     enum Transport {
         case direct(any TransportConnection)
@@ -245,16 +240,18 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
         connectionInboundByteBudget: InboundByteBudget? = nil,
-        isAccepted: Bool = false
+        isAccepted: Bool = false,
+        localMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) {
         self.endpoint = endpoint
         self.isAccepted = isAccepted
         self.transport = .direct(connection)
         self.writable = connection.isWritable
         self.inboundAdmission = inboundAdmission
+        self.localMaxFrameSize = localMaxFrameSize
         self.inboundByteBudget = inboundByteBudget
         let connectionBudget = connectionInboundByteBudget
-            ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
+            ?? InboundByteBudget(limit: Self.inboundByteBudgetLimit(for: localMaxFrameSize))
         self.connectionInboundByteBudget = connectionBudget
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
         // Unbounded because demand bounds it: reads stop while frames are
@@ -262,8 +259,10 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         // every byte of which is charged to the budgets.
         (self.inbound, self.inboundContinuation) = AsyncStream<InboundFrame>.makeStream(
             bufferingPolicy: .unbounded)
+        // The operator's configured cap, not the protocol default: a node that
+        // accepts smaller frames must also refuse to buffer larger ones.
         self.accumulator = FrameAccumulator(
-            maxFrameSize: IvyConfig.protocolMaxFrameSize,
+            maxFrameSize: localMaxFrameSize,
             budgets: [connectionBudget, inboundByteBudget])
         connection.attach(self)
     }
@@ -277,7 +276,8 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
         connectionInboundByteBudget: InboundByteBudget? = nil,
-        isAccepted: Bool = false
+        isAccepted: Bool = false,
+        localMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) {
         let transportConnection = NIOTransportConnection(channel: channel)
         self.init(
@@ -286,7 +286,8 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
             inboundAdmission: inboundAdmission,
             inboundByteBudget: inboundByteBudget,
             connectionInboundByteBudget: connectionInboundByteBudget,
-            isAccepted: isAccepted)
+            isAccepted: isAccepted,
+            localMaxFrameSize: localMaxFrameSize)
         // Not `syncOperations`: the caller may not be on the channel's loop.
         channel.pipeline.addHandler(
             NIOTransportHandler(connection: transportConnection),
@@ -302,15 +303,17 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         inboundByteBudget: InboundByteBudget = InboundByteBudget(
             limit: IvyConfig.defaultMaxInboundBufferedBytes),
         connectionInboundByteBudget: InboundByteBudget? = nil,
-        isAccepted: Bool = false
+        isAccepted: Bool = false,
+        localMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) {
         self.endpoint = endpoint
         self.isAccepted = isAccepted
         self.transport = .relayed(routeID: routeID, carrier: carrier)
         self.writable = false
+        self.localMaxFrameSize = localMaxFrameSize
         self.inboundByteBudget = inboundByteBudget
         self.connectionInboundByteBudget = connectionInboundByteBudget
-            ?? InboundByteBudget(limit: Self.maxInboundBufferedBytes)
+            ?? InboundByteBudget(limit: Self.inboundByteBudgetLimit(for: localMaxFrameSize))
         self.inboundBufferLimit = Self.maxInboundBufferedRecords
         // Unbounded at the stream; `feedFrame` enforces the relayed record cap,
         // since a relayed peer has no socket to backpressure.
@@ -323,7 +326,8 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         transport: any IvyTransport,
         group: EventLoopGroup,
         inboundByteBudget: InboundByteBudget,
-        boundToPort: UInt16? = nil
+        boundToPort: UInt16? = nil,
+        maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
     ) async throws -> PeerConnection {
         let transportConnection = try await transport.dial(
             host: endpoint.host,
@@ -333,20 +337,22 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         let connection = PeerConnection(
             endpoint: endpoint,
             connection: transportConnection,
-            inboundByteBudget: inboundByteBudget)
+            inboundByteBudget: inboundByteBudget,
+            localMaxFrameSize: maxFrameSize)
         connection.observedHost = transportConnection.observedHost
         return connection
     }
 
     @discardableResult
     func sendRecord(_ record: SessionWireRecord) -> SendResult {
-        sendSerializedRecord(record.serialize())
+        // Serialize up to what the peer advertised it will accept (negotiated).
+        sendSerializedRecord(record.serialize(maxPayload: peerMaxFrameSize))
     }
 
     @discardableResult
     func sendSerializedRecord(_ payload: Data) -> SendResult {
         guard !payload.isEmpty,
-              payload.count <= Int(IvyConfig.protocolMaxFrameSize) else {
+              payload.count <= Int(peerMaxFrameSize) else {
             return .locallyRejected
         }
         switch sendReadiness() {
@@ -463,7 +469,7 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         let reservation = InboundByteReservation(
             budgets: [connectionInboundByteBudget, inboundByteBudget])
         guard !data.isEmpty,
-              data.count <= Int(IvyConfig.protocolMaxFrameSize),
+              data.count <= Int(localMaxFrameSize),
               reservation.acquire(data.count) else {
             cancel()
             return false
@@ -591,7 +597,7 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
     private var accumulator: FrameAccumulator
 
     init(
-        maxFrameSize: UInt32 = IvyConfig.protocolMaxFrameSize,
+        maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         budget: InboundByteBudget,
         connectionBudget: InboundByteBudget
     ) {

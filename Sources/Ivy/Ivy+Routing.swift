@@ -60,7 +60,7 @@ extension Ivy {
                     [LookupRoute(
                         endpoint: entry.endpoint,
                         source: .authenticated)] + (routesByKey[entry.id.publicKey] ?? []),
-                    preferred: preferred)
+                    preferred: preferred, maxRoutesPerIdentity: config.maxRoutesPerIdentity)
             }
 
             let candidates = closestCandidateEntries(candidatesByKey.values, to: targetHash)
@@ -80,7 +80,7 @@ extension Ivy {
                 for entry in batch where !hasEndpointSession(entry.id) {
                     let selected = selectedLookupRoutes(
                         routesByKey[entry.id.publicKey] ?? [],
-                        preferred: nil)
+                        preferred: nil, maxRoutesPerIdentity: config.maxRoutesPerIdentity)
                     routesByKey[entry.id.publicKey] = selected
                     let routes = selected.isEmpty ? [entry.endpoint] : selected.map(\.endpoint)
                     group.addTask { [weak self] in
@@ -154,7 +154,7 @@ extension Ivy {
                         oldRoutes + [LookupRoute(
                             endpoint: endpoint,
                             source: .referral(source.publicKey))],
-                        preferred: preferredRoutes[id.publicKey])
+                        preferred: preferredRoutes[id.publicKey], maxRoutesPerIdentity: config.maxRoutesPerIdentity)
                     routesByKey[id.publicKey] = newRoutes
                     if !hasEndpointSession(id), newRoutes != oldRoutes {
                         queried.remove(id.publicKey)
@@ -177,7 +177,7 @@ extension Ivy {
                 [LookupRoute(
                     endpoint: entry.endpoint,
                     source: .authenticated)] + (routesByKey[entry.id.publicKey] ?? []),
-                preferred: preferred)
+                preferred: preferred, maxRoutesPerIdentity: config.maxRoutesPerIdentity)
         }
         let currentRoutes = Dictionary(uniqueKeysWithValues: router.allPeers().filter {
             hasEndpointSession($0.id)
@@ -187,7 +187,7 @@ extension Ivy {
         return closestCandidateEntries(candidatesByKey.values, to: targetHash).map { entry in
             let selected = selectedLookupRoutes(
                 routesByKey[entry.id.publicKey] ?? [],
-                preferred: currentRoutes[entry.id.publicKey])
+                preferred: currentRoutes[entry.id.publicKey], maxRoutesPerIdentity: config.maxRoutesPerIdentity)
             return currentRoutes[entry.id.publicKey]
                 ?? selected.first?.endpoint
                 ?? entry.endpoint
@@ -434,7 +434,8 @@ extension Ivy {
 
 func selectedLookupRoutes(
     _ routes: [LookupRoute],
-    preferred: PeerEndpoint?
+    preferred: PeerEndpoint?,
+    maxRoutesPerIdentity: Int
 ) -> [LookupRoute] {
     var unique: [PeerEndpoint: LookupRoute] = [:]
     for route in routes where unique[route.endpoint] == nil { unique[route.endpoint] = route }
@@ -449,9 +450,9 @@ func selectedLookupRoutes(
             ($0.endpoint.host, $0.endpoint.port) < ($1.endpoint.host, $1.endpoint.port)
         }
     }
-    for index in 0..<Ivy.maxRoutesPerIdentity {
+    for index in 0..<maxRoutesPerIdentity {
         for source in bySource.keys.sorted()
-            where selected.count < Ivy.maxRoutesPerIdentity {
+            where selected.count < maxRoutesPerIdentity {
             let alternatives = bySource[source] ?? []
             if alternatives.indices.contains(index) { selected.append(alternatives[index]) }
         }
