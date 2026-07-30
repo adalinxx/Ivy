@@ -216,6 +216,8 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     /// reaches zero, so a slow consumer stops the peer at the socket instead of
     /// letting frames pile up here (the stream itself is unbounded).
     private var unconsumedFrames = 0
+    /// Whether a read has been asked for and not yet answered.
+    private var readOutstanding = false
     private let inbound: AsyncStream<InboundFrame>
     private let inboundContinuation: AsyncStream<InboundFrame>.Continuation
 
@@ -502,16 +504,28 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     /// drained everything already delivered, which is what stops a peer from
     /// outrunning a slow consumer.
     func recordConsumed() {
-        let requestMore = stateLock.withLock { () -> Bool in
-            unconsumedFrames -= 1
-            return unconsumedFrames == 0 && !closed
+        stateLock.withLock { unconsumedFrames -= 1 }
+        requestMoreBytes()
+    }
+
+    /// Asks the transport for one more delivery, and only ever one: a request is
+    /// outstanding until it is answered. Both the delivery path and the consumer
+    /// can observe an empty queue for the same delivery, and without this they
+    /// would each ask, letting read-ahead drift upward with every race.
+    private func requestMoreBytes() {
+        let shouldRequest = stateLock.withLock { () -> Bool in
+            guard !closed, !readOutstanding, unconsumedFrames == 0 else { return false }
+            readOutstanding = true
+            return true
         }
-        if requestMore { directConnection?.requestBytes() }
+        if shouldRequest { directConnection?.requestBytes() }
     }
 
     // MARK: - TransportConnectionSink
 
     func transportDidReceive(_ bytes: Data) {
+        // This delivery answers the outstanding request.
+        stateLock.withLock { readOutstanding = false }
         let outcome = stateLock.withLock { () -> FrameAccumulator.Outcome in
             guard accumulator != nil else { return .incomplete }
             return accumulator!.consume(bytes) { frame in
@@ -532,8 +546,7 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
         // Ask for the next delivery only while the consumer has nothing waiting;
         // otherwise `recordConsumed` re-arms the read once it drains, so a slow
         // session stops the peer rather than letting frames pile up.
-        let requestMore = stateLock.withLock { unconsumedFrames == 0 && !closed }
-        if requestMore { directConnection?.requestBytes() }
+        requestMoreBytes()
     }
 
     func transportWritabilityChanged(isWritable: Bool) {
@@ -548,7 +561,7 @@ final class PeerConnection: TransportConnectionSink, @unchecked Sendable {
     /// Begins reading. Called once admission has granted this connection a slot,
     /// so nothing is read from an unadmitted peer (IVY-001).
     func startReading() {
-        directConnection?.requestBytes()
+        requestMoreBytes()
     }
 
     func connectionClosed() {
