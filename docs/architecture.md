@@ -23,8 +23,21 @@ inbound cap can be raised for proxy-fronted nodes, where every inbound peer
 shares one address, without loosening the outbound cap. The outbound cap keeps
 one address block, which can offer unlimited free identities, from holding every
 dial. Inbound peers do not count against it, so they cannot block dials into
-their netgroup. Configured bootstrap peers and carriers are exempt from the
-outbound cap but count toward it.
+their netgroup. A session counts as outbound when this node dialed it: that
+includes a session the dialed peer completes inbound while the dial is in
+flight, and one that replaces an outbound session.
+
+Dials made from configuration (bootstrap peers and carriers) are exempt from the
+outbound cap but still count toward it. The exemption belongs to the configured
+endpoint, not the key: a referral naming a configured key at another address is
+capped like any other dial.
+
+Netgroup caps count direct connections only. A relayed session has no socket
+address of its own, so it is not counted in either direction; relay route limits
+bound it instead, at `maxRelayRoutesPerPeer` (8) routes per carrier and
+`maxRelayRoutes` (64) in total. Outbound relay uses only operator-configured
+carriers, and a direct dial that fails may fall back to it. Inbound route offers
+are accepted from any directly connected peer, within the same limits.
 
 A pending socket is absent from routing, delegates, content, and application
 messages. Promotion requires a signed transcript over both identities, fresh
