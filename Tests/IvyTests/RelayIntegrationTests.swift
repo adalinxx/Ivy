@@ -714,7 +714,8 @@ struct RelayIntegrationTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 1,
-            maxConnectionsPerNetgroup: 1))
+            maxInboundConnectionsPerNetgroup: 1,
+            maxOutboundConnectionsPerNetgroup: 1))
         let existing = PeerEndpoint(
             publicKey: deterministicTestPeerKey("relay-cap-existing"),
             host: "127.0.0.1",

@@ -37,7 +37,7 @@ struct InboundAdmissionTests {
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 2,
             reservedOutboundConnectionSlots: 1,
-            maxConnectionsPerNetgroup: 2))
+            maxInboundConnectionsPerNetgroup: 2))
         try await ivy.start()
         let port = try #require(await ivy.serverChannel?.localAddress?.port)
 
@@ -102,7 +102,7 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 3,
-            maxConnectionsPerNetgroup: 1))
+            maxOutboundConnectionsPerNetgroup: 1))
         let replacedEndpoint = PeerEndpoint(
             publicKey: deterministicTestPeerKey("replacement-netgroup-peer"),
             host: "10.1.0.1",
@@ -156,7 +156,7 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 3,
-            maxConnectionsPerNetgroup: 1,
+            maxInboundConnectionsPerNetgroup: 1,
             externalAddress: ("127.0.0.1", port)))
         try await ivy.start()
         let generation = await ivy.runGeneration
@@ -239,7 +239,7 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 1,
-            maxConnectionsPerNetgroup: 1,
+            maxOutboundConnectionsPerNetgroup: 1,
             externalAddress: ("127.0.0.1", port)))
         let first = TransportTestHarness.endpoint(firstIdentity, port: 4001)
         let second = TransportTestHarness.endpoint(secondIdentity, port: 4002)
@@ -557,7 +557,7 @@ struct InboundAdmissionTests {
         await ivy.stop()
     }
 
-    @Test("inbound handshakes and outbound reservations share one netgroup cap")
+    @Test("inbound handshakes and outbound reservations use independent netgroup caps")
     func mixedDirectionNetgroupAdmission() async throws {
         let identity = TransportTestHarness.identity("mixed-netgroup-node")
         let port = TransportTestHarness.nextPort()
@@ -567,7 +567,8 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 4,
-            maxConnectionsPerNetgroup: 1,
+            maxInboundConnectionsPerNetgroup: 1,
+            maxOutboundConnectionsPerNetgroup: 1,
             externalAddress: ("127.0.0.1", port)))
         try await ivy.start()
         let generation = await ivy.runGeneration
@@ -577,23 +578,31 @@ struct InboundAdmissionTests {
             port: 4001)
         #expect(await ivy.reserveOutgoingDial(to: first))
 
-        let rejected = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
-            .connect(host: "127.0.0.1", port: Int(port)).get()
-        #expect(try await TransportTestHarness.eventually { !rejected.isActive })
-
-        await ivy.finishOutgoingDial(
-            to: PeerID(publicKey: first.publicKey),
-            generation: generation)
+        // An outbound reservation into 127.0/16 does not consume inbound room.
         let admitted = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connect(host: "127.0.0.1", port: Int(port)).get()
         #expect(try await TransportTestHarness.eventually {
             await ivy.pendingSessionCountForTesting == 1
         })
+        let rejected = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .connect(host: "127.0.0.1", port: Int(port)).get()
+        #expect(try await TransportTestHarness.eventually { !rejected.isActive })
+
+        // The outbound cap is still enforced on its own count...
         let second = PeerEndpoint(
             publicKey: deterministicTestPeerKey("mixed-netgroup-second"),
             host: "127.0.0.3",
             port: 4002)
         #expect(!(await ivy.reserveOutgoingDial(to: second)))
+
+        // ...and an inbound peer holding the netgroup cannot block our dials into it.
+        await ivy.finishOutgoingDial(
+            to: PeerID(publicKey: first.publicKey),
+            generation: generation)
+        #expect(await ivy.reserveOutgoingDial(to: second))
+        await ivy.finishOutgoingDial(
+            to: PeerID(publicKey: second.publicKey),
+            generation: generation)
         try? await admitted.close().get()
         await ivy.stop()
     }
@@ -610,7 +619,8 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 2,
-            maxConnectionsPerNetgroup: 4,
+            maxInboundConnectionsPerNetgroup: 4,
+            maxOutboundConnectionsPerNetgroup: 4,
             externalAddress: ("127.0.0.1", sourcePort)))
         let peer = Ivy(config: TransportTestHarness.config(peerIdentity, port: peerPort))
         try await peer.start()
@@ -651,7 +661,7 @@ struct InboundAdmissionTests {
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: 4,
-            maxConnectionsPerNetgroup: 1))
+            maxOutboundConnectionsPerNetgroup: 1))
         let first = PeerEndpoint(
             publicKey: TransportTestHarness.key(firstIdentity).hex,
             host: "first.example",
