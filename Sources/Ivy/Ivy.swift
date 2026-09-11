@@ -102,6 +102,9 @@ private struct PendingOutgoingDial {
     let generation: UInt64
     var cancelled = false
     var connectionID: UUID? = nil
+    /// Dialed from operator configuration (a bootstrap peer or carrier), so
+    /// exempt from the outbound netgroup cap at reservation and at bind.
+    var configured = false
 }
 
 struct PendingReconnect {
@@ -530,7 +533,8 @@ public actor Ivy {
 
     func connectEndpointIfAdmitted(
         to routes: [PeerEndpoint],
-        requiredGeneration: UInt64? = nil
+        requiredGeneration: UInt64? = nil,
+        configured: Bool = false
     ) async throws -> Bool {
         guard let endpoint = routes.first else { throw IvyError.invalidPeerKey }
         guard let key = try? PeerKey(endpoint.publicKey) else { throw IvyError.invalidPeerKey }
@@ -549,7 +553,8 @@ public actor Ivy {
                     to: route,
                     key: key,
                     role: .endpoint,
-                    generation: generation
+                    generation: generation,
+                    configured: configured
                 ) {
                     return true
                 }
@@ -577,7 +582,8 @@ public actor Ivy {
             to: endpoint,
             key: key,
             role: .carrier,
-            generation: generation
+            generation: generation,
+            configured: true
         ) else {
             throw IvyError.identityVerificationFailed
         }
@@ -587,12 +593,13 @@ public actor Ivy {
         to endpoint: PeerEndpoint,
         key: PeerKey,
         role: AuthenticatedPeerRole,
-        generation: UInt64
+        generation: UInt64,
+        configured: Bool
     ) async throws -> Bool {
         guard !reconnectSuppressed.contains(key.peerID) else { return false }
         if sessions[key]?.role == role,
            sessions[key]?.connection.isLive == true { return true }
-        guard reserveOutgoingDial(to: endpoint) else {
+        guard reserveOutgoingDial(to: endpoint, configured: configured) else {
             return sessions[key]?.role == role && sessions[key]?.connection.isLive == true
         }
 
@@ -677,14 +684,19 @@ public actor Ivy {
         return true
     }
 
-    func reserveOutgoingDial(to endpoint: PeerEndpoint) -> Bool {
+    /// `configured` marks a dial made from operator configuration. Only those
+    /// skip the outbound netgroup cap: the key alone is unauthenticated here, so
+    /// a configured key offered at another address (a referral) is capped like
+    /// any other dial.
+    func reserveOutgoingDial(to endpoint: PeerEndpoint, configured: Bool = false) -> Bool {
         guard let key = try? PeerKey(endpoint.publicKey),
               sessions[key] == nil,
               outgoingDials[key.peerID] == nil,
               pendingPeerConnectionWaiters[key] == nil,
               connectionCapacityUsed < config.maxConnections else { return false }
 
-        guard config.isConfiguredPeer(key)
+        let exempt = configured && config.isConfiguredPeer(key)
+        guard exempt
                 || outboundConnectionCount(inNetgroup: NetGroup.group(endpoint.host))
                     < config.maxOutboundConnectionsPerNetgroup else {
             return false
@@ -692,7 +704,8 @@ public actor Ivy {
 
         outgoingDials[key.peerID] = PendingOutgoingDial(
             endpoint: PeerEndpoint(publicKey: key.hex, host: endpoint.host, port: endpoint.port),
-            generation: runGeneration)
+            generation: runGeneration,
+            configured: exempt)
         return true
     }
 
@@ -710,7 +723,7 @@ public actor Ivy {
                 port: dial.endpoint.port)
         }
         outgoingDials[peer] = dial
-        return (try? PeerKey(peer.publicKey)).map(config.isConfiguredPeer) == true
+        return dial.configured
             || outboundConnectionCount(inNetgroup: NetGroup.group(dial.endpoint.host))
                 <= config.maxOutboundConnectionsPerNetgroup
     }
@@ -962,7 +975,8 @@ public actor Ivy {
         if role == .endpoint {
             if (try? await connectEndpointIfAdmitted(
                 to: endpoints,
-                requiredGeneration: generation)) == true {
+                requiredGeneration: generation,
+                configured: true)) == true {
                 return
             }
         } else {
@@ -1361,9 +1375,14 @@ public actor Ivy {
 
         // Role is local policy: configured carrier identities stay carrier-only.
         let role: AuthenticatedPeerRole = config.isConfiguredCarrier(peerKey) ? .carrier : .endpoint
+        // A responder session still counts as outbound when it answers a dial we
+        // have in flight to this peer or replaces an outbound session. Otherwise a
+        // dialed peer could complete inbound instead (stalling our hello, or
+        // winning the session tie-break) and free outbound netgroup room.
         let isInbound: Bool
         if case .responder = pending.direction {
-            isInbound = true
+            isInbound = outgoingDials[peerKey.peerID] == nil
+                && sessions[peerKey].map(\.isInbound) != false
         } else {
             isInbound = false
         }
@@ -3289,6 +3308,7 @@ public actor Ivy {
 
     func seedResponderAwaitingFinishForTesting(
         _ endpoint: PeerEndpoint,
+        connection suppliedConnection: PeerConnection? = nil,
         marker: UInt8
     ) throws -> UUID {
         let peer = try PeerKey(endpoint.publicKey)
@@ -3314,7 +3334,7 @@ public actor Ivy {
                 responderNonce: nonce,
                 metadata: encodedMetadata),
             signature: Data(repeating: marker, count: 64))
-        let connection = PeerConnection(
+        let connection = suppliedConnection ?? PeerConnection(
             endpoint: endpoint,
             routeID: Data(repeating: marker, count: 32),
             carrier: peer,
