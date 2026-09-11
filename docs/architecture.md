@@ -18,6 +18,14 @@ reads begin. Rejected sockets cannot buffer protocol input while waiting for the
 Ivy actor. Capacity is a hard cap: Ivy rejects excess peers rather than evicting
 an authenticated connection by reputation.
 
+Netgroup caps are per direction, keyed on the observed socket address. The
+inbound cap can be raised for proxy-fronted nodes, where every inbound peer
+shares one address, without loosening the outbound cap. The outbound cap keeps
+one address block, which can offer unlimited free identities, from holding every
+dial. Inbound peers do not count against it, so they cannot block dials into
+their netgroup. Configured bootstrap peers and carriers are exempt from the
+outbound cap but count toward it.
+
 A pending socket is absent from routing, delegates, content, and application
 messages. Promotion requires a signed transcript over both identities, fresh
 nonces, route binding, and bounded metadata, followed by the initiator's signed

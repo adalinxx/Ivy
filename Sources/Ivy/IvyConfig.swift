@@ -8,6 +8,14 @@ public struct IvyConfig: Sendable {
     /// node never sends a frame larger than the peer advertised it will accept).
     public static let defaultProtocolMaxFrameSize: UInt32 = 4 * 1024 * 1024
     public static let defaultMaxConnections = 256
+    /// Outbound dials this node will hold into one netgroup. Outbound peers are
+    /// the ones a node chooses to learn the chain from, so they must not be
+    /// concentrable in one address block: with free peer identities, a single
+    /// host could otherwise answer every dial. Two (not Bitcoin Core's one)
+    /// leaves room for two honest nodes sharing a cloud /16 while still forcing
+    /// an attacker to acquire N/2 distinct netgroups to hold N outbound slots.
+    /// Operator-configured bootstrap peers and carriers are exempt.
+    public static let defaultMaxOutboundConnectionsPerNetgroup = 2
     public static let defaultMaxInboundBufferedBytes = 64 * 1024 * 1024
     public static let defaultMaxRoutesPerIdentity = 3
     public static let defaultMaxProviderTTLSeconds: UInt64 = 24 * 60 * 60
@@ -39,7 +47,15 @@ public struct IvyConfig: Sendable {
     public let maxConnections: Int
     /// Slots held back from inbound handshakes so an outbound configured peer can connect.
     public let reservedOutboundConnectionSlots: Int
-    public let maxConnectionsPerNetgroup: Int
+    /// Inbound connections admitted per observed netgroup. Separate from the
+    /// outbound cap because an L4 proxy presents every inbound peer from one
+    /// address, so proxy-fronted nodes must raise this without weakening
+    /// outbound diversity.
+    public let maxInboundConnectionsPerNetgroup: Int
+    /// Outbound connections held per netgroup; see
+    /// `defaultMaxOutboundConnectionsPerNetgroup`. Configured bootstrap peers
+    /// and carriers are exempt, but still count against the netgroup.
+    public let maxOutboundConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
     public let maxWaitersPerRequest: Int
     public let maxConcurrentContentRequests: Int
@@ -76,7 +92,8 @@ public struct IvyConfig: Sendable {
         logger: any IvyLogger = NullLogger(),
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         reservedOutboundConnectionSlots: Int = 0,
-        maxConnectionsPerNetgroup: Int = 2,
+        maxInboundConnectionsPerNetgroup: Int = 2,
+        maxOutboundConnectionsPerNetgroup: Int = IvyConfig.defaultMaxOutboundConnectionsPerNetgroup,
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
         maxConcurrentContentRequests: Int = 64,
@@ -112,7 +129,8 @@ public struct IvyConfig: Sendable {
         self.logger = logger
         self.maxConnections = maxConnections
         self.reservedOutboundConnectionSlots = reservedOutboundConnectionSlots
-        self.maxConnectionsPerNetgroup = maxConnectionsPerNetgroup
+        self.maxInboundConnectionsPerNetgroup = maxInboundConnectionsPerNetgroup
+        self.maxOutboundConnectionsPerNetgroup = maxOutboundConnectionsPerNetgroup
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
         self.maxConcurrentContentRequests = maxConcurrentContentRequests
@@ -128,7 +146,8 @@ public struct IvyConfig: Sendable {
 
     public func validate() throws {
         guard maxConnections > 0,
-              maxConnectionsPerNetgroup > 0,
+              maxInboundConnectionsPerNetgroup > 0,
+              maxOutboundConnectionsPerNetgroup > 0,
               maxPendingRequests > 0,
               maxWaitersPerRequest > 0,
               maxConcurrentContentRequests > 0,
@@ -246,6 +265,10 @@ public struct IvyConfig: Sendable {
 
     func allowsEndpoint(_ key: PeerKey) -> Bool {
         key != peerKey && mode.allowsEndpoint(key) && !isConfiguredCarrier(key)
+    }
+
+    func isConfiguredPeer(_ key: PeerKey) -> Bool {
+        isConfiguredCarrier(key) || bootstrapPeers.contains { (try? PeerKey($0.publicKey)) == key }
     }
 
     var maxInboundConnections: Int {

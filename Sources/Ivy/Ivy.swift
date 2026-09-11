@@ -50,6 +50,8 @@ final class AuthenticatedSession: @unchecked Sendable {
     let role: AuthenticatedPeerRole
     let sessionID: SessionID
     let metadata: PeerMetadata
+    /// Whether the remote side opened this session; netgroup caps are per direction.
+    let isInbound: Bool
     var sequenceState = SessionSequenceState()
     var didNotifyConnect = false
 
@@ -58,13 +60,15 @@ final class AuthenticatedSession: @unchecked Sendable {
         peerKey: PeerKey,
         role: AuthenticatedPeerRole,
         sessionID: SessionID,
-        metadata: PeerMetadata
+        metadata: PeerMetadata,
+        isInbound: Bool
     ) {
         self.connection = connection
         self.peerKey = peerKey
         self.role = role
         self.sessionID = sessionID
         self.metadata = metadata
+        self.isInbound = isInbound
     }
 }
 
@@ -472,10 +476,15 @@ public actor Ivy {
         return endpointSession(for: key)?.connection.isLive == true
     }
 
-    func connectionCount(inNetgroup group: String, excluding peer: PeerID?) -> Int {
+    func connectionCount(
+        inNetgroup group: String,
+        inbound: Bool,
+        excluding peer: PeerID?
+    ) -> Int {
         let excluded = peer.flatMap { try? PeerKey($0.publicKey) }
         return sessions.values.filter { session in
             session.peerKey != excluded
+                && session.isInbound == inbound
                 && session.connection.isDirect
                 && connectionNetgroup(session.connection) == group
         }.count
@@ -675,9 +684,9 @@ public actor Ivy {
               pendingPeerConnectionWaiters[key] == nil,
               connectionCapacityUsed < config.maxConnections else { return false }
 
-        let targetGroup = NetGroup.group(endpoint.host)
-        guard directConnectionCount(inNetgroup: targetGroup)
-                < config.maxConnectionsPerNetgroup else {
+        guard config.isConfiguredPeer(key)
+                || outboundConnectionCount(inNetgroup: NetGroup.group(endpoint.host))
+                    < config.maxOutboundConnectionsPerNetgroup else {
             return false
         }
 
@@ -701,8 +710,9 @@ public actor Ivy {
                 port: dial.endpoint.port)
         }
         outgoingDials[peer] = dial
-        return directConnectionCount(inNetgroup: NetGroup.group(dial.endpoint.host))
-            <= config.maxConnectionsPerNetgroup
+        return (try? PeerKey(peer.publicKey)).map(config.isConfiguredPeer) == true
+            || outboundConnectionCount(inNetgroup: NetGroup.group(dial.endpoint.host))
+                <= config.maxOutboundConnectionsPerNetgroup
     }
 
     @discardableResult
@@ -986,17 +996,34 @@ public actor Ivy {
         sessions.count + pendingSessions.count + unrepresentedOutgoingDials.count
     }
 
-    private func directConnectionCount(inNetgroup group: String) -> Int {
+    /// Direct connections we opened into `group`: authenticated, handshaking,
+    /// and dials not yet represented by a connection.
+    private func outboundConnectionCount(inNetgroup group: String) -> Int {
         let authenticated = sessions.values.lazy.filter {
-            $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
+            !$0.isInbound && $0.connection.isDirect
+                && self.connectionNetgroup($0.connection) == group
         }.count
         let pending = pendingSessions.values.lazy.filter {
-            $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
+            guard case .initiator = $0.direction else { return false }
+            return $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
         }.count
         let reserved = unrepresentedOutgoingDials.lazy.filter {
             NetGroup.group($0.endpoint.host) == group
         }.count
         return authenticated + pending + reserved
+    }
+
+    /// Direct connections the remote side opened from `group`.
+    private func inboundConnectionCount(inNetgroup group: String) -> Int {
+        let authenticated = sessions.values.lazy.filter {
+            $0.isInbound && $0.connection.isDirect
+                && self.connectionNetgroup($0.connection) == group
+        }.count
+        let pending = pendingSessions.values.lazy.filter {
+            guard case .responder = $0.direction else { return false }
+            return $0.connection.isDirect && self.connectionNetgroup($0.connection) == group
+        }.count
+        return authenticated + pending
     }
 
     @discardableResult
@@ -1006,8 +1033,8 @@ public actor Ivy {
               connection.isLive,
               connectionCapacityUsed < config.maxInboundConnections,
               (!connection.isDirect
-                || directConnectionCount(inNetgroup: netgroup)
-                    < config.maxConnectionsPerNetgroup) else {
+                || inboundConnectionCount(inNetgroup: netgroup)
+                    < config.maxInboundConnectionsPerNetgroup) else {
             connection.cancel()
             return false
         }
@@ -1334,13 +1361,20 @@ public actor Ivy {
 
         // Role is local policy: configured carrier identities stay carrier-only.
         let role: AuthenticatedPeerRole = config.isConfiguredCarrier(peerKey) ? .carrier : .endpoint
+        let isInbound: Bool
+        if case .responder = pending.direction {
+            isInbound = true
+        } else {
+            isInbound = false
+        }
 
         let session = AuthenticatedSession(
             connection: pending.connection,
             peerKey: peerKey,
             role: role,
             sessionID: sessionID,
-            metadata: metadata)
+            metadata: metadata,
+            isInbound: isInbound)
         let existing = sessions[peerKey]
 
         if let existing,
@@ -1353,12 +1387,6 @@ public actor Ivy {
             return
         }
 
-        let isInbound: Bool
-        if case .responder = pending.direction {
-            isInbound = true
-        } else {
-            isInbound = false
-        }
         if !canPromote(
             pending.connection,
             peerKey: peerKey,
@@ -1442,10 +1470,15 @@ public actor Ivy {
         if sessions[peerKey] == nil, sessions.count >= limit {
             return false
         }
-        return !connection.isDirect
-            || connectionCount(
-                inNetgroup: connectionNetgroup(connection),
-                excluding: peerKey.peerID) < config.maxConnectionsPerNetgroup
+        guard connection.isDirect else { return true }
+        if !isInbound, config.isConfiguredPeer(peerKey) { return true }
+        let cap = isInbound
+            ? config.maxInboundConnectionsPerNetgroup
+            : config.maxOutboundConnectionsPerNetgroup
+        return connectionCount(
+            inNetgroup: connectionNetgroup(connection),
+            inbound: isInbound,
+            excluding: peerKey.peerID) < cap
     }
 
     private func firstAdvertisedListenEndpoint(
@@ -3051,6 +3084,7 @@ public actor Ivy {
         _ endpoint: PeerEndpoint,
         connection suppliedConnection: PeerConnection? = nil,
         role: AuthenticatedPeerRole = .endpoint,
+        isInbound: Bool = false,
         marker: UInt8
     ) throws {
         running = true
@@ -3066,7 +3100,8 @@ public actor Ivy {
             peerKey: peerKey,
             role: role,
             sessionID: try SessionID(bytes: Data(repeating: marker, count: 32)),
-            metadata: PeerMetadata())
+            metadata: PeerMetadata(),
+            isInbound: isInbound)
         sessions[peerKey] = session
     }
 
@@ -3235,7 +3270,8 @@ public actor Ivy {
             peerKey: peerKey,
             role: .endpoint,
             sessionID: try! SessionID(bytes: Data(repeating: sessionMarker, count: 32)),
-            metadata: PeerMetadata())
+            metadata: PeerMetadata(),
+            isInbound: false)
         running = true
         sessions[session.peerKey] = session
         await handleContentRequest(
@@ -3326,7 +3362,7 @@ public actor Ivy {
     ) async throws -> (channel: Channel, gate: InboundAdmissionGate) {
         let gate = InboundAdmissionGate(
             maxConnections: config.maxInboundConnections,
-            maxConnectionsPerNetgroup: config.maxConnectionsPerNetgroup)
+            maxConnectionsPerNetgroup: config.maxInboundConnectionsPerNetgroup)
         let inboundByteBudget = self.inboundByteBudget
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(.backlog, value: 256)
