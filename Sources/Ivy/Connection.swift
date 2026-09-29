@@ -65,19 +65,34 @@ final class InboundAdmissionLease: @unchecked Sendable {
     deinit { release() }
 }
 
+/// Wakes a paused `SessionFrameDecoder` when budget it waits on is released.
+final class InboundBudgetWaiter: Sendable {
+    let wake: @Sendable () -> Void
+
+    init(wake: @escaping @Sendable () -> Void) {
+        self.wake = wake
+    }
+}
+
 final class InboundByteBudget: @unchecked Sendable {
     private let lock = NSLock()
     let limit: Int
     private var used = 0
+    private var waiters: [ObjectIdentifier: InboundBudgetWaiter] = [:]
 
     init(limit: Int) {
         self.limit = limit
     }
 
-    fileprivate func reserve(_ byteCount: Int) -> Bool {
+    /// Reserves `byteCount`, or registers `waiter` to be woken on the next
+    /// release. Check and registration share the lock, so no release is missed.
+    fileprivate func reserve(_ byteCount: Int, waiter: InboundBudgetWaiter?) -> Bool {
         guard byteCount >= 0 else { return false }
         return lock.withLock {
-            guard byteCount <= limit - used else { return false }
+            guard byteCount <= limit - used else {
+                if let waiter { waiters[ObjectIdentifier(waiter)] = waiter }
+                return false
+            }
             used += byteCount
             return true
         }
@@ -86,7 +101,17 @@ final class InboundByteBudget: @unchecked Sendable {
     var currentUsage: Int { lock.withLock { used } }
 
     fileprivate func release(_ byteCount: Int) {
-        lock.withLock { used -= byteCount }
+        let woken = lock.withLock { () -> [InboundBudgetWaiter] in
+            used -= byteCount
+            guard byteCount > 0, !waiters.isEmpty else { return [] }
+            defer { waiters.removeAll() }
+            return Array(waiters.values)
+        }
+        for waiter in woken { waiter.wake() }
+    }
+
+    fileprivate func cancelWait(_ waiter: InboundBudgetWaiter) {
+        lock.withLock { _ = waiters.removeValue(forKey: ObjectIdentifier(waiter)) }
     }
 }
 
@@ -98,10 +123,12 @@ final class InboundByteReservation: @unchecked Sendable {
         self.budgets = budgets
     }
 
-    func acquire(_ count: Int) -> Bool {
+    /// All-or-nothing across every budget. On failure `waiter`, if given, is
+    /// registered with the budget that refused, to be woken when it frees.
+    func acquire(_ count: Int, waiter: InboundBudgetWaiter? = nil) -> Bool {
         var acquired: [InboundByteBudget] = []
         for budget in budgets {
-            guard budget.reserve(count) else {
+            guard budget.reserve(count, waiter: waiter) else {
                 for budget in acquired { budget.release(count) }
                 return false
             }
@@ -476,9 +503,23 @@ final class PeerConnection: @unchecked Sendable {
     }
 }
 
-final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+/// Decodes length-prefixed frames, reserving each byte against the connection
+/// and global inbound budgets until the consumer releases its frame.
+///
+/// An exhausted budget is backpressure, not a violation: the decoder stops
+/// consuming input, keeps the undecoded bytes, and withholds `read()` so the
+/// socket is not read further and TCP holds the sender. When a reservation is
+/// released the decoder resumes, then forwards a withheld read. Only malformed
+/// framing (a zero or over-`maxFrameSize` length) closes the connection.
+///
+/// Memory per connection is the reserved bytes (at most the connection budget)
+/// plus the undecoded carry-over, which is at most what one socket read event
+/// already had in flight when the decoder paused.
+final class SessionFrameDecoder: ChannelDuplexHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = InboundFrame
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
 
     private let maxFrameSize: UInt32
     private let budget: InboundByteBudget
@@ -488,6 +529,18 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
     private var expectedBodyLength: Int?
     private var body = Data()
     private var bodyReservation: InboundByteReservation?
+    private var context: ChannelHandlerContext?
+    private var waiter: InboundBudgetWaiter?
+    /// Received bytes not yet decoded because the budget was exhausted.
+    private var carryOver: ByteBuffer?
+    private var paused = false
+    private var readWithheld = false
+
+#if DEBUG || IVY_TESTING
+    /// Called on the event loop whenever the decoder pauses or buffers input
+    /// while paused, with the undecoded carry-over byte count.
+    var onPausedForTesting: ((_ carryOverBytes: Int) -> Void)?
+#endif
 
     init(
         maxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
@@ -500,24 +553,72 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
         header.reserveCapacity(4)
     }
 
+    func handlerAdded(context: ChannelHandlerContext) {
+        self.context = context
+        let eventLoop = context.eventLoop
+        waiter = InboundBudgetWaiter { [weak self] in
+            guard let self else { return }
+            eventLoop.execute { self.budgetReleased() }
+        }
+    }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var incoming = unwrapInboundIn(data)
+        if carryOver == nil {
+            carryOver = incoming
+        } else {
+            carryOver!.writeBuffer(&incoming)
+        }
+        if paused {
+            reportPaused()
+            return
+        }
+        decode(context: context)
+    }
+
+    func read(context: ChannelHandlerContext) {
+        if paused {
+            readWithheld = true
+        } else {
+            context.read()
+        }
+    }
+
+    private func budgetReleased() {
+        guard paused, let context else { return }
+        paused = false
+        if decode(context: context) {
+            context.fireChannelReadComplete()
+        }
+        if !paused, readWithheld {
+            readWithheld = false
+            context.read()
+        }
+    }
+
+    /// Decodes the carry-over until it is empty, the budget is exhausted, or
+    /// the framing is malformed. Returns whether any frame was delivered.
+    @discardableResult
+    private func decode(context: ChannelHandlerContext) -> Bool {
+        guard var incoming = carryOver else { return false }
+        carryOver = nil
+        var delivered = false
 
         while incoming.readableBytes > 0 {
             if expectedBodyLength == nil {
                 if header.isEmpty {
                     let reservation = InboundByteReservation(
                         budgets: [connectionBudget, budget])
-                    guard reservation.acquire(4) else {
-                        close(context)
-                        return
+                    guard reservation.acquire(4, waiter: waiter) else {
+                        pause(keeping: incoming)
+                        return delivered
                     }
                     headerReservation = reservation
                 }
                 let count = min(4 - header.count, incoming.readableBytes)
-                guard let bytes = incoming.readBytes(length: count) else { return }
+                guard let bytes = incoming.readBytes(length: count) else { return delivered }
                 header.append(contentsOf: bytes)
-                guard header.count == 4 else { return }
+                guard header.count == 4 else { return delivered }
 
                 let length = UInt32(header[0]) << 24
                     | UInt32(header[1]) << 16
@@ -525,7 +626,7 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
                     | UInt32(header[3])
                 guard length > 0, length <= maxFrameSize else {
                     close(context)
-                    return
+                    return delivered
                 }
                 expectedBodyLength = Int(length)
                 bodyReservation = InboundByteReservation(
@@ -537,24 +638,41 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
             guard let expectedBodyLength,
                   let bodyReservation else { continue }
             let count = min(expectedBodyLength - body.count, incoming.readableBytes)
-            guard bodyReservation.acquire(count) else {
-                close(context)
-                return
+            guard bodyReservation.acquire(count, waiter: waiter) else {
+                pause(keeping: incoming)
+                return delivered
             }
-            guard let bytes = incoming.readData(length: count) else { return }
+            guard let bytes = incoming.readData(length: count) else { return delivered }
             body.append(bytes)
-            guard body.count == expectedBodyLength else { return }
+            guard body.count == expectedBodyLength else { return delivered }
 
             let frame = InboundFrame(bytes: body, reservation: bodyReservation)
             body = Data()
             self.bodyReservation = nil
             self.expectedBodyLength = nil
+            delivered = true
             context.fireChannelRead(wrapInboundOut(frame))
+            // A downstream handler may have closed the channel re-entrantly.
+            guard context.channel.isActive else { return delivered }
         }
+        return delivered
+    }
+
+    private func pause(keeping incoming: ByteBuffer) {
+        carryOver = incoming
+        paused = true
+        reportPaused()
+    }
+
+    private func reportPaused() {
+#if DEBUG || IVY_TESTING
+        onPausedForTesting?(carryOver?.readableBytes ?? 0)
+#endif
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
         reset()
+        self.context = nil
     }
 
     func channelInactive(context: ChannelHandlerContext) {
@@ -573,6 +691,13 @@ final class SessionFrameDecoder: ChannelInboundHandler, RemovableChannelHandler,
         expectedBodyLength = nil
         body = Data()
         bodyReservation = nil
+        carryOver = nil
+        paused = false
+        readWithheld = false
+        if let waiter {
+            connectionBudget.cancelWait(waiter)
+            budget.cancelWait(waiter)
+        }
     }
 }
 

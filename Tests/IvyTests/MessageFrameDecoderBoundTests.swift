@@ -155,11 +155,17 @@ struct MessageFrameDecoderBoundTests {
         #expect(budget.currentUsage == 8)
         #expect(connectionBudget.currentUsage == 8)
 
+        // Exhaustion is backpressure: the byte waits unreserved, the
+        // connection stays open, and the reservation never exceeds its limit.
         var finalByte = channel.allocator.buffer(capacity: 1)
         finalByte.writeInteger(UInt8(0xaa))
-        _ = try? channel.writeInbound(finalByte)
-        #expect(!channel.isActive)
+        try channel.writeInbound(finalByte)
+        #expect(channel.isActive)
         #expect(collector.records.isEmpty)
+        #expect(budget.currentUsage == 8)
+        #expect(connectionBudget.currentUsage == 8)
+
+        _ = try channel.finish()
         #expect(budget.currentUsage == 0)
         #expect(connectionBudget.currentUsage == 0)
     }
