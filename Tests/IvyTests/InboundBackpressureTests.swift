@@ -293,6 +293,44 @@ struct InboundBackpressureTests {
         #expect(slowReceived == slowFrames)
     }
 
+    @Test("a connection paused on the global budget resumes when another connection releases")
+    func globalBudgetReleaseWakesAnotherConnection() async throws {
+        // Room for one connection's two held frames plus two headers, so the
+        // second connection's first body is refused by the GLOBAL budget.
+        let server = try await Server.open(budget: InboundByteBudget(limit: 2 * Int(maxFrameSize) + 8))
+        defer { _ = server.listener.close() }
+        let (aClient, a) = try await server.connect()
+        defer { _ = aClient.close() }
+        let aPaused = Latch()
+        try await a.onPaused { _ in aPaused.open() }
+        let aGate = Latch()
+        let aFrames = (0..<4).map(frame)
+        let aConsumer = a.consume(aFrames.count, gate: aGate)
+        try await aClient.writeAndFlush(framed(aFrames, allocator: aClient.allocator)).get()
+        try await withinDeadline("a pause") { await aPaused.wait() }
+
+        let (bClient, b) = try await server.connect()
+        defer { _ = bClient.close() }
+        let bPaused = Latch()
+        try await b.onPaused { _ in bPaused.open() }
+        let bFrames = (10..<20).map(frame)
+        let bConsumer = b.consume(bFrames.count, gate: nil)
+        try await bClient.writeAndFlush(framed(bFrames, allocator: bClient.allocator)).get()
+        try await withinDeadline("b pause") { await bPaused.wait() }
+        #expect(b.channel.isActive)
+        // B holds nothing, so its refusal came from the global budget, which
+        // A's two held frames fill beyond room for another frame body.
+        #expect(b.connectionBudget.currentUsage == 0)
+        #expect(server.budget.currentUsage == a.connectionBudget.currentUsage)
+        #expect(server.budget.currentUsage + Int(maxFrameSize) > server.budget.limit)
+
+        aGate.open()
+        let bReceived = try await withinDeadline("b frames") { try await bConsumer.value }
+        #expect(bReceived == bFrames)
+        let aReceived = try await withinDeadline("a frames") { try await aConsumer.value }
+        #expect(aReceived == aFrames)
+    }
+
     @Test("a paused decoder withholds socket reads and forwards one when budget frees")
     func pausedDecoderWithholdsReads() throws {
         let connectionBudget = InboundByteBudget(
