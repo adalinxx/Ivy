@@ -480,7 +480,8 @@ struct ProviderRefreshTests {
                         publicKey: peer.publicKey,
                         host: "8.\(identity / 256).\(identity % 256).\(route + 1)",
                         port: UInt16(4000 + route)),
-                    expiresAt: expiry)
+                    expiresAt: expiry,
+                    source: peer)
             }
         }
 
