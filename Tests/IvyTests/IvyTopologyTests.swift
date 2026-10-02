@@ -74,6 +74,9 @@ struct IvyTopologyTests {
             try IvyConfig(signingKey: identity(1), maxProviderTTLSeconds: 0).validate()
         }
         #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
+            try IvyConfig(signingKey: identity(1), maxProviderRecordsPerPeer: 0).validate()
+        }
+        #expect(throws: IvyModeError.invalidConfiguration(invalidMessage)) {
             try IvyConfig(signingKey: identity(1), maxInFlightVolumeBytes: 0).validate()
         }
         // A frame too small to carry the largest handshake record breaks every

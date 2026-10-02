@@ -197,6 +197,9 @@ public actor Ivy {
     static let kademliaLookupParallelism = 3
 
     var providerHints: [String: [ProviderHint]] = [:]
+    /// Per remote source: roots holding its provider records, and how many.
+    var providerRecordsBySource: [PeerID: [String: Int]] = [:]
+    var providerRecordTotal = 0
     static let maxProviderRoots = 10_000
     var deficientPeerSuppression: [String: [String: ContinuousClock.Instant]] = [:]
     static let deficiencySuppressionWindow: Duration = .seconds(30)

@@ -5,6 +5,9 @@ struct ProviderHint: Sendable, Equatable {
     let peer: PeerID
     let endpoint: PeerEndpoint?
     let expiresAt: UInt64
+    /// The authenticated peer whose quota this record counts against: the
+    /// announcer, or the responder that referred it.
+    let source: PeerID
 }
 
 struct PendingProviderQuery {
@@ -74,7 +77,8 @@ extension Ivy {
             accepted.append(ProviderHint(
                 peer: key.peerID,
                 endpoint: canonical,
-                expiresAt: record.expiresAt))
+                expiresAt: record.expiresAt,
+                source: peer))
         }
 
         pending.responsesByPeer[peer.publicKey] = boundedProviderHints(accepted)
@@ -92,7 +96,8 @@ extension Ivy {
             rootCID: rootCID,
             peer: peer,
             endpoint: providerEndpoint(for: peer),
-            expiresAt: expiresAt)
+            expiresAt: expiresAt,
+            source: peer)
     }
 
     public func announceProvider(rootCID: String, expiresAt: UInt64) {
@@ -104,7 +109,8 @@ extension Ivy {
                 rootCID: rootCID,
                 peer: localID,
                 endpoint: endpoint,
-                expiresAt: expiresAt)
+                expiresAt: expiresAt,
+                source: localID)
         }
         let message = Message.announceProvider(rootCID: rootCID, expiresAt: expiresAt)
         for entry in router.closestPeers(to: Router.hash(rootCID), count: config.kBucketSize)
@@ -233,7 +239,8 @@ extension Ivy {
                 rootCID: rootCID,
                 peer: hint.peer,
                 endpoint: hint.endpoint,
-                expiresAt: hint.expiresAt)
+                expiresAt: hint.expiresAt,
+                source: hint.source)
         }
         let endpoints = hints.compactMap(\.endpoint)
         for continuation in pending.continuations.values {
@@ -301,31 +308,86 @@ extension Ivy {
             rootCID: rootCID,
             peer: peer,
             endpoint: providerEndpoint(for: peer),
-            expiresAt: nowUnix() + Self.providerObservationTTL)
+            expiresAt: nowUnix() + Self.providerObservationTTL,
+            source: peer)
     }
 
     func storeProviderHint(
         rootCID: String,
         peer: PeerID,
         endpoint: PeerEndpoint?,
-        expiresAt: UInt64
+        expiresAt: UInt64,
+        source: PeerID? = nil
     ) {
-        if providerHints[rootCID] == nil,
-           providerHints.count >= Self.maxProviderRoots,
-           let evicted = providerHints.min(by: { left, right in
-               let leftExpiry = left.value.map(\.expiresAt).max() ?? 0
-               let rightExpiry = right.value.map(\.expiresAt).max() ?? 0
-               return leftExpiry == rightExpiry
-                   ? left.key < right.key
-                   : leftExpiry < rightExpiry
-           })?.key {
-            providerHints.removeValue(forKey: evicted)
+        let source = source ?? peer
+        let hint = ProviderHint(
+            peer: peer,
+            endpoint: endpoint,
+            expiresAt: expiresAt,
+            source: source)
+        evictExpiredProviders(rootCID: rootCID)
+        // A remote source may only displace its own records: at its quota it
+        // replaces its soonest-expiring record; at the table ceiling it is refused.
+        if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
+            if providerRecordCount(of: source) >= config.maxProviderRecordsPerPeer {
+                evictSoonestExpiringProviderRecord(of: source)
+            }
+            if providerRecordTotal >= config.maxProviderRecords {
+                for root in Array(providerHints.keys) { evictExpiredProviders(rootCID: root) }
+                guard providerRecordTotal < config.maxProviderRecords else { return }
+            }
         }
-        providerHints[rootCID] = boundedProviderHints(
-            (providerHints[rootCID] ?? []) + [ProviderHint(
-                peer: peer,
-                endpoint: endpoint,
-                expiresAt: expiresAt)])
+        setProviderHints(
+            boundedProviderHints((providerHints[rootCID] ?? []) + [hint]),
+            rootCID: rootCID)
+    }
+
+    private func addsProviderRecord(_ hint: ProviderHint, rootCID: String) -> Bool {
+        let existing = providerHints[rootCID] ?? []
+        let next = boundedProviderHints(existing + [hint])
+        return next.filter { $0.source == hint.source }.count
+            > existing.filter { $0.source == hint.source }.count
+    }
+
+    func providerRecordCount(of source: PeerID) -> Int {
+        (providerRecordsBySource[source] ?? [:]).values.reduce(0, +)
+    }
+
+    private func evictSoonestExpiringProviderRecord(of source: PeerID) {
+        var soonest: (rootCID: String, hint: ProviderHint)?
+        for rootCID in (providerRecordsBySource[source] ?? [:]).keys {
+            for hint in providerHints[rootCID] ?? [] where hint.source == source {
+                if let current = soonest,
+                   (current.hint.expiresAt, current.rootCID) <= (hint.expiresAt, rootCID) {
+                    continue
+                }
+                soonest = (rootCID, hint)
+            }
+        }
+        guard let soonest,
+              var hints = providerHints[soonest.rootCID],
+              let index = hints.firstIndex(of: soonest.hint) else { return }
+        hints.remove(at: index)
+        setProviderHints(hints, rootCID: soonest.rootCID)
+    }
+
+    /// The single writer of `providerHints`; keeps the per-source counts exact.
+    private func setProviderHints(_ hints: [ProviderHint], rootCID: String) {
+        for hint in providerHints[rootCID] ?? [] where hint.source != localID {
+            countProviderRecord(source: hint.source, rootCID: rootCID, delta: -1)
+        }
+        for hint in hints where hint.source != localID {
+            countProviderRecord(source: hint.source, rootCID: rootCID, delta: 1)
+        }
+        providerHints[rootCID] = hints.isEmpty ? nil : hints
+    }
+
+    private func countProviderRecord(source: PeerID, rootCID: String, delta: Int) {
+        var roots = providerRecordsBySource[source] ?? [:]
+        let count = (roots[rootCID] ?? 0) + delta
+        roots[rootCID] = count > 0 ? count : nil
+        providerRecordsBySource[source] = roots.isEmpty ? nil : roots
+        providerRecordTotal += delta
     }
 
     private func boundedProviderHints(_ input: [ProviderHint]) -> [ProviderHint] {
@@ -392,11 +454,7 @@ extension Ivy {
     func forgetProvider(rootCID: String, peer: PeerID) {
         guard var hints = providerHints[rootCID] else { return }
         hints.removeAll { $0.peer == peer }
-        if hints.isEmpty {
-            providerHints.removeValue(forKey: rootCID)
-        } else {
-            providerHints[rootCID] = hints
-        }
+        setProviderHints(hints, rootCID: rootCID)
     }
 
     func connectedProviderIDs(for rootCID: String) -> [PeerID] {
@@ -423,11 +481,7 @@ extension Ivy {
         guard var hints = providerHints[rootCID] else { return }
         let now = nowUnix()
         hints.removeAll { $0.expiresAt <= now }
-        if hints.isEmpty {
-            providerHints.removeValue(forKey: rootCID)
-        } else {
-            providerHints[rootCID] = hints
-        }
+        setProviderHints(hints, rootCID: rootCID)
     }
 
     func shouldStoreProviderHint(rootCID: String) -> Bool {
