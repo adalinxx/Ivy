@@ -326,15 +326,20 @@ extension Ivy {
             expiresAt: expiresAt,
             source: source)
         evictExpiredProviders(rootCID: rootCID)
-        // A remote source may only displace its own records: at its quota it
-        // replaces its soonest-expiring record; at the table ceiling it is refused.
+        // A referral never overrides what a provider announced for itself.
+        if source != peer,
+           providerHints[rootCID]?.contains(where: { $0.peer == peer && $0.source == peer }) == true {
+            return
+        }
+        // At its quota a source replaces its own soonest-expiring record; at the
+        // table ceiling the source holding the most records gives one up.
         if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
             if providerRecordCount(of: source) >= config.maxProviderRecordsPerPeer {
                 evictSoonestExpiringProviderRecord(of: source)
-            }
-            if providerRecordTotal >= config.maxProviderRecords {
-                for root in Array(providerHints.keys) { evictExpiredProviders(rootCID: root) }
-                guard providerRecordTotal < config.maxProviderRecords else { return }
+            } else if providerRecordTotal >= config.maxProviderRecords,
+                      let heaviest = providerSourcesByCount.keys.max()
+                        .flatMap({ providerSourcesByCount[$0]?.first }) {
+                evictSoonestExpiringProviderRecord(of: heaviest)
             }
         }
         setProviderHints(
@@ -350,7 +355,7 @@ extension Ivy {
     }
 
     func providerRecordCount(of source: PeerID) -> Int {
-        (providerRecordsBySource[source] ?? [:]).values.reduce(0, +)
+        providerRecordCounts[source] ?? 0
     }
 
     private func evictSoonestExpiringProviderRecord(of source: PeerID) {
@@ -387,6 +392,12 @@ extension Ivy {
         let count = (roots[rootCID] ?? 0) + delta
         roots[rootCID] = count > 0 ? count : nil
         providerRecordsBySource[source] = roots.isEmpty ? nil : roots
+        let old = providerRecordCounts[source] ?? 0
+        let new = old + delta
+        providerRecordCounts[source] = new > 0 ? new : nil
+        providerSourcesByCount[old]?.remove(source)
+        if providerSourcesByCount[old]?.isEmpty == true { providerSourcesByCount[old] = nil }
+        if new > 0 { providerSourcesByCount[new, default: []].insert(source) }
         providerRecordTotal += delta
     }
 
@@ -401,7 +412,14 @@ extension Ivy {
             routes.append(hint)
             routesByPeer[hint.peer] = Array(routes.suffix(config.maxRoutesPerIdentity))
         }
-        return peerOrder.suffix(config.kBucketSize).flatMap { routesByPeer[$0] ?? [] }
+        // A full root sheds the oldest referred-only provider before any that announced itself.
+        while peerOrder.count > config.kBucketSize {
+            let index = peerOrder.firstIndex { peer in
+                routesByPeer[peer]?.contains { $0.source == peer } != true
+            } ?? 0
+            peerOrder.remove(at: index)
+        }
+        return peerOrder.flatMap { routesByPeer[$0] ?? [] }
     }
 
     private func diversifiedProviderHints(

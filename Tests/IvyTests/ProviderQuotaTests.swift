@@ -8,6 +8,10 @@ private extension Ivy {
         providerHints[rootCID]?.contains { $0.peer == peer } == true
     }
 
+    func providerRecords(rootCID: String, peer: PeerID) -> [ProviderHint] {
+        providerHints[rootCID]?.filter { $0.peer == peer } ?? []
+    }
+
     func storedProviderRecordCount() -> Int {
         providerHints.values.reduce(0) { $0 + $1.count }
     }
@@ -33,10 +37,13 @@ private extension Ivy {
 
 @Suite("Provider record quota")
 struct ProviderQuotaTests {
-    private func node(_ label: String, quota: Int, maxConnections: Int = 256) -> Ivy {
+    private func node(
+        _ label: String, quota: Int, maxConnections: Int = 256, kBucketSize: Int = 20
+    ) -> Ivy {
         Ivy(config: IvyConfig(
             signingKey: deterministicTestSigningKey(label),
             listenPort: 0,
+            kBucketSize: kBucketSize,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
             maxConnections: maxConnections,
@@ -86,34 +93,61 @@ struct ProviderQuotaTests {
         #expect(await node.providerRecordCount(of: announcer) == 3)
     }
 
-    @Test("the global ceiling refuses new records and never evicts")
-    func ceilingRefusesWithoutEvicting() async {
-        // Ceiling = maxConnections * quota = 2 * 2.
-        let node = node("quota-ceiling-node", quota: 2, maxConnections: 2)
-        let first = peer("quota-ceiling-first")
-        let second = peer("quota-ceiling-second")
-        let late = peer("quota-ceiling-late")
+    @Test("at the ceiling the heaviest source gives up a record, so honest peers still get in")
+    func ceilingEvictsFromHeaviestSource() async {
+        // Ceiling = maxConnections * quota = 2 * 3.
+        let node = node("quota-ceiling-node", quota: 3, maxConnections: 2)
+        let honest = peer("quota-ceiling-honest")
+        let lateHonest = peer("quota-ceiling-late-honest")
+        let flooderA = peer("quota-ceiling-flooder-a")
+        let flooderB = peer("quota-ceiling-flooder-b")
         let now = await node.nowUnix()
-        for root in ["f1", "f2"] {
-            await node.handleAnnounceProvider(rootCID: root, expiresAt: now + 60, from: first)
+        let maxExpiry = now + IvyConfig.defaultMaxProviderTTLSeconds
+        await node.handleAnnounceProvider(rootCID: "honest", expiresAt: now + 60, from: honest)
+        for index in 0..<50 {
+            await node.handleAnnounceProvider(
+                rootCID: "a-\(index)", expiresAt: maxExpiry, from: flooderA)
+            await node.handleAnnounceProvider(
+                rootCID: "b-\(index)", expiresAt: maxExpiry, from: flooderB)
         }
-        for root in ["s1", "s2"] {
-            await node.handleAnnounceProvider(rootCID: root, expiresAt: now + 60, from: second)
+        #expect(await node.storedProviderRecordCount() == 6)
+
+        await node.handleAnnounceProvider(rootCID: "late", expiresAt: now + 60, from: lateHonest)
+        for index in 50..<100 {
+            await node.handleAnnounceProvider(
+                rootCID: "a-\(index)", expiresAt: maxExpiry, from: flooderA)
         }
 
-        await node.handleAnnounceProvider(rootCID: "late", expiresAt: now + 600, from: late)
-        await node.handleAnnounceProvider(rootCID: "f1", expiresAt: now + 600, from: late)
+        #expect(await node.hasProviderRecord(rootCID: "honest", peer: honest))
+        #expect(await node.hasProviderRecord(rootCID: "late", peer: lateHonest))
+        #expect(await node.storedProviderRecordCount() == 6)
+    }
 
-        #expect(await node.providerRecordCount(of: late) == 0)
-        #expect(await node.storedProviderRecordCount() == 4)
-        for (root, owner) in [("f1", first), ("f2", first), ("s1", second), ("s2", second)] {
-            #expect(await node.hasProviderRecord(rootCID: root, peer: owner))
+    @Test("admission at the ceiling does not sweep the whole table")
+    func ceilingAdmissionIsNotATableSweep() async {
+        let node = node("quota-sweep-node", quota: 3, maxConnections: 2)
+        let stale = peer("quota-sweep-stale")
+        let flooder = peer("quota-sweep-flooder")
+        let honest = peer("quota-sweep-honest")
+        let now = await node.nowUnix()
+        await node.storeProviderHint(rootCID: "stale", peer: stale, endpoint: nil, expiresAt: now - 1)
+        for index in 0..<3 {
+            await node.handleAnnounceProvider(
+                rootCID: "f-\(index)", expiresAt: now + 600, from: flooder)
         }
+        for index in 0..<2 {
+            await node.handleAnnounceProvider(
+                rootCID: "h-\(index)", expiresAt: now + 600, from: honest)
+        }
+        #expect(await node.storedProviderRecordCount() == 6)
 
-        // A peer at its own quota may still rotate its own records at the ceiling.
-        await node.handleAnnounceProvider(rootCID: "f3", expiresAt: now + 90, from: first)
-        #expect(await node.hasProviderRecord(rootCID: "f3", peer: first))
-        #expect(await node.storedProviderRecordCount() == 4)
+        await node.handleAnnounceProvider(rootCID: "h-2", expiresAt: now + 600, from: honest)
+
+        // The expired record in an untouched root is still there: no global sweep ran;
+        // the heaviest source (the flooder) gave up one record instead.
+        #expect(await node.hasProviderRecord(rootCID: "stale", peer: stale))
+        #expect(await node.providerRecordCount(of: flooder) == 2)
+        #expect(await node.providerRecordCount(of: honest) == 3)
     }
 
     @Test("referred records count against the responder that relayed them")
@@ -151,5 +185,80 @@ struct ProviderQuotaTests {
         #expect(await node.providerRecordCount(of: responder) == 5)
         #expect(await node.storedProviderRecordCount() == 6)
         #expect(await node.hasProviderRecord(rootCID: "honest-root", peer: honest))
+    }
+
+    @Test("a referral cannot rewrite, push out, or adopt a provider's direct record")
+    func referralCannotTakeOverDirectRecord() async throws {
+        let node = node("quota-takeover-node", quota: 1)
+        let honest = peer("quota-takeover-honest")
+        let responder = peer("quota-takeover-responder")
+        let now = await node.nowUnix()
+        let direct = PeerEndpoint(publicKey: honest.publicKey, host: "1.1.1.1", port: 4001)
+        await node.storeProviderHint(
+            rootCID: "root", peer: honest, endpoint: direct, expiresAt: now + 600)
+
+        // Same endpoint with a short expiry, plus alternative routes for the same identity.
+        let records = [ProviderRecord(endpoint: direct, expiresAt: now + 5)]
+            + (1...IvyConfig.defaultMaxRoutesPerIdentity).map { index in
+                ProviderRecord(
+                    endpoint: PeerEndpoint(
+                        publicKey: honest.publicKey, host: "8.8.8.\(index)", port: 4001),
+                    expiresAt: now + 5)
+            }
+        try await refer(node, root: "root", requestID: 200, records: records, from: responder)
+        #expect(await node.providerRecords(rootCID: "root", peer: honest)
+            == [ProviderHint(peer: honest, endpoint: direct, expiresAt: now + 600, source: honest)])
+        #expect(await node.providerRecordCount(of: responder) == 0)
+
+        // The responder's own quota eviction cannot reach the honest record either.
+        let other = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("quota-takeover-other"), host: "8.8.4.4", port: 4001)
+        for (index, root) in ["other-1", "other-2"].enumerated() {
+            try await refer(
+                node, root: root, requestID: UInt64(201 + index),
+                records: [ProviderRecord(endpoint: other, expiresAt: now + 60)], from: responder)
+        }
+        #expect(await node.providerRecordCount(of: responder) == 1)
+        #expect(await node.hasProviderRecord(rootCID: "root", peer: honest))
+    }
+
+    @Test("a full root sheds referred-only providers before self-announced ones")
+    func fullRootShedsReferredFirst() async throws {
+        let node = node("quota-shed-node", quota: 100, kBucketSize: 2)
+        let honest = peer("quota-shed-honest")
+        let responder = peer("quota-shed-responder")
+        let now = await node.nowUnix()
+        await node.handleAnnounceProvider(rootCID: "root", expiresAt: now + 600, from: honest)
+        let records = (0..<4).map { index in
+            ProviderRecord(
+                endpoint: PeerEndpoint(
+                    publicKey: deterministicTestPeerKey("quota-shed-fake-\(index)"),
+                    host: "8.8.8.\(index + 1)",
+                    port: 4001),
+                expiresAt: now + 600)
+        }
+        try await refer(node, root: "root", requestID: 300, records: records, from: responder)
+
+        #expect(await node.hasProviderRecord(rootCID: "root", peer: honest))
+        #expect(await node.storedProviderRecordCount() == 2)
+    }
+
+    private func refer(
+        _ node: Ivy,
+        root: String,
+        requestID: UInt64,
+        records: [ProviderRecord],
+        from responder: PeerID
+    ) async throws {
+        let waiting = BoundedTestTask {
+            await node.awaitQuotaTestProviderResponse(
+                rootCID: root, requestID: requestID, from: responder)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await node.hasQuotaTestProviderQuery(rootCID: root)
+        })
+        await node.handleProvidersResponse(
+            rootCID: root, requestID: requestID, records: records, from: responder)
+        _ = try await waiting.value(waitingFor: "referral response")
     }
 }
