@@ -197,7 +197,15 @@ public actor Ivy {
     static let kademliaLookupParallelism = 3
 
     var providerHints: [String: [ProviderHint]] = [:]
-    static let maxProviderRoots = 10_000
+    /// Per remote source: roots holding its provider records, and how many.
+    var providerRecordsBySource: [PeerID: [String: Int]] = [:]
+    var providerRecordCounts: [PeerID: Int] = [:]
+    /// Remote sources grouped by record count, to find the heaviest without a scan.
+    var providerSourcesByCount: [Int: Set<PeerID>] = [:]
+    var providerRecordTotal = 0
+    /// Roots the locally reported deficiency table may hold; its entries come
+    /// only from this node's own `reportDeficientContent` and expire on a fixed window.
+    static let maxDeficiencySuppressionRoots = 10_000
     var deficientPeerSuppression: [String: [String: ContinuousClock.Instant]] = [:]
     static let deficiencySuppressionWindow: Duration = .seconds(30)
 
