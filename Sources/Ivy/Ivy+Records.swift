@@ -331,6 +331,12 @@ extension Ivy {
            providerHints[rootCID]?.contains(where: { $0.peer == peer && $0.source == peer }) == true {
             return
         }
+        // A provider's own record supersedes the routes others referred for it.
+        if source == peer, var hints = providerHints[rootCID],
+           hints.contains(where: { $0.peer == peer && $0.source != peer }) {
+            hints.removeAll { $0.peer == peer && $0.source != peer }
+            setProviderHints(hints, rootCID: rootCID)
+        }
         // At its quota a source replaces its own soonest-expiring record; at the
         // table ceiling the source holding the most records gives one up.
         if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
