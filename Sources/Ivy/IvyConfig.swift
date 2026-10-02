@@ -11,6 +11,7 @@ public struct IvyConfig: Sendable {
     public static let defaultMaxInboundBufferedBytes = 64 * 1024 * 1024
     public static let defaultMaxRoutesPerIdentity = 3
     public static let defaultMaxProviderTTLSeconds: UInt64 = 24 * 60 * 60
+    public static let defaultMaxProviderRecordsPerPeer = 1_024
     public static let defaultMaxInFlightVolumeBytes = 128 * 1024 * 1024
     public static let defaultSTUNServers: [(String, Int)] = [
         ("stun.l.google.com", 19302),
@@ -50,6 +51,9 @@ public struct IvyConfig: Sendable {
     /// node may raise or lower them, accepting the resource/policy consequences.
     public let maxRoutesPerIdentity: Int
     public let maxProviderTTLSeconds: UInt64
+    /// Provider records each remote peer may hold in this node's table. The
+    /// table holds at most `maxConnections * maxProviderRecordsPerPeer` records.
+    public let maxProviderRecordsPerPeer: Int
     public let maxInFlightVolumeBytes: Int
     /// Max wire frame this node will ACCEPT (inbound). Advertised in the handshake
     /// so peers cap what they send us; outbound is capped at the peer's advertised
@@ -85,6 +89,7 @@ public struct IvyConfig: Sendable {
         maxContentCandidates: Int = 8,
         maxRoutesPerIdentity: Int = IvyConfig.defaultMaxRoutesPerIdentity,
         maxProviderTTLSeconds: UInt64 = IvyConfig.defaultMaxProviderTTLSeconds,
+        maxProviderRecordsPerPeer: Int = IvyConfig.defaultMaxProviderRecordsPerPeer,
         maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         externalAddress: (host: String, port: UInt16)? = nil,
@@ -121,6 +126,7 @@ public struct IvyConfig: Sendable {
         self.maxContentCandidates = maxContentCandidates
         self.maxRoutesPerIdentity = maxRoutesPerIdentity
         self.maxProviderTTLSeconds = maxProviderTTLSeconds
+        self.maxProviderRecordsPerPeer = maxProviderRecordsPerPeer
         self.maxInFlightVolumeBytes = maxInFlightVolumeBytes
         self.protocolMaxFrameSize = protocolMaxFrameSize
         self.externalAddress = externalAddress
@@ -149,6 +155,7 @@ public struct IvyConfig: Sendable {
         // break every connection before it starts.
         guard maxRoutesPerIdentity > 0,
               maxProviderTTLSeconds > 0,
+              maxProviderRecordsPerPeer > 0,
               maxInFlightVolumeBytes > 0,
               Int(protocolMaxFrameSize) >= SessionWireRecord.maxRelayedHandshakeRecordSize else {
             throw IvyModeError.invalidConfiguration(
@@ -250,5 +257,11 @@ public struct IvyConfig: Sendable {
 
     var maxInboundConnections: Int {
         maxConnections - reservedOutboundConnectionSlots
+    }
+
+    var maxProviderRecords: Int {
+        let (product, overflow) = maxConnections.multipliedReportingOverflow(
+            by: maxProviderRecordsPerPeer)
+        return overflow ? .max : product
     }
 }
