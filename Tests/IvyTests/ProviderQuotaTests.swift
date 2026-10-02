@@ -222,6 +222,37 @@ struct ProviderQuotaTests {
         #expect(await node.hasProviderRecord(rootCID: "root", peer: honest))
     }
 
+    @Test("a provider's re-announcement replaces routes referred for it after its record expired")
+    func directRecordReplacesReferredRoutes() async throws {
+        let node = node("quota-supersede-node", quota: 100)
+        let honest = peer("quota-supersede-honest")
+        let responder = peer("quota-supersede-responder")
+        let now = await node.nowUnix()
+        await node.storeProviderHint(
+            rootCID: "root",
+            peer: honest,
+            endpoint: PeerEndpoint(publicKey: honest.publicKey, host: "1.1.1.1", port: 4001),
+            expiresAt: now)
+
+        let wrong = (1...IvyConfig.defaultMaxRoutesPerIdentity).map { index in
+            ProviderRecord(
+                endpoint: PeerEndpoint(
+                    publicKey: honest.publicKey, host: "8.8.8.\(index)", port: 4001),
+                expiresAt: now + 600)
+        }
+        try await refer(node, root: "root", requestID: 400, records: wrong, from: responder)
+        #expect(await node.providerRecordCount(of: responder) == wrong.count)
+
+        let moved = PeerEndpoint(publicKey: honest.publicKey, host: "1.0.0.1", port: 4002)
+        await node.storeProviderHint(
+            rootCID: "root", peer: honest, endpoint: moved, expiresAt: now + 600)
+
+        #expect(await node.providerRecords(rootCID: "root", peer: honest)
+            == [ProviderHint(peer: honest, endpoint: moved, expiresAt: now + 600, source: honest)])
+        #expect(await node.providerRecordCount(of: responder) == 0)
+        #expect(await node.providerRecordCount(of: honest) == 1)
+    }
+
     @Test("a full root sheds referred-only providers before self-announced ones")
     func fullRootShedsReferredFirst() async throws {
         let node = node("quota-shed-node", quota: 100, kBucketSize: 2)
