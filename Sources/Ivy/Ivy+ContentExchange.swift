@@ -1484,7 +1484,7 @@ extension Ivy {
         guard MessageLimits.accepts(rootCID) else { return }
         forgetProvider(rootCID: rootCID, peer: peer)
         if deficientPeerSuppression[rootCID] == nil,
-           deficientPeerSuppression.count >= Self.maxProviderRoots,
+           deficientPeerSuppression.count >= Self.maxDeficiencySuppressionRoots,
            let evicted = deficientPeerSuppression.min(by: { left, right in
                let leftExpiry = left.value.values.max()
                let rightExpiry = right.value.values.max()
