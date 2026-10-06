@@ -216,13 +216,22 @@ public actor Ivy {
     var reservedServingVolumeBytes = 0
     /// DHT provider lookups started, for tests that assert one was avoided.
     var freshProviderQueryCount = 0
-    /// Volume reads waiting for serving capacity, in arrival order.
+    /// Volume reads waiting for serving capacity, in arrival order. Reads are
+    /// short and slots are already shared by weight, so reads go first come,
+    /// first served: ranking them could starve a peer's read.
     var servingVolumeReadWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
     var servingContentRequests: Set<InboundContentRequest> = []
     var servingContentTasks: [InboundContentRequest: Task<Void, Never>] = [:]
+    /// Requests waiting for a serving slot; non-empty only under pressure.
+    var servingTickets: [InboundContentRequest: ServingTicket] = [:]
+    var nextServingTicketArrival: UInt64 = 0
+    /// Stride-scheduling state for contended serving: each waiting peer's
+    /// pass, and the pass of the last grant.
+    var servingPass: [PeerID: Double] = [:]
+    var servingVirtualTime: Double = 0
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]
@@ -2932,6 +2941,7 @@ public actor Ivy {
 
     func cleanupAllPending() {
         for task in servingContentTasks.values { task.cancel() }
+        refuseAllServingTickets()
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingPeerConnectionWaiters: pendingPeerConnectionWaiters,
@@ -3065,6 +3075,14 @@ public actor Ivy {
 
     var providerQueryCountForTesting: Int {
         freshProviderQueryCount
+    }
+
+    var waitingServingTicketCountForTesting: Int {
+        servingTickets.values.filter { $0.state == .waiting }.count
+    }
+
+    var servingTicketCountForTesting: Int {
+        servingTickets.count
     }
 
     func seedConnectedEndpointForTesting(

@@ -338,6 +338,14 @@ extension Ivy {
     ) async {
         let (inbound, requestID, rootCID, key, maxDataBytes) = request
         defer { endServingContent(inbound) }
+        guard await awaitServingSlot(inbound) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
+            return
+        }
 
         let source = contentSource
         if let source {
@@ -479,6 +487,15 @@ extension Ivy {
         session: AuthenticatedSession?
     ) async {
         defer { endServingContent(inbound) }
+        guard await awaitServingSlot(inbound) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true
+            )
+            return
+        }
         let source = contentSource
         if let source {
             guard let requester = authenticatedPeer(for: peer, session: session),
@@ -718,22 +735,6 @@ extension Ivy {
         return fireToPeer(peer, message, bypassAdmission: bypassAdmission)
     }
 
-    private func beginServingContent(_ request: InboundContentRequest) -> Bool {
-        let perPeerLimit = max(1, min(8, config.maxConcurrentContentRequests / 4))
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests,
-              !servingContentRequests.contains(request),
-              servingContentRequests.lazy.filter({ $0.peer == request.peer }).count
-                < perPeerLimit else { return false }
-        servingContentRequests.insert(request)
-        return true
-    }
-
-    private func endServingContent(_ request: InboundContentRequest) {
-        servingContentTasks.removeValue(forKey: request)
-        servingContentRequests.remove(request)
-    }
-
     func handleContentResponse(
         requestID: UInt64,
         entries: [ContentEntry],
@@ -952,13 +953,12 @@ extension Ivy {
 
     private func localVolume(rootCID: String) async -> AttributedVolumeResponse? {
         guard let source = contentSource else { return nil }
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests,
-              tryReserveServingVolumeRead() else { return nil }
+        guard hasFreeServingSlot, tryReserveServingVolumeRead() else { return nil }
         activeLocalContentRequestCount += 1
         defer {
             activeLocalContentRequestCount -= 1
             releaseServingVolumeBytes(MessageLimits.maxVolumeArchiveBytes)
+            dispatchServingSlots()
         }
         let entries = await source.volume(
             rootCID: rootCID,
@@ -1224,10 +1224,12 @@ extension Ivy {
             maxFrameSize: config.protocolMaxFrameSize,
             relayed: false
         ) else { return nil }
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests else { return nil }
+        guard hasFreeServingSlot else { return nil }
         activeLocalContentRequestCount += 1
-        defer { activeLocalContentRequestCount -= 1 }
+        defer {
+            activeLocalContentRequestCount -= 1
+            dispatchServingSlots()
+        }
         let entries = await source.content(
             rootCID: key.rootCID,
             cids: key.requestedCIDs,

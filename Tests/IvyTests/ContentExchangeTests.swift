@@ -1247,15 +1247,26 @@ struct ContentExchangeTests {
         try await TestSynchronization.wait(for: "first content authorization") {
             await source.counts().authorizationStarts == 1
         }
-        await ivy.handleContentRequest(
-            requestID: 2,
-            rootCID: "two",
-            cids: [],
-            from: peer
-        )
+        // The second request waits for the slot; its authorization does not start.
+        let second = Task {
+            await ivy.handleContentRequest(
+                requestID: 2,
+                rootCID: "two",
+                cids: [],
+                from: peer
+            )
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.waitingServingTicketCountForTesting == 1
+        })
         #expect(await source.counts().authorizationStarts == 1)
         await source.releaseAll()
         await first.value
+        try await TestSynchronization.wait(for: "second content authorization") {
+            await source.counts().authorizationStarts == 2
+        }
+        await source.releaseAll()
+        await second.value
     }
 
     @Test("private content exchange requires explicit opt-in")
@@ -1776,14 +1787,25 @@ struct ContentExchangeTests {
             return started == 2 && serving == 2
         })
 
-        await ivy.handleContentRequest(requestID: 3, rootCID: "root", cids: [], from: peers[2])
+        // A third request waits for a slot rather than reaching storage.
+        let third = Task {
+            await ivy.handleContentRequest(requestID: 3, rootCID: "root", cids: [], from: peers[2])
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.waitingServingTicketCountForTesting == 1
+        })
         #expect(await source.startedCount() == 2)
         #expect(await ivy.servingContentCount() == 2)
 
         await source.releaseAll()
+        #expect(try await TransportTestHarness.eventually { await source.startedCount() == 3 })
+        #expect(await source.maxActiveCount() <= 2)
+        await source.releaseAll()
         _ = await first.value
         _ = await second.value
+        _ = await third.value
         #expect(await ivy.servingContentCount() == 0)
+        #expect(await ivy.servingTicketCountForTesting == 0)
     }
 
     @Test("a disconnected peer retains its serving slot until storage exits")
@@ -1890,20 +1912,24 @@ struct ContentExchangeTests {
                 == IvyConfig.defaultMaxInFlightVolumeBytes
         )
         try await ivy.start()
+        // Both retained slots are busy, so new requests wait for them.
         await ivy.scheduleVolumeRequest(
             requestID: 3,
             rootCID: "root-c",
             from: peers[2]
         )
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.waitingServingTicketCountForTesting == 1
+        })
         #expect(await source.startedCount() == 2)
         #expect(await ivy.servingContentCount() == 2)
 
+        // A retained slot frees: the waiting request takes it.
         await source.release(0)
         #expect(try await TransportTestHarness.eventually {
+            let started = await source.startedCount()
             let serving = await ivy.servingContentCount()
-            let reservation = await ivy.volumeReservations().serving
-            return serving == 1
-                && reservation == MessageLimits.maxVolumeArchiveBytes
+            return started == 3 && serving == 2
         })
         await ivy.scheduleVolumeRequest(
             requestID: 4,
@@ -1911,21 +1937,19 @@ struct ContentExchangeTests {
             from: peers[3]
         )
         #expect(try await TransportTestHarness.eventually {
-            let started = await source.startedCount()
-            let serving = await ivy.servingContentCount()
-            let reservation = await ivy.volumeReservations().serving
-            return started == 3
-                && serving == 2
-                && reservation == IvyConfig.defaultMaxInFlightVolumeBytes
+            await ivy.waitingServingTicketCountForTesting == 1
         })
 
         await source.release(1)
+        #expect(try await TransportTestHarness.eventually { await source.startedCount() == 4 })
         await source.release(2)
+        await source.release(3)
         #expect(try await TransportTestHarness.eventually {
             let serving = await ivy.servingContentCount()
             let reservation = await ivy.volumeReservations().serving
             return serving == 0 && reservation == 0
         })
+        #expect(await ivy.servingTicketCountForTesting == 0)
         await ivy.stop()
     }
 

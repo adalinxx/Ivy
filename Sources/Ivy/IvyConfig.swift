@@ -43,7 +43,14 @@ public struct IvyConfig: Sendable {
     public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
     public let maxWaitersPerRequest: Int
+    /// Content requests this node serves at once, to all peers combined.
     public let maxConcurrentContentRequests: Int
+    /// Content requests one peer may have served at once.
+    public let maxConcurrentContentRequestsPerPeer: Int
+    /// Requests one peer may have waiting for a slot when all are busy. Each
+    /// peer has its own allotment, so waiting requests total at most this
+    /// times the connection count, and no peer can crowd another out.
+    public let maxQueuedContentRequestsPerPeer: Int
     public let maxContentCandidates: Int
     public let maxInboundBufferedBytes: Int
     public let minPeerKeyBits: Int
@@ -84,6 +91,8 @@ public struct IvyConfig: Sendable {
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
         maxConcurrentContentRequests: Int = 64,
+        maxConcurrentContentRequestsPerPeer: Int? = nil,
+        maxQueuedContentRequestsPerPeer: Int = 64,
         maxInboundBufferedBytes: Int = IvyConfig.defaultMaxInboundBufferedBytes,
         minPeerKeyBits: Int = 0,
         maxContentCandidates: Int = 8,
@@ -121,6 +130,10 @@ public struct IvyConfig: Sendable {
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
         self.maxConcurrentContentRequests = maxConcurrentContentRequests
+        // Unset, one peer may use a quarter of the slots, at most eight.
+        self.maxConcurrentContentRequestsPerPeer = maxConcurrentContentRequestsPerPeer
+            ?? max(1, min(8, maxConcurrentContentRequests / 4))
+        self.maxQueuedContentRequestsPerPeer = maxQueuedContentRequestsPerPeer
         self.maxInboundBufferedBytes = maxInboundBufferedBytes
         self.minPeerKeyBits = minPeerKeyBits
         self.maxContentCandidates = maxContentCandidates
@@ -140,6 +153,11 @@ public struct IvyConfig: Sendable {
               maxConcurrentContentRequests > 0,
               maxContentCandidates > 0 else {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
+        }
+        guard (1...maxConcurrentContentRequests).contains(maxConcurrentContentRequestsPerPeer),
+              maxQueuedContentRequestsPerPeer >= 0 else {
+            throw IvyModeError.invalidConfiguration(
+                "per-peer serving slots must fit within the total; the queue limit must not be negative")
         }
         guard (0...maxConnections).contains(reservedOutboundConnectionSlots) else {
             throw IvyModeError.invalidConfiguration(
