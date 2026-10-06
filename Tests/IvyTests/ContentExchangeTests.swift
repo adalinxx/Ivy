@@ -584,11 +584,20 @@ struct ContentExchangeTests {
         #expect(await source.startedCount() == 2)
         #expect(await ivy.volumeReservations().serving
             == IvyConfig.defaultMaxInFlightVolumeBytes)
+        // The third read waits for capacity rather than being refused.
+        #expect(try await TransportTestHarness.eventually {
+            await ivy.servingVolumeReadWaiterCountForTesting == 1
+        })
 
+        await source.releaseAll()
+        #expect(try await TransportTestHarness.eventually {
+            await source.startedCount() == 3
+        })
         await source.releaseAll()
         #expect(try await TransportTestHarness.eventually {
             await ivy.volumeReservations().serving == 0
         })
+        #expect(await ivy.servingVolumeReadWaiterCountForTesting == 0)
     }
 
     @Test("Volume chunks reject gaps and duplicates without leaking bytes")

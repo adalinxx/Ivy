@@ -496,7 +496,7 @@ extension Ivy {
             }
         }
         guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
-        guard let source, reserveServingVolumeCapacity() else {
+        guard let source, await acquireServingVolumeRead() else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
@@ -505,16 +505,18 @@ extension Ivy {
             )
             return
         }
-        defer { releaseServingVolumeCapacity() }
-        let entries = await source.volume(
-            rootCID: rootCID,
-            maxDataBytes: MessageLimits.maxVolumeArchiveBytes
-        )
+        // A Volume's size is unknown until it is read, so the read holds a
+        // worst-case reservation. Once encoded, only the archive stays in
+        // memory while it is sent, so the reservation shrinks to its size.
+        var held = MessageLimits.maxVolumeArchiveBytes
+        defer { releaseServingVolumeBytes(held) }
+        let encoded = await readVolumeArchive(source: source, rootCID: rootCID)
+        if let encoded, encoded.data.count < held {
+            releaseServingVolumeBytes(held - encoded.data.count)
+            held = encoded.data.count
+        }
         guard session.map(isCurrent) ?? true,
-              let archive = VolumeArchive.encode(
-                entries: entries,
-                rootCID: rootCID
-              ),
+              let archive = encoded,
               let payloadBytes = Message.volumeChunkDataBudget(
                 rootCID: rootCID,
                 maxFrameSize: effectiveOutboundFrameSize(
@@ -571,18 +573,80 @@ extension Ivy {
         }
     }
 
-    private func reserveServingVolumeCapacity() -> Bool {
-        guard MessageLimits.maxVolumeArchiveBytes
-                <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes else {
+    /// Reads and encodes a Volume. Its entries go out of scope on return, so
+    /// only the archive outlives the read.
+    private func readVolumeArchive(
+        source: any IvyContentSource,
+        rootCID: String
+    ) async -> VolumeArchive? {
+        let entries = await source.volume(
+            rootCID: rootCID,
+            maxDataBytes: MessageLimits.maxVolumeArchiveBytes
+        )
+        return VolumeArchive.encode(entries: entries, rootCID: rootCID)
+    }
+
+    private func servingVolumeFits(_ bytes: Int) -> Bool {
+        bytes <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes
+    }
+
+    /// Reserves a worst-case Volume for one read. A burst waits for capacity
+    /// rather than being refused: reads are short, and the serving-request
+    /// limits already bound how many requests can wait. False when the
+    /// request is cancelled or a worst-case Volume can never fit.
+    private func acquireServingVolumeRead() async -> Bool {
+        let worstCase = MessageLimits.maxVolumeArchiveBytes
+        guard worstCase <= config.maxInFlightVolumeBytes, !Task.isCancelled else {
             return false
         }
-        reservedServingVolumeBytes += MessageLimits.maxVolumeArchiveBytes
+        if tryReserveServingVolumeRead() { return true }
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                servingVolumeReadWaiters.append((id, continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelServingVolumeReadWaiter(id) }
+        }
+        if acquired, Task.isCancelled {
+            releaseServingVolumeBytes(worstCase)
+            return false
+        }
+        return acquired
+    }
+
+    /// Reserves a worst-case Volume read only if it fits now and no read is
+    /// already waiting (waiting reads keep their turn).
+    private func tryReserveServingVolumeRead() -> Bool {
+        let worstCase = MessageLimits.maxVolumeArchiveBytes
+        guard servingVolumeReadWaiters.isEmpty, servingVolumeFits(worstCase) else {
+            return false
+        }
+        reservedServingVolumeBytes += worstCase
         return true
     }
 
-    private func releaseServingVolumeCapacity() {
-        precondition(reservedServingVolumeBytes >= MessageLimits.maxVolumeArchiveBytes)
-        reservedServingVolumeBytes -= MessageLimits.maxVolumeArchiveBytes
+    private func cancelServingVolumeReadWaiter(_ id: UUID) {
+        guard let index = servingVolumeReadWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        servingVolumeReadWaiters.remove(at: index).continuation.resume(returning: false)
+    }
+
+    /// Returns `bytes` of serving reservation and admits the waiting reads
+    /// that now fit, oldest first.
+    private func releaseServingVolumeBytes(_ bytes: Int) {
+        precondition(bytes >= 0 && reservedServingVolumeBytes >= bytes)
+        reservedServingVolumeBytes -= bytes
+        let worstCase = MessageLimits.maxVolumeArchiveBytes
+        while !servingVolumeReadWaiters.isEmpty, servingVolumeFits(worstCase) {
+            reservedServingVolumeBytes += worstCase
+            servingVolumeReadWaiters.removeFirst().continuation.resume(returning: true)
+        }
     }
 
     private func sendVolumeChunk(
@@ -795,51 +859,51 @@ extension Ivy {
             return .empty
         }
 
+        // Known providers, then the peers already connected, then the DHT.
+        // A connected peer without the Volume answers contentUnavailable at
+        // once, so asking them costs one round trip before any DHT lookup
+        // (Bitswap's order). Each step asks only peers not yet asked, and a
+        // miss returns the last empty answer so its failure (local capacity)
+        // still reaches the caller.
+        enum Step { case knownProviders, connectedPeers, discoveredProviders }
+        var asked = Set<PeerID>()
+        var last = AttributedVolumeResponse.empty
         let cached = cachedProviderEndpoints(rootCID: rootCID)
-        await connectToProviderEndpoints(cached, generation: generation)
-        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-        var candidates = Array(
-            connectedProviderIDs(for: rootCID).prefix(config.maxContentCandidates)
-        )
-        if !candidates.isEmpty {
+        for step in [Step.knownProviders, .connectedPeers, .discoveredProviders] {
+            let peers: [PeerID]
+            switch step {
+            case .knownProviders:
+                await connectToProviderEndpoints(cached, generation: generation)
+                guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
+                peers = connectedProviderIDs(for: rootCID)
+            case .connectedPeers:
+                peers = connectedFallbackCandidates(rootCID: rootCID, excluding: [:])
+            case .discoveredProviders:
+                let fresh = await queryFreshProviderEndpoints(
+                    rootCID: rootCID,
+                    generation: generation
+                )
+                await connectToProviderEndpoints(fresh + cached, generation: generation)
+                guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
+                peers = connectedProviderIDs(for: rootCID)
+            }
+            let batch = Array(
+                peers.filter { !asked.contains($0) }.prefix(config.maxContentCandidates)
+            )
+            guard !batch.isEmpty else { continue }
+            asked.formUnion(batch)
             let response = await fetchVolume(
                 rootCID: rootCID,
-                from: candidates,
+                from: batch,
                 generation: generation,
                 maximumArchiveBytes: maximumArchiveBytes,
                 maximumEntries: maximumEntries
             )
             if !response.entries.isEmpty { return response }
+            last = response
+            guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
         }
-
-        let fresh = await queryFreshProviderEndpoints(
-            rootCID: rootCID,
-            generation: generation
-        )
-        await connectToProviderEndpoints(fresh + cached, generation: generation)
-        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-        candidates = Array(
-            connectedProviderIDs(for: rootCID).prefix(config.maxContentCandidates)
-        )
-        if !candidates.isEmpty {
-            let response = await fetchVolume(
-                rootCID: rootCID,
-                from: candidates,
-                generation: generation,
-                maximumArchiveBytes: maximumArchiveBytes,
-                maximumEntries: maximumEntries
-            )
-            if !response.entries.isEmpty { return response }
-        }
-        candidates = connectedFallbackCandidates(rootCID: rootCID, excluding: [:])
-        guard !candidates.isEmpty else { return .empty }
-        return await fetchVolume(
-            rootCID: rootCID,
-            from: candidates,
-            generation: generation,
-            maximumArchiveBytes: maximumArchiveBytes,
-            maximumEntries: maximumEntries
-        )
+        return last
     }
 
     /// Fetches one complete Volume from the exact authenticated endpoint
@@ -890,11 +954,11 @@ extension Ivy {
         guard let source = contentSource else { return nil }
         guard servingContentRequests.count + activeLocalContentRequestCount
                 < config.maxConcurrentContentRequests,
-              reserveServingVolumeCapacity() else { return nil }
+              tryReserveServingVolumeRead() else { return nil }
         activeLocalContentRequestCount += 1
         defer {
             activeLocalContentRequestCount -= 1
-            releaseServingVolumeCapacity()
+            releaseServingVolumeBytes(MessageLimits.maxVolumeArchiveBytes)
         }
         let entries = await source.volume(
             rootCID: rootCID,

@@ -143,6 +143,7 @@ extension Ivy {
               isCurrentRun(generation),
               !Task.isCancelled,
               MessageLimits.accepts(rootCID) else { return [] }
+        freshProviderQueryCount += 1
         var targets = providerLookupTargets(rootCID: rootCID)
         if targets.isEmpty {
             _ = await findNode(target: rootCID, generation: generation)

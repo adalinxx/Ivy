@@ -53,7 +53,8 @@ enum TransportTestHarness {
         maxConnections: Int = IvyConfig.defaultMaxConnections,
         maxContentCandidates: Int = 8,
         privateContentExchangeEnabled: Bool = false,
-        protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
+        protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
+        maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
@@ -68,6 +69,7 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxContentCandidates: maxContentCandidates,
+            maxInFlightVolumeBytes: maxInFlightVolumeBytes,
             protocolMaxFrameSize: protocolMaxFrameSize,
             externalAddress: port == 0 ? nil : (advertisedHost, port),
             relayEnabled: relayEnabled,
@@ -507,7 +509,7 @@ struct TCPIntegrationTests {
         let clientRecorder = TransportTestRecorder()
         await server.setTestDelegate(serverRecorder)
         await client.setTestDelegate(clientRecorder)
-        await server.setContentSource(TransportVolumeSource(entries: [
+        let stalledEntries = [
             ContentEntry(
                 cid: "root",
                 data: Data(
@@ -515,7 +517,12 @@ struct TCPIntegrationTests {
                     count: Int(IvyConfig.defaultProtocolMaxFrameSize) + 1
                 )
             ),
-        ]))
+        ]
+        // While it is sent, a Volume holds its encoded size, not the worst case.
+        let archiveBytes = try #require(
+            VolumeArchive.encode(entries: stalledEntries, rootCID: "root")
+        ).data.count
+        await server.setContentSource(TransportVolumeSource(entries: stalledEntries))
 
         try await server.start()
         try await client.start()
@@ -538,8 +545,7 @@ struct TCPIntegrationTests {
             await client.fetchVolume(rootCID: "root", from: serverPeer)
         }
         #expect(try await TransportTestHarness.eventually {
-            await server.reservedServingVolumeBytesForTesting
-                == MessageLimits.maxVolumeArchiveBytes
+            await server.reservedServingVolumeBytesForTesting == archiveBytes
         })
         #expect(try await TransportTestHarness.eventually {
             await server.reservedServingVolumeBytesForTesting == 0
