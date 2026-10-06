@@ -214,9 +214,9 @@ public actor Ivy {
     var inFlightVolumeBytes = 0
     var reservedVolumeBytes = 0
     var reservedServingVolumeBytes = 0
-    /// Volume reads waiting for serving capacity, in arrival order.
     /// DHT provider lookups started, for tests that assert one was avoided.
     var freshProviderQueryCount = 0
+    /// Volume reads waiting for serving capacity, in arrival order.
     var servingVolumeReadWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
