@@ -69,10 +69,13 @@ private struct ServingFixture {
         var clientIDs: [PeerID] = []
         for index in 0..<count {
             let identity = TransportTestHarness.identity("\(name)-client-\(index)")
+            // Clients send freely here so these tests observe the server's
+            // queue; the client-side limit has its own tests.
             let client = Ivy(config: TransportTestHarness.config(
                 identity,
                 port: TransportTestHarness.nextPort(),
-                requestTimeout: .seconds(10)
+                requestTimeout: .seconds(10),
+                maxOutstandingVolumeRequestsPerPeer: 1_000
             ))
             let recorder = TransportTestRecorder()
             await client.setTestDelegate(recorder)

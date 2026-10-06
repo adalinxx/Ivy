@@ -977,6 +977,10 @@ extension Ivy {
         )
     }
 
+    /// Asks the candidates one at a time, least loaded first, moving on when
+    /// one misses. Each peer has at most `maxOutstandingVolumeRequestsPerPeer`
+    /// requests from this node in flight; when every candidate is at that
+    /// limit the request waits for one to free rather than piling on.
     private func fetchVolume(
         rootCID: String,
         from candidates: [PeerID],
@@ -985,6 +989,96 @@ extension Ivy {
         maximumEntries: Int,
         exactPeer: AuthenticatedPeer? = nil
     ) async -> AttributedVolumeResponse {
+        var remaining: [PeerID] = []
+        for peer in candidates where !remaining.contains(peer) { remaining.append(peer) }
+        var last = AttributedVolumeResponse.empty
+        while !remaining.isEmpty {
+            guard isCurrentRun(generation), !Task.isCancelled,
+                  let peer = await acquireOutstandingVolumeSlot(among: remaining) else { return .empty }
+            remaining.removeAll { $0 == peer }
+            let response = await requestVolume(
+                rootCID: rootCID,
+                from: peer,
+                generation: generation,
+                maximumArchiveBytes: maximumArchiveBytes,
+                maximumEntries: maximumEntries,
+                exactPeer: exactPeer
+            )
+            releaseOutstandingVolumeSlot(peer)
+            if !response.entries.isEmpty { return response }
+            // Keep a failure (local capacity) over a later plain miss.
+            if response.failure != nil || last.failure == nil { last = response }
+        }
+        return last
+    }
+
+    /// Reserves one in-flight request on a candidate below its limit, waiting
+    /// while all are at it: peers that have been timing out last, then the
+    /// least loaded, ties at random so no peer is always asked first. Nil
+    /// when cancelled or stopped.
+    private func acquireOutstandingVolumeSlot(among candidates: [PeerID]) async -> PeerID? {
+        while true {
+            let open = candidates.filter {
+                outstandingVolumeRequests[$0, default: 0] < config.maxOutstandingVolumeRequestsPerPeer
+            }
+            if let peer = open.shuffled().min(by: { lhs, rhs in
+                let left = (volumeTimeoutStreaks[lhs, default: 0], outstandingVolumeRequests[lhs, default: 0])
+                let right = (volumeTimeoutStreaks[rhs, default: 0], outstandingVolumeRequests[rhs, default: 0])
+                return left < right
+            }) {
+                outstandingVolumeRequests[peer, default: 0] += 1
+                return peer
+            }
+            guard await waitForOutstandingVolumeSlot() else { return nil }
+        }
+    }
+
+    private func waitForOutstandingVolumeSlot() async -> Bool {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                outstandingVolumeSlotWaiters.append((id, continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelOutstandingVolumeSlotWaiter(id) }
+        }
+    }
+
+    private func cancelOutstandingVolumeSlotWaiter(_ id: UUID) {
+        guard let index = outstandingVolumeSlotWaiters.firstIndex(where: { $0.id == id }) else { return }
+        outstandingVolumeSlotWaiters.remove(at: index).continuation.resume(returning: false)
+    }
+
+    /// Frees a peer's in-flight slot; waiting requests re-check their candidates.
+    private func releaseOutstandingVolumeSlot(_ peer: PeerID) {
+        let count = outstandingVolumeRequests[peer, default: 0] - 1
+        outstandingVolumeRequests[peer] = count > 0 ? count : nil
+        let waiters = outstandingVolumeSlotWaiters
+        outstandingVolumeSlotWaiters.removeAll()
+        for waiter in waiters { waiter.continuation.resume(returning: true) }
+    }
+
+    /// Releases requests waiting for a slot (on stop).
+    func releaseAllOutstandingVolumeSlotWaiters() {
+        let waiters = outstandingVolumeSlotWaiters
+        outstandingVolumeSlotWaiters.removeAll()
+        for waiter in waiters { waiter.continuation.resume(returning: false) }
+    }
+
+    /// One Volume request to one peer.
+    private func requestVolume(
+        rootCID: String,
+        from peer: PeerID,
+        generation: UInt64,
+        maximumArchiveBytes: Int,
+        maximumEntries: Int,
+        exactPeer: AuthenticatedPeer?
+    ) async -> AttributedVolumeResponse {
+        let candidates = [peer]
         guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
         let requestID = makeWireOperationID(
             avoiding: Set(pendingContentRequests.keys).union(pendingVolumeRequests.keys)
@@ -1035,7 +1129,7 @@ extension Ivy {
                 pendingVolumeRequests[requestID]?.timeoutTask = delayedTask(
                     after: config.requestTimeout
                 ) { [weak self] in
-                    await self?.resolveVolumeRequest(requestID: requestID)
+                    await self?.timeOutVolumeRequest(requestID: requestID)
                 }
             }
         } onCancel: {
@@ -1197,6 +1291,17 @@ extension Ivy {
         reservedVolumeBytes -= assembly.totalBytes
     }
 
+    /// The request's deadline passed: peers asked that sent nothing count a
+    /// timeout, so the next fetch tries them after peers that answer.
+    private func timeOutVolumeRequest(requestID: UInt64) {
+        if let pending = pendingVolumeRequests[requestID] {
+            for peer in pending.candidateSessions.keys where pending.assemblies[peer] == nil {
+                volumeTimeoutStreaks[peer, default: 0] += 1
+            }
+        }
+        resolveVolumeRequest(requestID: requestID)
+    }
+
     func resolveVolumeRequest(
         requestID: UInt64,
         entries: [ContentEntry] = [],
@@ -1205,6 +1310,7 @@ extension Ivy {
         guard let pending = pendingVolumeRequests.removeValue(forKey: requestID) else {
             return
         }
+        if !entries.isEmpty, let servedBy { volumeTimeoutStreaks[servedBy] = nil }
         for assembly in pending.assemblies.values {
             releaseVolumeAssembly(assembly)
         }
