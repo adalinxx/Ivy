@@ -24,6 +24,15 @@ extension Ivy {
     /// (`Tally.servingPriority`), oldest first among equals. False refuses
     /// the request: a duplicate, the peer's queue is full, or the global
     /// queue is full of requests from peers at least as helpful.
+    ///
+    /// Ivy treats CIDs as opaque, so it cannot tell verified content from
+    /// bytes: the host credits a peer, through `tally.recordUsefulReceived`,
+    /// when content it requested from that peer verifies. Without such
+    /// credit every peer ranks equally and waiting is first come, first served.
+    ///
+    /// A Volume request's `requestTimeout` covers its time waiting, as the
+    /// requester's does. Local reads (`localVolume`, local content) take any
+    /// free slot without queueing: the node's own needs come first.
     func beginServingContent(_ request: InboundContentRequest) -> Bool {
         guard !servingContentRequests.contains(request),
               servingTickets[request] == nil else { return false }
@@ -48,6 +57,9 @@ extension Ivy {
         }
         nextServingTicketArrival &+= 1
         servingTickets[request] = ServingTicket(request: request, arrival: nextServingTicketArrival)
+        // The waiters ahead may all be peers at their own limit; a free slot
+        // then goes to this request now rather than idling.
+        dispatchServingSlots()
         return true
     }
 
@@ -94,8 +106,14 @@ extension Ivy {
 
     /// Hands freed slots to waiting requests, most helpful peer first.
     func dispatchServingSlots() {
-        while hasFreeServingSlot, let next = bestEligibleWaitingTicket() {
+        guard hasFreeServingSlot, waitingServingTicketCount > 0 else { return }
+        var priorities: [PeerID: Double] = [:]
+        var active: [PeerID: Int] = [:]
+        for request in servingContentRequests { active[request.peer, default: 0] += 1 }
+        while hasFreeServingSlot,
+              let next = bestEligibleWaitingTicket(active: active, priorities: &priorities) {
             servingContentRequests.insert(next.request)
+            active[next.request.peer, default: 0] += 1
             resolveServingTicket(next.request, granted: true)
         }
     }
@@ -134,12 +152,19 @@ extension Ivy {
         servingContentRequests.lazy.filter { $0.peer == peer }.count
     }
 
-    private func bestEligibleWaitingTicket() -> ServingTicket? {
+    /// `active` counts each peer's slots; `priorities` caches one Tally read
+    /// per peer for the duration of a dispatch.
+    private func bestEligibleWaitingTicket(
+        active: [PeerID: Int],
+        priorities: inout [PeerID: Double]
+    ) -> ServingTicket? {
         var best: (ticket: ServingTicket, priority: Double)?
         for ticket in servingTickets.values where ticket.state == .waiting
-            && activeServingCount(of: ticket.request.peer)
+            && active[ticket.request.peer, default: 0]
                 < config.maxConcurrentContentRequestsPerPeer {
-            let priority = tally.servingPriority(for: ticket.request.peer)
+            let peer = ticket.request.peer
+            let priority = priorities[peer] ?? tally.servingPriority(for: peer)
+            priorities[peer] = priority
             if let current = best,
                priority < current.priority
                 || (priority == current.priority && ticket.arrival > current.ticket.arrival) {
@@ -153,8 +178,11 @@ extension Ivy {
     /// The waiting request to drop first: least helpful peer, newest among equals.
     private func lowestPriorityWaitingTicket() -> ServingTicket? {
         var lowest: (ticket: ServingTicket, priority: Double)?
+        var priorities: [PeerID: Double] = [:]
         for ticket in servingTickets.values where ticket.state == .waiting {
-            let priority = tally.servingPriority(for: ticket.request.peer)
+            let peer = ticket.request.peer
+            let priority = priorities[peer] ?? tally.servingPriority(for: peer)
+            priorities[peer] = priority
             if let current = lowest,
                priority > current.priority
                 || (priority == current.priority && ticket.arrival < current.ticket.arrival) {

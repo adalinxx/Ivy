@@ -200,6 +200,31 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
+    @Test("a free slot serves a newcomer even while another peer waits at its own limit")
+    func freeSlotIsNotIdledByIneligibleWaiters() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-no-idle-slots", clients: 2, source: source,
+            maxConcurrentContentRequests: 4,
+            maxConcurrentContentRequestsPerPeer: 1
+        )
+        let active = fixture.fetch(0, "a-active")
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["a-active"] })
+        let queued = fixture.fetch(0, "a-queued")
+        try await fixture.waiting(1)
+        // Three slots are free; peer 1 must not wait behind peer 0's queue.
+        let other = fixture.fetch(1, "b")
+        #expect(try await TransportTestHarness.eventually {
+            await source.startedRoots() == ["a-active", "b"]
+        })
+        try await fixture.waiting(1)
+        await source.open()
+        #expect(served(await active.value, "a-active"))
+        #expect(served(await queued.value, "a-queued"))
+        #expect(served(await other.value, "b"))
+        await fixture.stop()
+    }
+
     @Test("a peer whose queue is full is refused at once")
     func perPeerQueueFullRefuses() async throws {
         let source = OrderedGateSource()
