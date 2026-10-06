@@ -129,7 +129,9 @@ extension Ivy {
             for (peer, ticket) in oldest {
                 let weight = weights[peer] ?? servingWeight(of: peer)
                 weights[peer] = weight
-                let pass = servingPass[peer] ?? servingVirtualTime + 1 / weight
+                // A pass never counts below the virtual time: a peer skipped
+                // while at its slot limit must not bank the delay.
+                let pass = max(servingPass[peer] ?? servingVirtualTime + 1 / weight, servingVirtualTime)
                 if let current = chosen,
                    pass > current.pass
                     || (pass == current.pass && ticket.arrival > current.ticket.arrival) {
@@ -139,7 +141,9 @@ extension Ivy {
             }
             guard let next = chosen else { break }
             let peer = next.ticket.request.peer
-            servingVirtualTime = next.pass
+            // Virtual time never moves backwards, or peers joining after it
+            // would start below those already waiting.
+            servingVirtualTime = max(servingVirtualTime, next.pass)
             servingPass[peer] = next.pass + 1 / next.weight
             servingContentRequests.insert(next.ticket.request)
             active[peer, default: 0] += 1

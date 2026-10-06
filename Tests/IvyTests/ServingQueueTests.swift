@@ -429,6 +429,66 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
+    @Test("a peer held at its slot limit cannot rewind virtual time and let others cut ahead")
+    func cappedPeerCannotRewindVirtualTime() async throws {
+        // Driven directly, without the network: total slots 2, one per peer,
+        // every peer at weight 1.
+        let ivy = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("queue-no-rewind"),
+            port: TransportTestHarness.nextPort(),
+            maxConcurrentContentRequests: 2,
+            maxConcurrentContentRequestsPerPeer: 1
+        ))
+        func peer(_ name: String) -> PeerID {
+            TransportTestHarness.key(TransportTestHarness.identity("queue-no-rewind-\(name)")).peerID
+        }
+        let (capped, other, newcomer, sybil) = (peer("capped"), peer("other"), peer("newcomer"), peer("sybil"))
+        var nextID: UInt64 = 0
+        func request(_ peer: PeerID) -> InboundContentRequest {
+            nextID += 1
+            return InboundContentRequest(peer: peer, connectionID: nil, requestID: nextID)
+        }
+        // The capped peer holds its one slot and keeps a request waiting.
+        let held = request(capped)
+        let waiting = request(capped)
+        #expect(await ivy.beginServingContent(held))
+        #expect(await ivy.beginServingContent(waiting))
+        // Other traffic advances virtual time while the capped peer is skipped.
+        for _ in 0..<50 {
+            let quick = request(other)
+            #expect(await ivy.beginServingContent(quick))
+            await ivy.endServingContent(quick)
+        }
+        var busy = request(other)
+        _ = await ivy.beginServingContent(busy)
+        let newcomerRequest = request(newcomer)
+        #expect(await ivy.beginServingContent(newcomerRequest))
+        // The capped peer frees its slot and its waiting request is served.
+        await ivy.endServingContent(held)
+        #expect(await ivy.servingContentRequests.contains(waiting))
+        // A fresh identity re-requesting after every grant must not cut ahead.
+        var sybilRequest = request(sybil)
+        _ = await ivy.beginServingContent(sybilRequest)
+        var sybilGrantsFirst = 0
+        while !(await ivy.servingContentRequests.contains(newcomerRequest)), sybilGrantsFirst < 200 {
+            if await ivy.servingContentRequests.contains(busy) {
+                await ivy.endServingContent(busy)
+                busy = request(other)
+            } else if await ivy.servingContentRequests.contains(sybilRequest) {
+                sybilGrantsFirst += 1
+                let next = request(sybil)
+                _ = await ivy.beginServingContent(next)
+                await ivy.endServingContent(sybilRequest)
+                sybilRequest = next
+            } else {
+                break
+            }
+        }
+        #expect(await ivy.servingContentRequests.contains(newcomerRequest))
+        #expect(sybilGrantsFirst <= 1)
+        await ivy.stop()
+    }
+
     @Test("serving limits are validated and the per-peer default is derived")
     func configurationValidation() throws {
         let key = TransportTestHarness.identity("queue-config")
