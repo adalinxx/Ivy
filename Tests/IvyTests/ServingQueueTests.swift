@@ -270,11 +270,11 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
-    @Test("a full queue refuses a newcomer no more helpful than its waiters")
-    func fullQueueRefusesEqualNewcomer() async throws {
+    @Test("in a full queue, a peer with nothing waiting still gets a place")
+    func fullQueueAdmitsPeerWithNothingWaiting() async throws {
         let source = OrderedGateSource()
         let fixture = try await ServingFixture.make(
-            "queue-refuse-newcomer", clients: 3, source: source,
+            "queue-place-for-all", clients: 3, source: source,
             maxConcurrentContentRequests: 1,
             maxQueuedContentRequests: 1
         )
@@ -282,10 +282,37 @@ struct ServingQueueTests {
         #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
         let first = fixture.fetch(1, "first")
         try await fixture.waiting(1)
-        #expect(await fixture.fetch(2, "second").value == .empty)
+        // Equal weights: the single place rotates to the peer that had none.
+        let second = fixture.fetch(2, "second")
+        #expect(await first.value == .empty)
+        try await fixture.waiting(1)
+        await source.open()
+        _ = await holder.value
+        #expect(served(await second.value, "second"))
+        await fixture.stop()
+    }
+
+    @Test("in a full queue, a peer already waiting is refused unless under its weighted share")
+    func fullQueueRefusesPeerAlreadyWaiting() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-refuse-repeat", clients: 3, source: source,
+            maxConcurrentContentRequests: 1,
+            maxQueuedContentRequests: 2
+        )
+        let holder = fixture.fetch(0, "holder")
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
+        let first = fixture.fetch(1, "first")
+        try await fixture.waiting(1)
+        let second = fixture.fetch(2, "second")
+        try await fixture.waiting(2)
+        // Peer 2 already waits and holds its equal share: refused, nothing displaced.
+        #expect(await fixture.fetch(2, "again").value == .empty)
+        try await fixture.waiting(2)
         await source.open()
         _ = await holder.value
         #expect(served(await first.value, "first"))
+        #expect(served(await second.value, "second"))
         await fixture.stop()
     }
 
@@ -333,15 +360,15 @@ struct ServingQueueTests {
         for client in fixture.clients { await client.stop() }
     }
 
-    @Test("under read pressure, the most helpful peer's Volume is read first")
-    func readQueueFavorsHelpfulPeer() async throws {
+    @Test("Volume reads waiting for capacity go first come, first served, whatever the credit")
+    func readQueueIsFIFO() async throws {
         let source = OrderedGateSource()
         // Slots to spare; room for exactly one worst-case read at a time.
         let fixture = try await ServingFixture.make(
-            "read-priority", clients: 3, source: source,
+            "read-fifo", clients: 3, source: source,
             maxInFlightVolumeBytes: MessageLimits.maxVolumeArchiveBytes
         )
-        await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[2], bytes: 10_000)
+        await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[2], bytes: 1_000_000)
         let holder = fixture.fetch(0, "holder")
         #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
         let stranger = fixture.fetch(1, "stranger")
@@ -354,9 +381,73 @@ struct ServingQueueTests {
         })
         await source.open()
         #expect(served(await holder.value, "holder"))
-        #expect(served(await helpful.value, "helpful"))
         #expect(served(await stranger.value, "stranger"))
-        #expect(await source.startedRoots() == ["holder", "helpful", "stranger"])
+        #expect(served(await helpful.value, "helpful"))
+        #expect(await source.startedRoots() == ["holder", "stranger", "helpful"])
+        await fixture.stop()
+    }
+
+    @Test("under sustained pressure a newcomer with no credit keeps being served, at its weighted share")
+    func newcomerSyncsUnderSustainedPressure() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-newcomer-syncs", clients: 3, source: source,
+            maxConcurrentContentRequests: 1
+        )
+        // 1 MiB of credit: weight 1 + log2(1 + 1024) ≈ 11 against the newcomer's 1.
+        await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[1], bytes: 1_048_576)
+        let holder = fixture.fetch(0, "holder")
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
+        var fetches: [Task<AttributedVolumeResponse, Never>] = []
+        for index in 0..<30 {
+            fetches.append(fixture.fetch(1, "credited-\(index)"))
+            try await fixture.waiting(index + 1)
+        }
+        for index in 0..<3 {
+            fetches.append(fixture.fetch(2, "newcomer-\(index)"))
+            try await fixture.waiting(31 + index)
+        }
+        // Grant one slot at a time and record who was served.
+        for grant in 1...33 {
+            await source.releaseNext()
+            #expect(try await TransportTestHarness.eventually { await source.startedRoots().count == grant + 1 })
+        }
+        await source.open()
+        for fetch in fetches { #expect(!(await fetch.value).entries.isEmpty) }
+        _ = await holder.value
+
+        let order = Array(await source.startedRoots().dropFirst())
+        let newcomerPositions = order.indices.filter { order[$0].hasPrefix("newcomer") }
+        #expect(newcomerPositions.count == 3)
+        // The newcomer is reached at once and then about every 12 grants.
+        #expect(newcomerPositions.first! <= 1)
+        for (earlier, later) in zip(newcomerPositions, newcomerPositions.dropFirst()) {
+            #expect((8...14).contains(later - earlier - 1))
+        }
+        await fixture.stop()
+    }
+
+    @Test("a newcomer gets a place even when a heavily credited peer fills the queue")
+    func newcomerGetsPlaceInFullQueue() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-newcomer-place", clients: 3, source: source,
+            maxConcurrentContentRequests: 1,
+            maxQueuedContentRequests: 4
+        )
+        await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[1], bytes: 1_048_576)
+        let holder = fixture.fetch(0, "holder")
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
+        let credited = (0..<4).map { fixture.fetch(1, "credited-\($0)") }
+        try await fixture.waiting(4)
+        let newcomer = fixture.fetch(2, "newcomer")
+        // The credited peer's newest request makes room.
+        #expect(await credited[3].value == .empty)
+        try await fixture.waiting(4)
+        await source.open()
+        #expect(served(await newcomer.value, "newcomer"))
+        for fetch in credited.prefix(3) { #expect(!(await fetch.value).entries.isEmpty) }
+        _ = await holder.value
         await fixture.stop()
     }
 

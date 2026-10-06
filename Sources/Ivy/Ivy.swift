@@ -216,9 +216,10 @@ public actor Ivy {
     var reservedServingVolumeBytes = 0
     /// DHT provider lookups started, for tests that assert one was avoided.
     var freshProviderQueryCount = 0
-    /// Volume reads waiting for serving capacity, in arrival order. Capacity
-    /// goes to the most helpful peer first, oldest first among equals.
-    var servingVolumeReadWaiters: [(id: UUID, peer: PeerID, continuation: CheckedContinuation<Bool, Never>)] = []
+    /// Volume reads waiting for serving capacity, in arrival order. Reads are
+    /// short and slots are already shared by weight, so reads go first come,
+    /// first served: ranking them could starve a peer's read.
+    var servingVolumeReadWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
@@ -227,6 +228,10 @@ public actor Ivy {
     /// Requests waiting for a serving slot; non-empty only under pressure.
     var servingTickets: [InboundContentRequest: ServingTicket] = [:]
     var nextServingTicketArrival: UInt64 = 0
+    /// Stride-scheduling state for contended serving: each waiting peer's
+    /// pass, and the pass of the last grant.
+    var servingPass: [PeerID: Double] = [:]
+    var servingVirtualTime: Double = 0
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]

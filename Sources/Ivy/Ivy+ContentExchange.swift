@@ -513,7 +513,7 @@ extension Ivy {
             }
         }
         guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
-        guard let source, await acquireServingVolumeRead(for: peer) else {
+        guard let source, await acquireServingVolumeRead() else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
@@ -611,7 +611,7 @@ extension Ivy {
     /// rather than being refused: reads are short, and the serving-request
     /// limits already bound how many requests can wait. False when the
     /// request is cancelled or a worst-case Volume can never fit.
-    private func acquireServingVolumeRead(for peer: PeerID) async -> Bool {
+    private func acquireServingVolumeRead() async -> Bool {
         let worstCase = MessageLimits.maxVolumeArchiveBytes
         guard worstCase <= config.maxInFlightVolumeBytes, !Task.isCancelled else {
             return false
@@ -624,7 +624,7 @@ extension Ivy {
                     continuation.resume(returning: false)
                     return
                 }
-                servingVolumeReadWaiters.append((id, peer, continuation))
+                servingVolumeReadWaiters.append((id, continuation))
             }
         } onCancel: {
             Task { await self.cancelServingVolumeReadWaiter(id) }
@@ -655,20 +655,14 @@ extension Ivy {
     }
 
     /// Returns `bytes` of serving reservation and admits the waiting reads
-    /// that now fit: the most helpful peer first, oldest first among equals.
+    /// that now fit, oldest first.
     private func releaseServingVolumeBytes(_ bytes: Int) {
         precondition(bytes >= 0 && reservedServingVolumeBytes >= bytes)
         reservedServingVolumeBytes -= bytes
         let worstCase = MessageLimits.maxVolumeArchiveBytes
         while !servingVolumeReadWaiters.isEmpty, servingVolumeFits(worstCase) {
-            var bestIndex = 0
-            var bestPriority = tally.servingPriority(for: servingVolumeReadWaiters[0].peer)
-            for index in servingVolumeReadWaiters.indices.dropFirst() {
-                let priority = tally.servingPriority(for: servingVolumeReadWaiters[index].peer)
-                if priority > bestPriority { (bestIndex, bestPriority) = (index, priority) }
-            }
             reservedServingVolumeBytes += worstCase
-            servingVolumeReadWaiters.remove(at: bestIndex).continuation.resume(returning: true)
+            servingVolumeReadWaiters.removeFirst().continuation.resume(returning: true)
         }
     }
 
