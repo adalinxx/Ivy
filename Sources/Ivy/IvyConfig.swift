@@ -51,6 +51,11 @@ public struct IvyConfig: Sendable {
     /// peer has its own allotment, so waiting requests total at most this
     /// times the connection count, and no peer can crowd another out.
     public let maxQueuedContentRequestsPerPeer: Int
+    /// Volume requests this node keeps in flight to one peer. A fetch asks
+    /// one peer at a time, least loaded first, and waits rather than exceed
+    /// this - so a syncing node spreads its requests instead of piling them
+    /// on every peer.
+    public let maxOutstandingVolumeRequestsPerPeer: Int
     public let maxContentCandidates: Int
     public let maxInboundBufferedBytes: Int
     public let minPeerKeyBits: Int
@@ -93,6 +98,7 @@ public struct IvyConfig: Sendable {
         maxConcurrentContentRequests: Int = 64,
         maxConcurrentContentRequestsPerPeer: Int? = nil,
         maxQueuedContentRequestsPerPeer: Int = 64,
+        maxOutstandingVolumeRequestsPerPeer: Int = 16,
         maxInboundBufferedBytes: Int = IvyConfig.defaultMaxInboundBufferedBytes,
         minPeerKeyBits: Int = 0,
         maxContentCandidates: Int = 8,
@@ -134,6 +140,7 @@ public struct IvyConfig: Sendable {
         self.maxConcurrentContentRequestsPerPeer = maxConcurrentContentRequestsPerPeer
             ?? max(1, min(8, maxConcurrentContentRequests / 4))
         self.maxQueuedContentRequestsPerPeer = maxQueuedContentRequestsPerPeer
+        self.maxOutstandingVolumeRequestsPerPeer = maxOutstandingVolumeRequestsPerPeer
         self.maxInboundBufferedBytes = maxInboundBufferedBytes
         self.minPeerKeyBits = minPeerKeyBits
         self.maxContentCandidates = maxContentCandidates
@@ -155,7 +162,8 @@ public struct IvyConfig: Sendable {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
         }
         guard (1...maxConcurrentContentRequests).contains(maxConcurrentContentRequestsPerPeer),
-              maxQueuedContentRequestsPerPeer >= 0 else {
+              maxQueuedContentRequestsPerPeer >= 0,
+              maxOutstandingVolumeRequestsPerPeer > 0 else {
             throw IvyModeError.invalidConfiguration(
                 "per-peer serving slots must fit within the total; the queue limit must not be negative")
         }

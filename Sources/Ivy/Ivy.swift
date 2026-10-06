@@ -228,6 +228,10 @@ public actor Ivy {
     /// Requests waiting for a serving slot; non-empty only under pressure.
     var servingTickets: [InboundContentRequest: ServingTicket] = [:]
     var nextServingTicketArrival: UInt64 = 0
+    /// This node's Volume requests in flight to each peer, and requests
+    /// waiting for one to free.
+    var outstandingVolumeRequests: [PeerID: Int] = [:]
+    var outstandingVolumeSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     /// Stride-scheduling state for contended serving: each waiting peer's
     /// pass, and the pass of the last grant.
     var servingPass: [PeerID: Double] = [:]
@@ -2942,6 +2946,7 @@ public actor Ivy {
     func cleanupAllPending() {
         for task in servingContentTasks.values { task.cancel() }
         refuseAllServingTickets()
+        releaseAllOutstandingVolumeSlotWaiters()
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingPeerConnectionWaiters: pendingPeerConnectionWaiters,
