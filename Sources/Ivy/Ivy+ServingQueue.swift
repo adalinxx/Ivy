@@ -52,18 +52,30 @@ extension Ivy {
                 < config.maxConcurrentContentRequestsPerPeer
                     + config.maxQueuedContentRequestsPerPeer else { return false }
         if waitingServingTicketCount >= config.maxQueuedContentRequests {
-            // Make room by dropping the newest request of the peer holding
-            // the most queue for its weight. A peer with nothing queued always
-            // gets a place, so no peer - a syncing newcomer included - is
-            // shut out of a full queue.
-            guard let victim = mostOverQueuedTicket(),
-                  peerWaiting == 0
-                    || Double(peerWaiting + 1) / servingWeight(of: request.peer)
-                        < victim.ratio else { return false }
-            refuseServingTicket(victim.ticket.request)
+            // Make room without ever taking a peer's last waiting request
+            // while another peer holds several: drop the newest request of the
+            // peer with two or more waiting that holds the most queue for its
+            // weight. If every waiting peer has exactly one, only a peer with
+            // none may enter, displacing the newest arrival, so earlier
+            // waiters - a syncing newcomer included - keep their places.
+            if let victim = mostOverQueuedTicket() {
+                guard peerWaiting == 0
+                        || Double(peerWaiting + 1) / servingWeight(of: request.peer)
+                            < victim.ratio else { return false }
+                refuseServingTicket(victim.ticket.request)
+            } else {
+                guard peerWaiting == 0, let newest = newestWaitingTicket() else { return false }
+                refuseServingTicket(newest.request)
+            }
         }
         nextServingTicketArrival &+= 1
         servingTickets[request] = ServingTicket(request: request, arrival: nextServingTicketArrival)
+        // Stride scheduling: a peer that starts waiting begins one stride
+        // ahead of the virtual time and keeps its pass while it waits, so
+        // re-joining cannot jump the peers already waiting.
+        if peerWaiting == 0 {
+            servingPass[request.peer] = servingVirtualTime + 1 / servingWeight(of: request.peer)
+        }
         // The waiters ahead may all be peers at their own limit; a free slot
         // then goes to this request now rather than idling.
         dispatchServingSlots()
@@ -112,10 +124,10 @@ extension Ivy {
     }
 
     /// Hands freed slots to waiting requests by stride scheduling: the
-    /// eligible peer with the lowest pass is served next (higher weight, then
-    /// older request, among equals) and its pass advances by 1 / weight, so
-    /// each waiting peer's share of slots is proportional to its weight. A
-    /// peer that starts waiting begins at the current virtual time.
+    /// eligible peer with the lowest pass is served next (the older request
+    /// among equals) and its pass advances by 1 / weight, so each waiting
+    /// peer's share of slots is proportional to its weight. A peer that starts
+    /// waiting begins one stride past the virtual time.
     func dispatchServingSlots() {
         guard hasFreeServingSlot, waitingServingTicketCount > 0 else { return }
         var active: [PeerID: Int] = [:]
@@ -133,13 +145,11 @@ extension Ivy {
             for (peer, ticket) in oldest {
                 let weight = weights[peer] ?? servingWeight(of: peer)
                 weights[peer] = weight
-                let pass = max(servingPass[peer] ?? servingVirtualTime, servingVirtualTime)
-                if let current = chosen {
-                    if pass > current.pass { continue }
-                    if pass == current.pass {
-                        if weight < current.weight { continue }
-                        if weight == current.weight && ticket.arrival > current.ticket.arrival { continue }
-                    }
+                let pass = servingPass[peer] ?? servingVirtualTime + 1 / weight
+                if let current = chosen,
+                   pass > current.pass
+                    || (pass == current.pass && ticket.arrival > current.ticket.arrival) {
+                    continue
                 }
                 chosen = (ticket, pass, weight)
             }
@@ -199,8 +209,14 @@ extension Ivy {
         servingContentRequests.lazy.filter { $0.peer == peer }.count
     }
 
-    /// The newest waiting request of the peer holding the most queue for
-    /// its weight, with that peer's waiting-count / weight.
+    /// The newest waiting request overall.
+    private func newestWaitingTicket() -> ServingTicket? {
+        servingTickets.values.lazy.filter { $0.state == .waiting }.max { $0.arrival < $1.arrival }
+    }
+
+    /// The newest waiting request of the peer, among those with two or more
+    /// waiting, holding the most queue for its weight, with that peer's
+    /// waiting-count / weight. Nil when no peer has two waiting.
     private func mostOverQueuedTicket() -> (ticket: ServingTicket, ratio: Double)? {
         var newest: [PeerID: ServingTicket] = [:]
         var counts: [PeerID: Int] = [:]
@@ -211,7 +227,7 @@ extension Ivy {
             newest[peer] = ticket
         }
         var victim: (ticket: ServingTicket, ratio: Double)?
-        for (peer, ticket) in newest {
+        for (peer, ticket) in newest where (counts[peer] ?? 0) >= 2 {
             let ratio = Double(counts[peer] ?? 0) / servingWeight(of: peer)
             if let current = victim,
                ratio < current.ratio

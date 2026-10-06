@@ -419,11 +419,83 @@ struct ServingQueueTests {
         let order = Array(await source.startedRoots().dropFirst())
         let newcomerPositions = order.indices.filter { order[$0].hasPrefix("newcomer") }
         #expect(newcomerPositions.count == 3)
-        // The newcomer is reached at once and then about every 12 grants.
-        #expect(newcomerPositions.first! <= 1)
+        // The newcomer is reached within one stride of the credited peer
+        // (about 11 grants) and then about every 12.
+        #expect(newcomerPositions.first! <= 14)
         for (earlier, later) in zip(newcomerPositions, newcomerPositions.dropFirst()) {
             #expect((8...14).contains(later - earlier - 1))
         }
+        await fixture.stop()
+    }
+
+    @Test("credited peers re-requesting one at a time cannot starve a newcomer")
+    func sequentialCreditedPeersCannotStarveNewcomer() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-sequential-credited", clients: 3, source: source,
+            maxConcurrentContentRequests: 1
+        )
+        for credited in [0, 1] {
+            await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[credited], bytes: 1_048_576)
+        }
+        // Each credited peer syncs sequentially: the next request only after a reply.
+        let loops = [0, 1].map { credited in
+            let (ivy, peer) = (fixture.clients[credited], fixture.serverPeers[credited])
+            return Task {
+                for index in 0..<40 {
+                    _ = await ivy.fetchVolume(rootCID: "c\(credited)-\(index)", from: peer)
+                }
+            }
+        }
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots().count == 1 })
+        try await fixture.waiting(1)
+        let newcomer = fixture.fetch(2, "newcomer")
+        try await fixture.waiting(2)
+
+        var grants = 0
+        while !(await source.startedRoots().contains("newcomer")), grants < 40 {
+            let before = await source.startedRoots().count
+            await source.releaseNext()
+            #expect(try await TransportTestHarness.eventually { await source.startedRoots().count > before })
+            grants += 1
+        }
+        // Two credited peers at weight ~11 each against 1: the newcomer is
+        // reached within about two of their strides.
+        #expect(await source.startedRoots().contains("newcomer"))
+        #expect(grants <= 30)
+        await source.open()
+        #expect(served(await newcomer.value, "newcomer"))
+        for loop in loops { loop.cancel() }
+        await fixture.stop()
+    }
+
+    @Test("once queued, a newcomer keeps its place as credited peers keep arriving")
+    func newcomerKeepsPlaceAgainstLaterArrivals() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-newcomer-keeps-place", clients: 5, source: source,
+            maxConcurrentContentRequests: 1,
+            maxQueuedContentRequests: 2
+        )
+        for credited in [2, 3, 4] {
+            await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[credited], bytes: 1_048_576)
+        }
+        let holder = fixture.fetch(0, "holder")
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
+        let newcomer = fixture.fetch(1, "newcomer")
+        try await fixture.waiting(1)
+        let first = fixture.fetch(2, "credited-a")
+        try await fixture.waiting(2)
+        // Each later arrival displaces the newest waiter, never the newcomer.
+        let second = fixture.fetch(3, "credited-b")
+        #expect(await first.value == .empty)
+        let third = fixture.fetch(4, "credited-c")
+        #expect(await second.value == .empty)
+        try await fixture.waiting(2)
+        await source.open()
+        _ = await holder.value
+        #expect(served(await newcomer.value, "newcomer"))
+        #expect(served(await third.value, "credited-c"))
         await fixture.stop()
     }
 
