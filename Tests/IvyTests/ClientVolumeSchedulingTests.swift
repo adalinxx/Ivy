@@ -192,6 +192,95 @@ struct ClientVolumeSchedulingTests {
         for server in fixture.servers { await server.stop() }
     }
 
+    @Test("a peer that let a request time out is tried after peers that answer")
+    func timedOutPeerGoesLast() async throws {
+        let silentIdentity = TransportTestHarness.identity("client-silent-server")
+        let holderIdentity = TransportTestHarness.identity("client-holder-server")
+        let clientIdentity = TransportTestHarness.identity("client-silent-client")
+        let (silentPort, holderPort) = (TransportTestHarness.nextPort(), TransportTestHarness.nextPort())
+        let silent = Ivy(config: TransportTestHarness.config(silentIdentity, port: silentPort))
+        let holder = Ivy(config: TransportTestHarness.config(holderIdentity, port: holderPort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity, port: TransportTestHarness.nextPort(), requestTimeout: .seconds(1)
+        ))
+        await silent.setContentSource(RecordingSource(volumes: ["root": volume("root")]))
+        await holder.setContentSource(RecordingSource(volumes: ["root": volume("root")]))
+        let silentRecorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await silent.setTestDelegate(silentRecorder)
+        await client.setTestDelegate(clientRecorder)
+        try await silent.start()
+        try await holder.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(silentIdentity, port: silentPort))
+        #expect(try await TransportTestHarness.eventually {
+            silentRecorder.authenticatedPeers.count == 1 && clientRecorder.authenticatedPeers.count == 1
+        })
+        // The only peer never replies: the fetch times out and records it.
+        let silentID = TransportTestHarness.key(silentIdentity).peerID
+        await silent.setEndpointWritabilityForTesting(try #require(silentRecorder.authenticatedPeers.first).id, writable: false)
+        #expect(await client.fetchVolume(rootCID: "root").entries.isEmpty)
+        #expect(await client.volumeTimeoutStreaks[silentID] == 1)
+
+        // With a peer that answers connected, it is asked first: no timeout.
+        // (Without the streak, a random tie would pick the silent peer about
+        // half the time; eight fetches make that near certain to show.)
+        try await client.connect(to: TransportTestHarness.endpoint(holderIdentity, port: holderPort))
+        #expect(try await TransportTestHarness.eventually { clientRecorder.authenticatedPeers.count == 2 })
+        for _ in 0..<8 {
+            let started = ContinuousClock.now
+            let response = await client.fetchVolume(rootCID: "root")
+            #expect(response.servedBy == TransportTestHarness.key(holderIdentity).peerID)
+            #expect(ContinuousClock.now - started < .milliseconds(800))
+        }
+        await client.stop()
+        await holder.stop()
+        await silent.stop()
+    }
+
+    @Test("cancelling a fetch waiting for a slot withdraws it and leaks nothing")
+    func cancelWhileWaitingForSlot() async throws {
+        let source = RecordingSource(volumes: ["a": volume("a"), "b": volume("b")], gated: true)
+        let fixture = try await ClientFixture.make(
+            "client-cancel-waiting", sources: [source], maxOutstandingVolumeRequestsPerPeer: 1
+        )
+        let peer = fixture.serverIDs[0]
+        let first = Task { await fixture.client.fetchVolume(rootCID: "a") }
+        #expect(try await TransportTestHarness.eventually { await source.readCount() == 1 })
+        let waiting = Task { await fixture.client.fetchVolume(rootCID: "b") }
+        #expect(try await TransportTestHarness.eventually {
+            await fixture.client.outstandingVolumeSlotWaiters.count == 1
+        })
+        waiting.cancel()
+        #expect(await waiting.value == .empty)
+        #expect(try await TransportTestHarness.eventually {
+            await fixture.client.outstandingVolumeSlotWaiters.isEmpty
+        })
+        #expect(await fixture.client.outstandingVolumeRequests[peer] == 1)
+        await source.open()
+        #expect(await first.value.entries == ["a": Data("a bytes".utf8)])
+        #expect(await fixture.client.outstandingVolumeRequests[peer] == nil)
+        #expect(await source.readCount() == 1)
+        await fixture.stop()
+    }
+
+    @Test("cancelling a fetch mid-request releases its slot")
+    func cancelMidRequestReleasesSlot() async throws {
+        let source = RecordingSource(volumes: ["a": volume("a")], gated: true)
+        let fixture = try await ClientFixture.make("client-cancel-inflight", sources: [source])
+        let peer = fixture.serverIDs[0]
+        let fetch = Task { await fixture.client.fetchVolume(rootCID: "a") }
+        #expect(try await TransportTestHarness.eventually { await source.readCount() == 1 })
+        #expect(await fixture.client.outstandingVolumeRequests[peer] == 1)
+        fetch.cancel()
+        #expect(await fetch.value == .empty)
+        #expect(try await TransportTestHarness.eventually {
+            await fixture.client.outstandingVolumeRequests[peer] == nil
+        })
+        await source.open()
+        await fixture.stop()
+    }
+
     @Test("the per-peer limit is validated")
     func limitValidated() throws {
         let key = TransportTestHarness.identity("client-limit-config")

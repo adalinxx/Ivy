@@ -231,6 +231,9 @@ public actor Ivy {
     /// This node's Volume requests in flight to each peer, and requests
     /// waiting for one to free.
     var outstandingVolumeRequests: [PeerID: Int] = [:]
+    /// Consecutive Volume requests each connected peer let time out; cleared
+    /// when it serves one, dropped when it disconnects.
+    var volumeTimeoutStreaks: [PeerID: Int] = [:]
     var outstandingVolumeSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     /// Stride-scheduling state for contended serving: each waiting peer's
     /// pass, and the pass of the last grant.
@@ -2831,6 +2834,7 @@ public actor Ivy {
     // MARK: - Cleanup
 
     func cleanupPendingForPeer(_ peer: PeerID) {
+        volumeTimeoutStreaks[peer] = nil
         let serving = servingContentTasks.keys.filter { $0.peer == peer }
         for request in serving {
             servingContentTasks[request]?.cancel()
