@@ -57,8 +57,7 @@ enum TransportTestHarness {
         maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         maxConcurrentContentRequests: Int = 64,
         maxConcurrentContentRequestsPerPeer: Int? = nil,
-        maxQueuedContentRequestsPerPeer: Int = 64,
-        maxQueuedContentRequests: Int = 1_024
+        maxQueuedContentRequestsPerPeer: Int = 64
     ) -> IvyConfig {
         IvyConfig(
             signingKey: identity,
@@ -75,7 +74,6 @@ enum TransportTestHarness {
             maxConcurrentContentRequests: maxConcurrentContentRequests,
             maxConcurrentContentRequestsPerPeer: maxConcurrentContentRequestsPerPeer,
             maxQueuedContentRequestsPerPeer: maxQueuedContentRequestsPerPeer,
-            maxQueuedContentRequests: maxQueuedContentRequests,
             maxContentCandidates: maxContentCandidates,
             maxInFlightVolumeBytes: maxInFlightVolumeBytes,
             protocolMaxFrameSize: protocolMaxFrameSize,
