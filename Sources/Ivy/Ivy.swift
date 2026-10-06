@@ -216,13 +216,17 @@ public actor Ivy {
     var reservedServingVolumeBytes = 0
     /// DHT provider lookups started, for tests that assert one was avoided.
     var freshProviderQueryCount = 0
-    /// Volume reads waiting for serving capacity, in arrival order.
-    var servingVolumeReadWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    /// Volume reads waiting for serving capacity, in arrival order. Capacity
+    /// goes to the most helpful peer first, oldest first among equals.
+    var servingVolumeReadWaiters: [(id: UUID, peer: PeerID, continuation: CheckedContinuation<Bool, Never>)] = []
     var pendingFetches: [ContentRequestKey: PendingFetch] = [:]
     var nextFetchToken: UInt64 = 0
     var activeFetchCount = 0
     var servingContentRequests: Set<InboundContentRequest> = []
     var servingContentTasks: [InboundContentRequest: Task<Void, Never>] = [:]
+    /// Requests waiting for a serving slot; non-empty only under pressure.
+    var servingTickets: [InboundContentRequest: ServingTicket] = [:]
+    var nextServingTicketArrival: UInt64 = 0
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0
     var pendingProviderQueries: [String: PendingProviderQuery] = [:]
@@ -2932,6 +2936,7 @@ public actor Ivy {
 
     func cleanupAllPending() {
         for task in servingContentTasks.values { task.cancel() }
+        refuseAllServingTickets()
         Self.drainAllPending(
             pendingSessions: pendingSessions,
             pendingPeerConnectionWaiters: pendingPeerConnectionWaiters,
@@ -3065,6 +3070,14 @@ public actor Ivy {
 
     var providerQueryCountForTesting: Int {
         freshProviderQueryCount
+    }
+
+    var waitingServingTicketCountForTesting: Int {
+        servingTickets.values.filter { $0.state == .waiting }.count
+    }
+
+    var servingTicketCountForTesting: Int {
+        servingTickets.count
     }
 
     func seedConnectedEndpointForTesting(

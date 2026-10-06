@@ -338,6 +338,14 @@ extension Ivy {
     ) async {
         let (inbound, requestID, rootCID, key, maxDataBytes) = request
         defer { endServingContent(inbound) }
+        guard await awaitServingSlot(inbound) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true)
+            return
+        }
 
         let source = contentSource
         if let source {
@@ -479,6 +487,15 @@ extension Ivy {
         session: AuthenticatedSession?
     ) async {
         defer { endServingContent(inbound) }
+        guard await awaitServingSlot(inbound) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session,
+                bypassAdmission: true
+            )
+            return
+        }
         let source = contentSource
         if let source {
             guard let requester = authenticatedPeer(for: peer, session: session),
@@ -496,7 +513,7 @@ extension Ivy {
             }
         }
         guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
-        guard let source, await acquireServingVolumeRead() else {
+        guard let source, await acquireServingVolumeRead(for: peer) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
@@ -594,7 +611,7 @@ extension Ivy {
     /// rather than being refused: reads are short, and the serving-request
     /// limits already bound how many requests can wait. False when the
     /// request is cancelled or a worst-case Volume can never fit.
-    private func acquireServingVolumeRead() async -> Bool {
+    private func acquireServingVolumeRead(for peer: PeerID) async -> Bool {
         let worstCase = MessageLimits.maxVolumeArchiveBytes
         guard worstCase <= config.maxInFlightVolumeBytes, !Task.isCancelled else {
             return false
@@ -607,7 +624,7 @@ extension Ivy {
                     continuation.resume(returning: false)
                     return
                 }
-                servingVolumeReadWaiters.append((id, continuation))
+                servingVolumeReadWaiters.append((id, peer, continuation))
             }
         } onCancel: {
             Task { await self.cancelServingVolumeReadWaiter(id) }
@@ -638,14 +655,20 @@ extension Ivy {
     }
 
     /// Returns `bytes` of serving reservation and admits the waiting reads
-    /// that now fit, oldest first.
+    /// that now fit: the most helpful peer first, oldest first among equals.
     private func releaseServingVolumeBytes(_ bytes: Int) {
         precondition(bytes >= 0 && reservedServingVolumeBytes >= bytes)
         reservedServingVolumeBytes -= bytes
         let worstCase = MessageLimits.maxVolumeArchiveBytes
         while !servingVolumeReadWaiters.isEmpty, servingVolumeFits(worstCase) {
+            var bestIndex = 0
+            var bestPriority = tally.servingPriority(for: servingVolumeReadWaiters[0].peer)
+            for index in servingVolumeReadWaiters.indices.dropFirst() {
+                let priority = tally.servingPriority(for: servingVolumeReadWaiters[index].peer)
+                if priority > bestPriority { (bestIndex, bestPriority) = (index, priority) }
+            }
             reservedServingVolumeBytes += worstCase
-            servingVolumeReadWaiters.removeFirst().continuation.resume(returning: true)
+            servingVolumeReadWaiters.remove(at: bestIndex).continuation.resume(returning: true)
         }
     }
 
@@ -716,22 +739,6 @@ extension Ivy {
             return enqueueIfCurrent(message, on: session, bypassAdmission: bypassAdmission)
         }
         return fireToPeer(peer, message, bypassAdmission: bypassAdmission)
-    }
-
-    private func beginServingContent(_ request: InboundContentRequest) -> Bool {
-        let perPeerLimit = max(1, min(8, config.maxConcurrentContentRequests / 4))
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests,
-              !servingContentRequests.contains(request),
-              servingContentRequests.lazy.filter({ $0.peer == request.peer }).count
-                < perPeerLimit else { return false }
-        servingContentRequests.insert(request)
-        return true
-    }
-
-    private func endServingContent(_ request: InboundContentRequest) {
-        servingContentTasks.removeValue(forKey: request)
-        servingContentRequests.remove(request)
     }
 
     func handleContentResponse(
@@ -952,13 +959,12 @@ extension Ivy {
 
     private func localVolume(rootCID: String) async -> AttributedVolumeResponse? {
         guard let source = contentSource else { return nil }
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests,
-              tryReserveServingVolumeRead() else { return nil }
+        guard hasFreeServingSlot, tryReserveServingVolumeRead() else { return nil }
         activeLocalContentRequestCount += 1
         defer {
             activeLocalContentRequestCount -= 1
             releaseServingVolumeBytes(MessageLimits.maxVolumeArchiveBytes)
+            dispatchServingSlots()
         }
         let entries = await source.volume(
             rootCID: rootCID,
@@ -1224,10 +1230,12 @@ extension Ivy {
             maxFrameSize: config.protocolMaxFrameSize,
             relayed: false
         ) else { return nil }
-        guard servingContentRequests.count + activeLocalContentRequestCount
-                < config.maxConcurrentContentRequests else { return nil }
+        guard hasFreeServingSlot else { return nil }
         activeLocalContentRequestCount += 1
-        defer { activeLocalContentRequestCount -= 1 }
+        defer {
+            activeLocalContentRequestCount -= 1
+            dispatchServingSlots()
+        }
         let entries = await source.content(
             rootCID: key.rootCID,
             cids: key.requestedCIDs,
