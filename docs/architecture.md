@@ -67,15 +67,13 @@ bound exhaustion close it.
 - A physical dial keeps its connection-cap reservation until the underlying
   NIO future completes, including across stop and restart.
 
-Tally gates authenticated application work using peer-global traffic evidence
-and pressure. A relay packet's full signed carrier payload is recorded before
-forwarding admission, so relayed bytes consume the same peer budget as direct
-traffic. Local rate denial is not a protocol violation.
-
-Useful authenticated exchange therefore remains admissible deeper into local
-pressure. Low-evidence or violating peers receive less service, but Ivy does not
-evict an authenticated connection by score. Evidence decays, and application
-content deficiency remains root-scoped rather than becoming global blame.
+Ivy serves any authenticated peer and never rate-limits its own requests.
+Tally records peer-global traffic evidence and compares peers only when
+content requests wait for a serving slot: waiting peers share freed slots in
+proportion to the verified content they served this node, and a peer with no
+history still advances. Ivy does not evict an authenticated connection by
+score. Evidence decays, and application content deficiency remains root-scoped
+rather than becoming global blame.
 
 ## Application protocols
 

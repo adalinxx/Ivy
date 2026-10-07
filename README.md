@@ -116,8 +116,8 @@ sender. `.enqueued` means local queue acceptance, not remote delivery.
 Each authenticated peer is an independent availability zone. Unavailable or
 caller-reported deficient content changes provider selection for that root; it
 does not disconnect the peer or prevent messages and other roots from using the
-same session. Tally reduces admission for weak evidence or verified transport
-violations under pressure, without turning local service history into a ban.
+same session. Tally only weights peers waiting for a serving slot under load; it
+never refuses a peer or the node's own requests.
 
 ## Boundary
 

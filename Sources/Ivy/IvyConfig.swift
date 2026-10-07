@@ -25,9 +25,6 @@ public struct IvyConfig: Sendable {
     public let mode: IvyMode
     public let listenPort: UInt16
     public let bootstrapPeers: [PeerEndpoint]
-    /// Authenticated private-plane peers whose application messages must not
-    /// be silently discarded by the receiver's local Tally policy.
-    public let inboundAdmissionBypassPeerKeys: Set<PeerKey>
     public let carriers: [PeerEndpoint]
     public let tallyConfig: TallyConfig
     public let kBucketSize: Int
@@ -77,7 +74,6 @@ public struct IvyConfig: Sendable {
         signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
         bootstrapPeers: [PeerEndpoint] = [],
-        inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         tallyConfig: TallyConfig = .default,
         kBucketSize: Int = 20,
         requestTimeout: Duration = .seconds(15),
@@ -112,7 +108,6 @@ public struct IvyConfig: Sendable {
         self.mode = mode
         self.listenPort = listenPort
         self.bootstrapPeers = bootstrapPeers
-        self.inboundAdmissionBypassPeerKeys = inboundAdmissionBypassPeerKeys
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
@@ -222,7 +217,6 @@ public struct IvyConfig: Sendable {
             }
         }
 
-        var bootstrapKeys = Set<PeerKey>()
         for endpoint in bootstrapPeers {
             guard endpointIsDialable(endpoint) else {
                 throw IvyModeError.invalidConfiguration("bootstrap endpoint must be dialable")
@@ -230,7 +224,6 @@ public struct IvyConfig: Sendable {
             guard let key = try? PeerKey(endpoint.publicKey) else {
                 throw IvyModeError.invalidEndpointIdentity(endpoint.publicKey)
             }
-            bootstrapKeys.insert(key)
             guard !carrierKeys.contains(key) else {
                 throw IvyModeError.identityRoleCollision(endpoint.publicKey)
             }
@@ -240,19 +233,6 @@ public struct IvyConfig: Sendable {
             if let pinned, key != pinned {
                 throw IvyModeError.peerOutsidePinnedMode(expected: pinned.hex, actual: endpoint.publicKey)
             }
-        }
-        guard inboundAdmissionBypassPeerKeys.isEmpty || mode == .privateNetwork else {
-            throw IvyModeError.invalidConfiguration(
-                "inbound admission bypass is private-network only"
-            )
-        }
-        guard !inboundAdmissionBypassPeerKeys.contains(peerKey) else {
-            throw IvyModeError.identityRoleCollision(peerKey.hex)
-        }
-        guard inboundAdmissionBypassPeerKeys.isSubset(of: bootstrapKeys) else {
-            throw IvyModeError.invalidConfiguration(
-                "inbound admission bypass peers must be configured bootstrap peers"
-            )
         }
     }
 

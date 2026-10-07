@@ -933,19 +933,14 @@ struct ContentExchangeTests {
         #expect(await ivy.inFlightVolumeByteCount() == 0)
     }
 
-    @Test("solicited content replies survive admission exhaustion on the exact session")
-    func solicitedRepliesBypassAdmissionOnExactSession() async throws {
-        let tally = Tally(config: TallyConfig(
-            perPeerRequestCapacity: 1,
-            perPeerRequestRefillPerSecond: 0
-        ))
+    @Test("solicited content replies are accepted only on the exact session")
+    func solicitedRepliesAreAcceptedOnExactSession() async throws {
         let ivy = Ivy(
             config: IvyConfig(
                 publicKey: "solicited-reply-requester",
                 listenPort: 0,
                 requestTimeout: .seconds(1)
-            ),
-            tally: tally
+            )
         )
         let identity = deterministicTestPeerKey("solicited-reply-peer")
         let endpoint = PeerEndpoint(publicKey: identity, host: "127.0.0.1", port: 4102)
@@ -968,8 +963,6 @@ struct ContentExchangeTests {
         })
         let volumeRequestID = try #require(await ivy.pendingVolumeState().requestID)
 
-        #expect(tally.shouldAllow(peer: key.peerID))
-        #expect(!tally.shouldAllow(peer: key.peerID))
         let volumeResponse = try #require(volumeMessage(
             requestID: volumeRequestID,
             rootCID: "root",
@@ -980,7 +973,6 @@ struct ContentExchangeTests {
             from: key.peerID
         )
         #expect(await ivy.pendingVolumeState().requestID == volumeRequestID)
-        let deniedAfterWrongSession = tally.metrics.denied
 
         await ivy.handleCurrentMessageForTesting(
             volumeResponse,
@@ -991,17 +983,6 @@ struct ContentExchangeTests {
             entries: ["root": Data("root".utf8)],
             servedBy: key.peerID
         ))
-        #expect(tally.metrics.denied == deniedAfterWrongSession)
-
-        await ivy.handleCurrentMessageForTesting(
-            try #require(volumeMessage(
-                requestID: .max,
-                rootCID: "root",
-                entries: entries
-            )),
-            from: key.peerID
-        )
-        #expect(tally.metrics.denied == deniedAfterWrongSession + 1)
 
         let unavailableFetch = Task { await ivy.fetchVolume(rootCID: "missing", from: peer) }
         #expect(try await TransportTestHarness.eventually {

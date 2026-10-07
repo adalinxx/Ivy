@@ -306,8 +306,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return nil
         }
         let inbound = InboundContentRequest(
@@ -318,8 +317,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return nil
         }
         return (inbound, requestID, rootCID, key, maxDataBytes)
@@ -342,8 +340,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
 
@@ -358,8 +355,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true)
+                    session: session)
                 return
             }
         }
@@ -379,8 +375,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
 
@@ -388,17 +383,15 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
-        guard case .enqueued = sendContentReply(
+        guard await sendWhenWritable(
             response,
             to: peer,
-            session: session,
-            bypassAdmission: true
+            session: session
         ) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
     }
@@ -471,8 +464,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return nil
         }
@@ -491,8 +483,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -506,8 +497,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true
+                    session: session
                 )
                 return
             }
@@ -517,8 +507,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -545,8 +534,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -556,8 +544,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -574,7 +561,7 @@ extension Ivy {
                 totalBytes: UInt64(archive.data.count),
                 payload: Data(archive.data[start..<end])
             )
-            guard await sendVolumeChunk(
+            guard await sendWhenWritable(
                 response,
                 to: peer,
                 session: session
@@ -582,8 +569,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true
+                    session: session
                 )
                 return
             }
@@ -665,7 +651,9 @@ extension Ivy {
         }
     }
 
-    private func sendVolumeChunk(
+    /// Sends a reply, waiting out a backpressured connection. False only when
+    /// the request is cancelled or its session is gone.
+    private func sendWhenWritable(
         _ message: Message,
         to peer: PeerID,
         session: AuthenticatedSession?
@@ -674,8 +662,7 @@ extension Ivy {
             switch sendContentReply(
                 message,
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             ) {
             case .enqueued:
                 return true
@@ -722,16 +709,15 @@ extension Ivy {
     private func sendContentReply(
         _ message: Message,
         to peer: PeerID,
-        session: AuthenticatedSession?,
-        bypassAdmission: Bool = false
+        session: AuthenticatedSession?
     ) -> SendMessageResult {
         if let session {
 #if DEBUG || IVY_TESTING
             contentReplyConnectionsForTesting.append(session.connection.connectionID)
 #endif
-            return enqueueIfCurrent(message, on: session, bypassAdmission: bypassAdmission)
+            return enqueueIfCurrent(message, on: session)
         }
-        return fireToPeer(peer, message, bypassAdmission: bypassAdmission)
+        return fireToPeer(peer, message)
     }
 
     func handleContentResponse(
@@ -1521,36 +1507,6 @@ extension Ivy {
             }
             return (peer, connection.connectionID)
         })
-    }
-
-    func isExpectedContentReply(
-        _ message: Message,
-        from peer: PeerID,
-        sessionID: Data?
-    ) -> Bool {
-        switch message {
-        case .contentResponse(let requestID, _):
-            return pendingContentRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        case .volumeChunk(let requestID, _, _, _, _, _, _):
-            return pendingVolumeRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        case .contentUnavailable(let requestID):
-            if let pending = pendingContentRequests[requestID],
-               pending.matches(peer: peer, sessionID: sessionID) {
-                return true
-            }
-            return pendingVolumeRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        default:
-            return false
-        }
     }
 
     func fetchContent(
