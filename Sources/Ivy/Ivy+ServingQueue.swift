@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import Tally
 
 /// A content request admitted to wait for a serving slot. It exists only
@@ -11,58 +12,58 @@ struct ServingTicket {
     let arrival: UInt64
     var state: State = .waiting
     /// Set once the request's task awaits the slot. A ticket can be granted
-    /// or refused before that, and then answers immediately.
+    /// or refused before that, and then answers immediately. Refused means
+    /// only that the request was cancelled or the node stopped.
     var continuation: CheckedContinuation<Bool, Never>?
+}
+
+/// A peer with requests waiting for a serving slot.
+struct WaitingServingPeer {
+    var pass: Double
+    /// Tickets still waiting. `tickets` may also hold ones that stopped
+    /// waiting (cancelled); those are skipped, and its first is always waiting.
+    var waiting = 0
+    var tickets = CircularBuffer<(request: InboundContentRequest, arrival: UInt64)>()
 }
 
 extension Ivy {
     /// Admits a request to be served, now or once a slot frees.
     ///
     /// With a free slot and nobody waiting, the request is served at once in
-    /// arrival order. Under pressure it waits, and freed slots are shared
-    /// among the waiting peers in proportion to their weight (see
-    /// `servingWeight`): peers that served this node verified content get
-    /// proportionally more, and a peer with no credit, such as a node syncing
-    /// from scratch, always advances. Each peer queues within its own
-    /// allotment (`maxQueuedContentRequestsPerPeer`), so no peer can crowd
-    /// another out of the queue. False refuses a duplicate or a request over
-    /// the peer's own allotment.
+    /// arrival order, whoever asks: one peer alone may hold every slot. Under
+    /// pressure it waits, and freed slots are shared among the waiting peers
+    /// in proportion to their weight (see `servingWeight`): peers that served
+    /// this node verified content get proportionally more, and a peer with no
+    /// credit, such as a node syncing from scratch, always advances. A
+    /// request is never refused for load. False refuses only a duplicate.
     ///
     /// Ivy treats CIDs as opaque, so it cannot tell verified content from
     /// bytes: the host credits a peer, through `tally.recordUsefulReceived`,
     /// when content it requested from that peer verifies. Without such
     /// credit every peer ranks equally and waiting is first come, first served.
     ///
-    /// A Volume request's `requestTimeout` covers its time waiting, as the
-    /// requester's does. Local reads (`localVolume`, local content) take any
-    /// free slot without queueing: the node's own needs come first.
+    /// `requestTimeout` does not run while a request waits: it starts once
+    /// the request holds its capacity. Local reads (`localVolume`, local
+    /// content) take any free slot without queueing: the node's own needs
+    /// come first.
     func beginServingContent(_ request: InboundContentRequest) -> Bool {
         guard !servingContentRequests.contains(request),
               servingTickets[request] == nil else { return false }
-        let peerActive = activeServingCount(of: request.peer)
-        if waitingServingTicketCount == 0,
-           hasFreeServingSlot,
-           peerActive < config.maxConcurrentContentRequestsPerPeer {
+        if waitingServingTicketCount == 0, hasFreeServingSlot {
             servingContentRequests.insert(request)
             return true
         }
-        let peerWaiting = servingTickets.values.lazy
-            .filter { $0.request.peer == request.peer && $0.state == .waiting }
-            .count
-        guard peerActive + peerWaiting
-                < config.maxConcurrentContentRequestsPerPeer
-                    + config.maxQueuedContentRequestsPerPeer else { return false }
         nextServingTicketArrival &+= 1
         servingTickets[request] = ServingTicket(request: request, arrival: nextServingTicketArrival)
         // Stride scheduling: a peer that starts waiting begins one stride
         // ahead of the virtual time and keeps its pass while it waits, so
         // re-joining cannot jump the peers already waiting.
-        if peerWaiting == 0 {
-            servingPass[request.peer] = servingVirtualTime + 1 / servingWeight(of: request.peer)
-        }
-        // The waiters ahead may all be peers at their own limit; a free slot
-        // then goes to this request now rather than idling.
-        dispatchServingSlots()
+        var peer = waitingServingPeers.removeValue(forKey: request.peer)
+            ?? WaitingServingPeer(pass: servingVirtualTime + 1 / servingWeight(of: request.peer))
+        peer.waiting += 1
+        peer.tickets.append((request, nextServingTicketArrival))
+        waitingServingPeers[request.peer] = peer
+        waitingServingTicketCount += 1
         return true
     }
 
@@ -85,8 +86,9 @@ extension Ivy {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled, var waiting = servingTickets[request],
                       waiting.state == .waiting else {
-                    let granted = servingTickets.removeValue(forKey: request)?.state == .granted
-                    continuation.resume(returning: granted && !Task.isCancelled)
+                    let state = servingTickets.removeValue(forKey: request)?.state
+                    if state == .waiting { servingTicketStoppedWaiting(of: request.peer) }
+                    continuation.resume(returning: state == .granted && !Task.isCancelled)
                     return
                 }
                 waiting.continuation = continuation
@@ -100,6 +102,7 @@ extension Ivy {
     func endServingContent(_ request: InboundContentRequest) {
         servingContentTasks.removeValue(forKey: request)
         if let ticket = servingTickets.removeValue(forKey: request) {
+            if ticket.state == .waiting { servingTicketStoppedWaiting(of: request.peer) }
             ticket.continuation?.resume(returning: false)
         }
         if servingContentRequests.remove(request) != nil {
@@ -108,50 +111,39 @@ extension Ivy {
     }
 
     /// Hands freed slots to waiting requests by stride scheduling: the
-    /// eligible peer with the lowest pass is served next (the older request
+    /// waiting peer with the lowest pass is served next (the older request
     /// among equals) and its pass advances by 1 / weight, so each waiting
     /// peer's share of slots is proportional to its weight. A peer that starts
     /// waiting begins one stride past the virtual time.
     func dispatchServingSlots() {
         guard hasFreeServingSlot, waitingServingTicketCount > 0 else { return }
-        var active: [PeerID: Int] = [:]
-        for request in servingContentRequests { active[request.peer, default: 0] += 1 }
         var weights: [PeerID: Double] = [:]
         while hasFreeServingSlot {
-            var oldest: [PeerID: ServingTicket] = [:]
-            for ticket in servingTickets.values where ticket.state == .waiting
-                && active[ticket.request.peer, default: 0] < config.maxConcurrentContentRequestsPerPeer {
-                let peer = ticket.request.peer
-                if let current = oldest[peer], current.arrival < ticket.arrival { continue }
-                oldest[peer] = ticket
-            }
-            var chosen: (ticket: ServingTicket, pass: Double, weight: Double)?
-            for (peer, ticket) in oldest {
-                let weight = weights[peer] ?? servingWeight(of: peer)
-                weights[peer] = weight
-                // A pass never counts below the virtual time: a peer skipped
-                // while at its slot limit must not bank the delay.
-                let pass = max(servingPass[peer] ?? servingVirtualTime + 1 / weight, servingVirtualTime)
+            var chosen: (
+                ticket: (request: InboundContentRequest, arrival: UInt64),
+                pass: Double,
+                weight: Double
+            )?
+            for (peer, waiting) in waitingServingPeers {
+                guard let ticket = waiting.tickets.first else { continue }
                 if let current = chosen,
-                   pass > current.pass
-                    || (pass == current.pass && ticket.arrival > current.ticket.arrival) {
+                   waiting.pass > current.pass
+                    || (waiting.pass == current.pass && ticket.arrival > current.ticket.arrival) {
                     continue
                 }
-                chosen = (ticket, pass, weight)
+                let weight = weights[peer] ?? servingWeight(of: peer)
+                weights[peer] = weight
+                chosen = (ticket, waiting.pass, weight)
             }
             guard let next = chosen else { break }
             let peer = next.ticket.request.peer
             // Virtual time never moves backwards, or peers joining after it
             // would start below those already waiting.
             servingVirtualTime = max(servingVirtualTime, next.pass)
-            servingPass[peer] = next.pass + 1 / next.weight
+            waitingServingPeers[peer]?.pass = next.pass + 1 / next.weight
             servingContentRequests.insert(next.ticket.request)
-            active[peer, default: 0] += 1
             resolveServingTicket(next.ticket.request, granted: true)
         }
-        // Pass values matter only while a peer waits.
-        let waiting = Set(servingTickets.values.lazy.filter { $0.state == .waiting }.map(\.request.peer))
-        servingPass = servingPass.filter { waiting.contains($0.key) }
     }
 
     /// A peer's share of contended serving: 1 plus log2(1 + credit / 1 KiB),
@@ -173,6 +165,7 @@ extension Ivy {
         for request in Array(servingTickets.keys) { refuseServingTicket(request) }
     }
 
+    /// Grants or refuses a waiting ticket.
     private func resolveServingTicket(_ request: InboundContentRequest, granted: Bool) {
         guard var ticket = servingTickets[request] else { return }
         if let continuation = ticket.continuation {
@@ -182,18 +175,27 @@ extension Ivy {
             ticket.state = granted ? .granted : .refused
             servingTickets[request] = ticket
         }
+        servingTicketStoppedWaiting(of: request.peer)
+    }
+
+    /// Accounts for one of `peer`'s tickets that just stopped waiting, and
+    /// drops the tickets at the front of its queue that no longer wait.
+    private func servingTicketStoppedWaiting(of peer: PeerID) {
+        waitingServingTicketCount -= 1
+        guard var waiting = waitingServingPeers.removeValue(forKey: peer) else { return }
+        waiting.waiting -= 1
+        guard waiting.waiting > 0 else { return }
+        while let first = waiting.tickets.first,
+              servingTickets[first.request].map({
+                  $0.state != .waiting || $0.arrival != first.arrival
+              }) ?? true {
+            waiting.tickets.removeFirst()
+        }
+        waitingServingPeers[peer] = waiting
     }
 
     var hasFreeServingSlot: Bool {
         servingContentRequests.count + activeLocalContentRequestCount
             < config.maxConcurrentContentRequests
-    }
-
-    private var waitingServingTicketCount: Int {
-        servingTickets.values.lazy.filter { $0.state == .waiting }.count
-    }
-
-    private func activeServingCount(of peer: PeerID) -> Int {
-        servingContentRequests.lazy.filter { $0.peer == peer }.count
     }
 }

@@ -25,9 +25,6 @@ public struct IvyConfig: Sendable {
     public let mode: IvyMode
     public let listenPort: UInt16
     public let bootstrapPeers: [PeerEndpoint]
-    /// Authenticated private-plane peers whose application messages must not
-    /// be silently discarded by the receiver's local Tally policy.
-    public let inboundAdmissionBypassPeerKeys: Set<PeerKey>
     public let carriers: [PeerEndpoint]
     public let tallyConfig: TallyConfig
     public let kBucketSize: Int
@@ -43,14 +40,10 @@ public struct IvyConfig: Sendable {
     public let maxConnectionsPerNetgroup: Int
     public let maxPendingRequests: Int
     public let maxWaitersPerRequest: Int
-    /// Content requests this node serves at once, to all peers combined.
+    /// Content requests this node serves at once, to all peers combined. A
+    /// free slot goes to whoever asks; with none free a request waits, and
+    /// freed slots are shared among the waiting peers by weight.
     public let maxConcurrentContentRequests: Int
-    /// Content requests one peer may have served at once.
-    public let maxConcurrentContentRequestsPerPeer: Int
-    /// Requests one peer may have waiting for a slot when all are busy. Each
-    /// peer has its own allotment, so waiting requests total at most this
-    /// times the connection count, and no peer can crowd another out.
-    public let maxQueuedContentRequestsPerPeer: Int
     /// Volume requests this node keeps in flight to one peer. A fetch asks
     /// one peer at a time, least loaded first, and waits rather than exceed
     /// this - so a syncing node spreads its requests instead of piling them
@@ -81,7 +74,6 @@ public struct IvyConfig: Sendable {
         signingKey: Curve25519.Signing.PrivateKey,
         listenPort: UInt16 = 4001,
         bootstrapPeers: [PeerEndpoint] = [],
-        inboundAdmissionBypassPeerKeys: Set<PeerKey> = [],
         tallyConfig: TallyConfig = .default,
         kBucketSize: Int = 20,
         requestTimeout: Duration = .seconds(15),
@@ -96,8 +88,6 @@ public struct IvyConfig: Sendable {
         maxPendingRequests: Int = 4_096,
         maxWaitersPerRequest: Int = 64,
         maxConcurrentContentRequests: Int = 64,
-        maxConcurrentContentRequestsPerPeer: Int? = nil,
-        maxQueuedContentRequestsPerPeer: Int = 64,
         maxOutstandingVolumeRequestsPerPeer: Int = 16,
         maxInboundBufferedBytes: Int = IvyConfig.defaultMaxInboundBufferedBytes,
         minPeerKeyBits: Int = 0,
@@ -118,7 +108,6 @@ public struct IvyConfig: Sendable {
         self.mode = mode
         self.listenPort = listenPort
         self.bootstrapPeers = bootstrapPeers
-        self.inboundAdmissionBypassPeerKeys = inboundAdmissionBypassPeerKeys
         self.carriers = carriers
         self.stunServers = mode.participatesInPublicDiscovery ? stunServers : []
         self.relayEnabled = relayEnabled
@@ -136,10 +125,6 @@ public struct IvyConfig: Sendable {
         self.maxPendingRequests = maxPendingRequests
         self.maxWaitersPerRequest = maxWaitersPerRequest
         self.maxConcurrentContentRequests = maxConcurrentContentRequests
-        // Unset, one peer may use a quarter of the slots, at most eight.
-        self.maxConcurrentContentRequestsPerPeer = maxConcurrentContentRequestsPerPeer
-            ?? max(1, min(8, maxConcurrentContentRequests / 4))
-        self.maxQueuedContentRequestsPerPeer = maxQueuedContentRequestsPerPeer
         self.maxOutstandingVolumeRequestsPerPeer = maxOutstandingVolumeRequestsPerPeer
         self.maxInboundBufferedBytes = maxInboundBufferedBytes
         self.minPeerKeyBits = minPeerKeyBits
@@ -161,11 +146,9 @@ public struct IvyConfig: Sendable {
               maxContentCandidates > 0 else {
             throw IvyModeError.invalidConfiguration("capacity limits must be positive")
         }
-        guard (1...maxConcurrentContentRequests).contains(maxConcurrentContentRequestsPerPeer),
-              maxQueuedContentRequestsPerPeer >= 0,
-              maxOutstandingVolumeRequestsPerPeer > 0 else {
+        guard maxOutstandingVolumeRequestsPerPeer > 0 else {
             throw IvyModeError.invalidConfiguration(
-                "per-peer serving slots must fit within the total; the queue limit must not be negative")
+                "outstanding Volume requests per peer must be positive")
         }
         guard (0...maxConnections).contains(reservedOutboundConnectionSlots) else {
             throw IvyModeError.invalidConfiguration(
@@ -234,7 +217,6 @@ public struct IvyConfig: Sendable {
             }
         }
 
-        var bootstrapKeys = Set<PeerKey>()
         for endpoint in bootstrapPeers {
             guard endpointIsDialable(endpoint) else {
                 throw IvyModeError.invalidConfiguration("bootstrap endpoint must be dialable")
@@ -242,7 +224,6 @@ public struct IvyConfig: Sendable {
             guard let key = try? PeerKey(endpoint.publicKey) else {
                 throw IvyModeError.invalidEndpointIdentity(endpoint.publicKey)
             }
-            bootstrapKeys.insert(key)
             guard !carrierKeys.contains(key) else {
                 throw IvyModeError.identityRoleCollision(endpoint.publicKey)
             }
@@ -252,19 +233,6 @@ public struct IvyConfig: Sendable {
             if let pinned, key != pinned {
                 throw IvyModeError.peerOutsidePinnedMode(expected: pinned.hex, actual: endpoint.publicKey)
             }
-        }
-        guard inboundAdmissionBypassPeerKeys.isEmpty || mode == .privateNetwork else {
-            throw IvyModeError.invalidConfiguration(
-                "inbound admission bypass is private-network only"
-            )
-        }
-        guard !inboundAdmissionBypassPeerKeys.contains(peerKey) else {
-            throw IvyModeError.identityRoleCollision(peerKey.hex)
-        }
-        guard inboundAdmissionBypassPeerKeys.isSubset(of: bootstrapKeys) else {
-            throw IvyModeError.invalidConfiguration(
-                "inbound admission bypass peers must be configured bootstrap peers"
-            )
         }
     }
 

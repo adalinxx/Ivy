@@ -236,8 +236,9 @@ public actor Ivy {
     var volumeTimeoutStreaks: [PeerID: Int] = [:]
     var outstandingVolumeSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     /// Stride-scheduling state for contended serving: each waiting peer's
-    /// pass, and the pass of the last grant.
-    var servingPass: [PeerID: Double] = [:]
+    /// pass and its waiting tickets, and the pass of the last grant.
+    var waitingServingPeers: [PeerID: WaitingServingPeer] = [:]
+    var waitingServingTicketCount = 0
     var servingVirtualTime: Double = 0
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0
@@ -1665,8 +1666,7 @@ public actor Ivy {
         }
         return enqueue(
             .peerMessage(topic: topic, payload: payload),
-            on: session,
-            bypassAdmission: false
+            on: session
         )
     }
 
@@ -1681,7 +1681,7 @@ public actor Ivy {
             return hook(peer.id)
         }
 #endif
-        if case .enqueued = enqueue(message, on: session, bypassAdmission: false) {
+        if case .enqueued = enqueue(message, on: session) {
             return true
         }
         return false
@@ -1699,8 +1699,7 @@ public actor Ivy {
 #endif
         guard case .enqueued = enqueue(
             message,
-            on: session,
-            bypassAdmission: false
+            on: session
         ) else { return nil }
         return session.sessionID.bytes
     }
@@ -1746,21 +1745,20 @@ public actor Ivy {
         guard config.mode.usesOverlayServices else { return }
         let message = Message.peerMessage(topic: topic, payload: payload)
         for session in sessions.values where session.role == .endpoint {
-            _ = enqueue(message, on: session, bypassAdmission: false)
+            _ = enqueue(message, on: session)
         }
     }
 
     @discardableResult
     func fireToPeer(
         _ peer: PeerID,
-        _ message: Message,
-        bypassAdmission: Bool = false
+        _ message: Message
     ) -> SendMessageResult {
         guard let key = try? PeerKey(peer.publicKey) else { return .notConnected }
         if let session = endpointSession(for: key) {
-            return enqueue(message, on: session, bypassAdmission: bypassAdmission)
+            return enqueue(message, on: session)
         } else if message.isKeepalive, let session = carrierSession(for: key) {
-            return enqueue(message, on: session, bypassAdmission: true)
+            return enqueue(message, on: session)
         }
         return .notConnected
     }
@@ -1770,27 +1768,24 @@ public actor Ivy {
               let session = endpointSession(for: key) else {
             return .notConnected
         }
-        return enqueue(message, on: session, bypassAdmission: false)
+        return enqueue(message, on: session)
     }
 
     @discardableResult
     private func enqueue(
         _ message: Message,
-        on session: AuthenticatedSession,
-        bypassAdmission: Bool
+        on session: AuthenticatedSession
     ) -> SendMessageResult {
         let payload = message.serialize(maxFrameSize: effectiveOutboundFrameSize(for: session.connection))
         guard !payload.isEmpty else { return .locallyRejected }
         return enqueuePayload(
             payload,
-            on: session,
-            bypassAdmission: bypassAdmission || message.isKeepalive)
+            on: session)
     }
 
     private func enqueuePayload(
         _ payload: Data,
-        on session: AuthenticatedSession,
-        bypassAdmission: Bool
+        on session: AuthenticatedSession
     ) -> SendMessageResult {
         guard isCurrent(session) else { return .notConnected }
         switch sessionRecordReadiness(on: session.connection) {
@@ -1800,9 +1795,6 @@ public actor Ivy {
             return .backpressured
         case .notConnected:
             return .notConnected
-        }
-        guard bypassAdmission || tally.shouldAllow(peer: session.peerKey.peerID) else {
-            return .locallyRejected
         }
         var sequenceState = session.sequenceState
         guard let sequence = sequenceState.takeNextOutgoing() else { return .locallyRejected }
@@ -1832,11 +1824,10 @@ public actor Ivy {
 
     func enqueueIfCurrent(
         _ message: Message,
-        on session: AuthenticatedSession,
-        bypassAdmission: Bool = false
+        on session: AuthenticatedSession
     ) -> SendMessageResult {
         guard isCurrent(session) else { return .notConnected }
-        return enqueue(message, on: session, bypassAdmission: bypassAdmission)
+        return enqueue(message, on: session)
     }
 
     private func sendRelayControl(_ message: Message, to key: PeerKey) -> Bool {
@@ -1859,7 +1850,7 @@ public actor Ivy {
             session = nil
         }
         guard let session else { return .notConnected }
-        switch enqueue(message, on: session, bypassAdmission: true) {
+        switch enqueue(message, on: session) {
         case .enqueued:
             return .sent
         case .backpressured:
@@ -1874,7 +1865,7 @@ public actor Ivy {
     private func sendRelayReply(_ message: Message, to key: PeerKey) -> Bool {
         let session = sessions[key]
         guard let session, session.connection.isDirect else { return false }
-        if case .enqueued = enqueue(message, on: session, bypassAdmission: true) {
+        if case .enqueued = enqueue(message, on: session) {
             return true
         }
         return false
@@ -1984,12 +1975,6 @@ public actor Ivy {
 
         if isRelayControl(message) {
             guard config.mode.usesOverlayServices else { return }
-            if case .relayClose(let routeID) = message,
-               relayCloseMatches(routeID, sender: session.peerKey) {
-                // A valid close releases bounded state and must remain available under load.
-            } else if !tally.shouldAllow(peer: session.peerKey.peerID) {
-                return
-            }
             guard sessionMayCarryRelayControl(message, session: session) else {
                 rejectAuthenticatedSession(session, attributedTo: session.peerKey)
                 return
@@ -2074,14 +2059,6 @@ public actor Ivy {
             && relayRoutes[routeID] == nil
             && installedRoutes[routeID] == nil
             && pendingRelayOpens[routeID] == nil
-    }
-
-    private func relayCloseMatches(_ routeID: Data, sender: PeerKey) -> Bool {
-        if let route = relayRoutes[routeID] {
-            return route.source == sender || route.target == sender
-        }
-        return installedRoutes[routeID]?.carrier == sender
-            || pendingRelayOpens[routeID]?.carrier == sender
     }
 
     // MARK: - Relay Routes
@@ -2463,7 +2440,7 @@ public actor Ivy {
         let deadline = ContinuousClock.now.advanced(by: config.requestTimeout)
         while relayRoutes[routeID]?.lifecycleID == lifecycleID,
               isCurrent(destination) {
-            switch enqueue(message, on: destination, bypassAdmission: true) {
+            switch enqueue(message, on: destination) {
             case .enqueued:
                 return
             case .backpressured:
@@ -2605,12 +2582,11 @@ public actor Ivy {
         from peer: PeerID,
         session: AuthenticatedSession? = nil
     ) async {
-        var exactPong = false
         if let session {
             guard isCurrent(session) else { return }
             if let monitor = healthMonitor {
                 if case .pong(let nonce) = message {
-                    exactPong = await monitor.recordPong(
+                    _ = await monitor.recordPong(
                         from: peer,
                         sessionID: session.sessionID,
                         nonce: nonce)
@@ -2633,18 +2609,6 @@ public actor Ivy {
             default:
                 return
             }
-        }
-        let bypassesInboundAdmission = session.map {
-            config.inboundAdmissionBypassPeerKeys.contains($0.peerKey)
-        } ?? false
-        let expectedContentReply = isExpectedContentReply(
-            message,
-            from: peer,
-            sessionID: session?.sessionID.bytes
-        )
-        if !exactPong && !bypassesInboundAdmission && !expectedContentReply
-            && !tally.shouldAllow(peer: peer) {
-            return
         }
         switch message {
         case .ping(let nonce):
@@ -3120,7 +3084,7 @@ public actor Ivy {
     func sendAuthenticatedMessageForTesting(_ message: Message, to peer: PeerID) -> Bool {
         guard let key = try? PeerKey(peer.publicKey),
               let session = sessions[key] else { return false }
-        if case .enqueued = enqueue(message, on: session, bypassAdmission: true) {
+        if case .enqueued = enqueue(message, on: session) {
             return true
         }
         return false

@@ -108,13 +108,7 @@ struct ResilienceTests {
         let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
         let loopback = try await TestLoopback.open()
         let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
-        let ivy = Ivy(config: IvyConfig(
-            signingKey: local,
-            tallyConfig: TallyConfig(
-                perPeerRequestCapacity: 1,
-                perPeerRequestRefillPerSecond: 0
-            ),
-            stunServers: []))
+        let ivy = Ivy(config: IvyConfig(signingKey: local, stunServers: []))
         try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
 
         connection.channelWritabilityChanged(isWritable: false)
@@ -130,13 +124,67 @@ struct ResilienceTests {
             to: remote.peerID,
             topic: "state",
             payload: Data()) == .enqueued(endpoint: remote.peerID, route: .direct))
-        #expect(await ivy.sendMessage(
-            to: remote.peerID,
-            topic: "state",
-            payload: Data()) == .locallyRejected)
 
         connection.cancel()
         #expect(!(await ivy.waitUntilWritable(to: remote.peerID)))
+        await loopback.close()
+    }
+
+    @Test("a burst beyond Tally's per-peer request capacity is never locally rejected")
+    func outboundBurstIsNotLocallyRejected() async throws {
+        let local = deterministicTestSigningKey("burst-local")
+        let remote = try PeerKey(deterministicTestPeerKey("burst-remote"))
+        let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
+        let loopback = try await TestLoopback.open()
+        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let ivy = Ivy(config: IvyConfig(
+            signingKey: local,
+            tallyConfig: TallyConfig(
+                perPeerRequestCapacity: 1,
+                perPeerRequestRefillPerSecond: 0
+            ),
+            stunServers: []))
+        try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
+
+        for _ in 0..<100 {
+            #expect(await ivy.sendMessage(
+                to: remote.peerID,
+                topic: "state",
+                payload: Data()) == .enqueued(endpoint: remote.peerID, route: .direct))
+        }
+
+        connection.cancel()
+        await loopback.close()
+    }
+
+    @Test("a content response waits out a backpressured connection")
+    func contentResponseWaitsForWritability() async throws {
+        let local = deterministicTestSigningKey("reply-wait-local")
+        let remote = try PeerKey(deterministicTestPeerKey("reply-wait-remote"))
+        let endpoint = PeerEndpoint(publicKey: remote.hex, host: "127.0.0.1", port: 4001)
+        let loopback = try await TestLoopback.open()
+        let connection = PeerConnection(endpoint: endpoint, channel: loopback.client)
+        let ivy = Ivy(config: IvyConfig(signingKey: local, stunServers: []))
+        try await ivy.seedConnectedEndpointForTesting(endpoint, connection: connection, marker: 1)
+        let content = Data(repeating: 7, count: 1_000)
+        await ivy.setContentSource(TransportTestContentSource(["root": content]))
+
+        connection.channelWritabilityChanged(isWritable: false)
+        let serving = Task {
+            await ivy.handleContentRequest(
+                requestID: 1,
+                rootCID: "root",
+                cids: [],
+                from: remote.peerID)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await ivy.tally.metrics.totalBytesSent == 0)
+
+        connection.channelWritabilityChanged(isWritable: true)
+        await serving.value
+        #expect(await ivy.tally.metrics.totalBytesSent > content.count)
+
+        connection.cancel()
         await loopback.close()
     }
 

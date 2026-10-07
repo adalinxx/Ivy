@@ -67,15 +67,13 @@ bound exhaustion close it.
 - A physical dial keeps its connection-cap reservation until the underlying
   NIO future completes, including across stop and restart.
 
-Tally gates authenticated application work using peer-global traffic evidence
-and pressure. A relay packet's full signed carrier payload is recorded before
-forwarding admission, so relayed bytes consume the same peer budget as direct
-traffic. Local rate denial is not a protocol violation.
-
-Useful authenticated exchange therefore remains admissible deeper into local
-pressure. Low-evidence or violating peers receive less service, but Ivy does not
-evict an authenticated connection by score. Evidence decays, and application
-content deficiency remains root-scoped rather than becoming global blame.
+Ivy serves any authenticated peer and never rate-limits its own requests.
+Tally records peer-global traffic evidence and compares peers only when
+content requests wait for a serving slot: waiting peers share freed slots in
+proportion to the verified content they served this node, and a peer with no
+history still advances. Ivy does not evict an authenticated connection by
+score. Evidence decays, and application content deficiency remains root-scoped
+rather than becoming global blame.
 
 ## Application protocols
 
@@ -118,8 +116,11 @@ independently, and replacement sessions, gaps, duplicates, conflicting stream
 metadata, and malformed archives discard only that provider's attempt. Ivy
 returns no `AttributedVolumeResponse` until one archive is complete and contains
 the requested root. Identifiers and bytes remain opaque: Ivy neither validates
-content addressing nor interprets or traverses a DAG. Ivy cancels serving at
-`requestTimeout`; blocked writers release their reservation, while a storage
+content addressing nor interprets or traverses a DAG. A request waiting for
+capacity never times out. `requestTimeout` starts once a content request holds
+its serving slot, and once a Volume request holds both its slot and its byte
+reservation (its authorization callback runs before that, untimed); from then
+Ivy cancels serving at the deadline. Blocked writers release their reservation, while a storage
 callback that ignores cancellation remains counted until it actually exits.
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and

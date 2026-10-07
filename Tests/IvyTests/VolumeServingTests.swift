@@ -76,6 +76,8 @@ private struct ConnectedPair {
         _ name: String,
         serverSource: (any IvyContentSource)?,
         serverInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
+        serverConcurrentContentRequests: Int = 64,
+        serverRequestTimeout: Duration? = nil,
         requestTimeout: Duration = .seconds(5)
     ) async throws -> ConnectedPair {
         let serverIdentity = TransportTestHarness.identity("\(name)-server")
@@ -84,8 +86,9 @@ private struct ConnectedPair {
         let server = Ivy(config: TransportTestHarness.config(
             serverIdentity,
             port: serverPort,
-            requestTimeout: requestTimeout,
-            maxInFlightVolumeBytes: serverInFlightVolumeBytes
+            requestTimeout: serverRequestTimeout ?? requestTimeout,
+            maxInFlightVolumeBytes: serverInFlightVolumeBytes,
+            maxConcurrentContentRequests: serverConcurrentContentRequests
         ))
         let client = Ivy(config: TransportTestHarness.config(
             clientIdentity,
@@ -181,6 +184,30 @@ struct VolumeServingTests {
         await pair.stop()
     }
 
+    @Test("a request that waits for a slot longer than requestTimeout is still served")
+    func waitingForSlotOutlivesRequestTimeout() async throws {
+        let source = GatedVolumeSource(volumes: ["first": smallVolume("first"), "second": smallVolume("second")])
+        let pair = try await ConnectedPair.make(
+            "serving-wait-outlives-timeout",
+            serverSource: source,
+            serverConcurrentContentRequests: 1,
+            serverRequestTimeout: .seconds(1)
+        )
+        let first = Task { await pair.client.fetchVolume(rootCID: "first", from: pair.serverPeer) }
+        #expect(try await TransportTestHarness.eventually { await source.readsStarted() == 1 })
+        let second = Task { await pair.client.fetchVolume(rootCID: "second", from: pair.serverPeer) }
+        #expect(try await TransportTestHarness.eventually {
+            await pair.server.waitingServingTicketCountForTesting == 1
+        })
+        try await Task.sleep(for: .milliseconds(2_500))
+        #expect(await pair.server.waitingServingTicketCountForTesting == 1)
+
+        await source.open()
+        #expect(await second.value == expectedResponse("second", servedBy: pair.serverPeer.id))
+        first.cancel()
+        await pair.stop()
+    }
+
     @Test("waiting reads are admitted oldest first as capacity frees")
     func waitersAreAdmittedInOrder() async throws {
         let roots = ["a", "b", "c", "d"]
@@ -268,17 +295,15 @@ struct VolumeServingTests {
         await pair.client.stop()
     }
 
-    @Test("a budget smaller than one worst-case Volume refuses at once, never waits")
-    func impossibleBudgetRefusesPromptly() async throws {
+    @Test("a budget smaller than one worst-case Volume still serves, one read at a time")
+    func smallBudgetServesAlone() async throws {
         let pair = try await ConnectedPair.make(
-            "serving-impossible-budget",
+            "serving-small-budget",
             serverSource: MapVolumeSource(volumes: ["root": smallVolume("root")]),
             serverInFlightVolumeBytes: 1024 * 1024,
             requestTimeout: .seconds(10)
         )
-        let started = ContinuousClock.now
-        #expect(await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer) == .empty)
-        #expect(ContinuousClock.now - started < .seconds(5))
+        #expect(!(await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer)).entries.isEmpty)
         #expect(await pair.server.servingVolumeReadWaiterCountForTesting == 0)
         #expect(await pair.server.reservedServingVolumeBytesForTesting == 0)
         await pair.stop()

@@ -306,8 +306,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return nil
         }
         let inbound = InboundContentRequest(
@@ -318,8 +317,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return nil
         }
         return (inbound, requestID, rootCID, key, maxDataBytes)
@@ -342,10 +340,11 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
+        let timeout = startServingTimeout(inbound)
+        defer { timeout.cancel() }
 
         let source = contentSource
         if let source {
@@ -358,8 +357,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true)
+                    session: session)
                 return
             }
         }
@@ -379,8 +377,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
 
@@ -388,17 +385,15 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
-        guard case .enqueued = sendContentReply(
+        guard await sendWhenWritable(
             response,
             to: peer,
-            session: session,
-            bypassAdmission: true
+            session: session
         ) else {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true)
+                session: session)
             return
         }
     }
@@ -415,11 +410,7 @@ extension Ivy {
             from: peer,
             session: session
         ) else { return }
-        let timeout = delayedTask(after: config.requestTimeout) { [weak self] in
-            await self?.cancelServingVolume(inbound)
-        }
         servingContentTasks[inbound] = Task { [weak self] in
-            defer { timeout.cancel() }
             await self?.serveVolumeRequest(
                 inbound: inbound,
                 requestID: requestID,
@@ -430,7 +421,15 @@ extension Ivy {
         }
     }
 
-    private func cancelServingVolume(_ request: InboundContentRequest) {
+    /// Bounds a request that holds its capacity: `requestTimeout` runs from
+    /// here, never while the request waits for a slot or a byte reservation.
+    private func startServingTimeout(_ request: InboundContentRequest) -> IvyTimer {
+        delayedTask(after: config.requestTimeout) { [weak self] in
+            await self?.cancelServing(request)
+        }
+    }
+
+    private func cancelServing(_ request: InboundContentRequest) {
         servingContentTasks[request]?.cancel()
     }
 
@@ -471,8 +470,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return nil
         }
@@ -491,8 +489,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -506,8 +503,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true
+                    session: session
                 )
                 return
             }
@@ -517,11 +513,12 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
+        let timeout = startServingTimeout(inbound)
+        defer { timeout.cancel() }
         // A Volume's size is unknown until it is read, so the read holds a
         // worst-case reservation. Once encoded, only the archive stays in
         // memory while it is sent, so the reservation shrinks to its size.
@@ -545,8 +542,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -556,8 +552,7 @@ extension Ivy {
             sendContentReply(
                 .contentUnavailable(requestID: requestID),
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             )
             return
         }
@@ -574,7 +569,7 @@ extension Ivy {
                 totalBytes: UInt64(archive.data.count),
                 payload: Data(archive.data[start..<end])
             )
-            guard await sendVolumeChunk(
+            guard await sendWhenWritable(
                 response,
                 to: peer,
                 session: session
@@ -582,8 +577,7 @@ extension Ivy {
                 sendContentReply(
                     .contentUnavailable(requestID: requestID),
                     to: peer,
-                    session: session,
-                    bypassAdmission: true
+                    session: session
                 )
                 return
             }
@@ -603,19 +597,18 @@ extension Ivy {
         return VolumeArchive.encode(entries: entries, rootCID: rootCID)
     }
 
+    /// With nothing reserved a read always fits, so a budget below one
+    /// worst-case Volume serves one read at a time rather than none.
     private func servingVolumeFits(_ bytes: Int) -> Bool {
-        bytes <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes
+        reservedServingVolumeBytes == 0
+            || bytes <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes
     }
 
     /// Reserves a worst-case Volume for one read. A burst waits for capacity
-    /// rather than being refused: reads are short, and the serving-request
-    /// limits already bound how many requests can wait. False when the
-    /// request is cancelled or a worst-case Volume can never fit.
+    /// rather than being refused. False only when the request is cancelled.
     private func acquireServingVolumeRead() async -> Bool {
         let worstCase = MessageLimits.maxVolumeArchiveBytes
-        guard worstCase <= config.maxInFlightVolumeBytes, !Task.isCancelled else {
-            return false
-        }
+        guard !Task.isCancelled else { return false }
         if tryReserveServingVolumeRead() { return true }
         let id = UUID()
         let acquired = await withTaskCancellationHandler {
@@ -666,7 +659,9 @@ extension Ivy {
         }
     }
 
-    private func sendVolumeChunk(
+    /// Sends a reply, waiting out a backpressured connection. False only when
+    /// the request is cancelled or its session is gone.
+    private func sendWhenWritable(
         _ message: Message,
         to peer: PeerID,
         session: AuthenticatedSession?
@@ -675,8 +670,7 @@ extension Ivy {
             switch sendContentReply(
                 message,
                 to: peer,
-                session: session,
-                bypassAdmission: true
+                session: session
             ) {
             case .enqueued:
                 return true
@@ -723,16 +717,15 @@ extension Ivy {
     private func sendContentReply(
         _ message: Message,
         to peer: PeerID,
-        session: AuthenticatedSession?,
-        bypassAdmission: Bool = false
+        session: AuthenticatedSession?
     ) -> SendMessageResult {
         if let session {
 #if DEBUG || IVY_TESTING
             contentReplyConnectionsForTesting.append(session.connection.connectionID)
 #endif
-            return enqueueIfCurrent(message, on: session, bypassAdmission: bypassAdmission)
+            return enqueueIfCurrent(message, on: session)
         }
-        return fireToPeer(peer, message, bypassAdmission: bypassAdmission)
+        return fireToPeer(peer, message)
     }
 
     func handleContentResponse(
@@ -1522,36 +1515,6 @@ extension Ivy {
             }
             return (peer, connection.connectionID)
         })
-    }
-
-    func isExpectedContentReply(
-        _ message: Message,
-        from peer: PeerID,
-        sessionID: Data?
-    ) -> Bool {
-        switch message {
-        case .contentResponse(let requestID, _):
-            return pendingContentRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        case .volumeChunk(let requestID, _, _, _, _, _, _):
-            return pendingVolumeRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        case .contentUnavailable(let requestID):
-            if let pending = pendingContentRequests[requestID],
-               pending.matches(peer: peer, sessionID: sessionID) {
-                return true
-            }
-            return pendingVolumeRequests[requestID]?.matches(
-                peer: peer,
-                sessionID: sessionID
-            ) ?? false
-        default:
-            return false
-        }
     }
 
     func fetchContent(
