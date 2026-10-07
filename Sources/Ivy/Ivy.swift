@@ -236,8 +236,9 @@ public actor Ivy {
     var volumeTimeoutStreaks: [PeerID: Int] = [:]
     var outstandingVolumeSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     /// Stride-scheduling state for contended serving: each waiting peer's
-    /// pass, and the pass of the last grant.
-    var servingPass: [PeerID: Double] = [:]
+    /// pass and its waiting tickets, and the pass of the last grant.
+    var waitingServingPeers: [PeerID: WaitingServingPeer] = [:]
+    var waitingServingTicketCount = 0
     var servingVirtualTime: Double = 0
     var activeLocalContentRequestCount = 0
     var nextConnectedFallbackOffset = 0

@@ -343,6 +343,8 @@ extension Ivy {
                 session: session)
             return
         }
+        let timeout = startServingTimeout(inbound)
+        defer { timeout.cancel() }
 
         let source = contentSource
         if let source {
@@ -383,8 +385,6 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
-        let timeout = startServingTimeout(inbound)
-        defer { timeout.cancel() }
         guard await sendWhenWritable(
             response,
             to: peer,

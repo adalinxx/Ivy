@@ -108,6 +108,31 @@ private func served(_ response: AttributedVolumeResponse, _ root: String) -> Boo
     response.entries == [root: Data("\(root) bytes".utf8)]
 }
 
+private extension Ivy {
+    /// Request 0 takes the only slot, `count` more wait behind it, every
+    /// tenth is cancelled, and the rest are served one at a time. Returns
+    /// the order in which they were granted the slot.
+    func drainDeepServingQueueForTesting(peer: PeerID, count: UInt64) -> [UInt64] {
+        func request(_ id: UInt64) -> InboundContentRequest {
+            InboundContentRequest(peer: peer, connectionID: nil, requestID: id)
+        }
+        for id in 0...count { _ = beginServingContent(request(id)) }
+        for id in stride(from: 10, through: count, by: 10) {
+            refuseServingTicket(request(id))
+            endServingContent(request(id))
+        }
+        var order: [UInt64] = []
+        var current: UInt64 = 0
+        while true {
+            endServingContent(request(current))
+            guard let next = servingContentRequests.first else { break }
+            current = next.requestID
+            order.append(current)
+        }
+        return order
+    }
+}
+
 @Suite("Ranked serving queue", .serialized)
 struct ServingQueueTests {
     @Test("without pressure, requests are served at once and never queue")
@@ -377,5 +402,20 @@ struct ServingQueueTests {
         }
         #expect(throws: (any Error).self) { try config(concurrent: 0).validate() }
         try config(concurrent: 1).validate()
+    }
+
+    @Test("a deep queue from one peer is admitted and served in arrival order, skipping cancelled requests")
+    func deepQueueIsServedInOrder() async {
+        let ivy = Ivy(config: IvyConfig(
+            publicKey: "queue-deep",
+            listenPort: 0,
+            maxConcurrentContentRequests: 1))
+        let peer = PeerID(publicKey: deterministicTestPeerKey("queue-deep-peer"))
+        let served = await ivy.drainDeepServingQueueForTesting(peer: peer, count: 5_000)
+        #expect(served == (1...5_000).filter { $0 % 10 != 0 }.map(UInt64.init))
+        #expect(await ivy.waitingServingTicketCountForTesting == 0)
+        #expect(await ivy.waitingServingTicketCount == 0)
+        #expect(await ivy.waitingServingPeers.isEmpty)
+        #expect(await ivy.servingTicketCountForTesting == 0)
     }
 }

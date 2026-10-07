@@ -191,7 +191,7 @@ struct VolumeServingTests {
             "serving-wait-outlives-timeout",
             serverSource: source,
             serverConcurrentContentRequests: 1,
-            serverRequestTimeout: .milliseconds(200)
+            serverRequestTimeout: .seconds(1)
         )
         let first = Task { await pair.client.fetchVolume(rootCID: "first", from: pair.serverPeer) }
         #expect(try await TransportTestHarness.eventually { await source.readsStarted() == 1 })
@@ -199,7 +199,7 @@ struct VolumeServingTests {
         #expect(try await TransportTestHarness.eventually {
             await pair.server.waitingServingTicketCountForTesting == 1
         })
-        try await Task.sleep(for: .milliseconds(600))
+        try await Task.sleep(for: .milliseconds(2_500))
         #expect(await pair.server.waitingServingTicketCountForTesting == 1)
 
         await source.open()

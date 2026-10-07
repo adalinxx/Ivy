@@ -453,6 +453,55 @@ struct TCPIntegrationTests {
         await server.stop()
     }
 
+    @Test("a content reply to a peer that stops draining releases its slot at the deadline")
+    func stalledContentReplyTimesOut() async throws {
+        let serverIdentity = TransportTestHarness.identity("stalled-content-server")
+        let clientIdentity = TransportTestHarness.identity("stalled-content-client")
+        let serverPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(
+            serverIdentity,
+            port: serverPort,
+            requestTimeout: .seconds(1)
+        ))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity,
+            port: TransportTestHarness.nextPort()
+        ))
+        let serverRecorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await server.setTestDelegate(serverRecorder)
+        await client.setTestDelegate(clientRecorder)
+        await server.setContentSource(TransportTestContentSource(["root": Data("root".utf8)]))
+
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(
+            serverIdentity,
+            port: serverPort
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            serverRecorder.authenticatedPeers.count == 1
+                && clientRecorder.authenticatedPeers.count == 1
+        })
+        let clientPeer = try #require(serverRecorder.authenticatedPeers.first)
+        let serverPeer = try #require(clientRecorder.authenticatedPeers.first)
+        await server.setEndpointWritabilityForTesting(clientPeer.id, writable: false)
+
+        let fetch = Task {
+            await client.fetchContent(rootCID: "root", from: serverPeer)
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await server.servingContentCountForTesting() == 1
+        })
+        #expect(try await TransportTestHarness.eventually {
+            await server.servingContentCountForTesting() == 0
+        })
+        #expect(await fetch.value == .empty)
+
+        await client.stop()
+        await server.stop()
+    }
+
     @Test("connections accepted before discovery completes are health-tracked")
     func connectionDuringDiscoveryIsHealthTracked() async throws {
         let serverIdentity = TransportTestHarness.identity("health-before-discovery-server")
