@@ -178,6 +178,51 @@ struct ProviderRefreshTests {
             publicKey: honestProvider.publicKey)))
     }
 
+    @Test("a provider of a root still discovers the other providers of it")
+    func ownRecordDoesNotAnswerDiscovery() async throws {
+        let requesterIdentity = TransportTestHarness.identity("own-record-requester")
+        let routerIdentity = TransportTestHarness.identity("own-record-router")
+        let providerIdentity = TransportTestHarness.identity("own-record-provider")
+        let (requesterPort, routerPort, providerPort) = (
+            TransportTestHarness.nextPort(), TransportTestHarness.nextPort(), TransportTestHarness.nextPort()
+        )
+        let root = "own-record-root"
+        let requester = Ivy(config: TransportTestHarness.config(requesterIdentity, port: requesterPort))
+        let router = Ivy(config: TransportTestHarness.config(routerIdentity, port: routerPort))
+        let provider = Ivy(config: TransportTestHarness.config(providerIdentity, port: providerPort))
+        try await router.start()
+        try await requester.start()
+        try await provider.start()
+        let routerEndpoint = TransportTestHarness.endpoint(routerIdentity, port: routerPort)
+        try await requester.connect(to: routerEndpoint)
+        try await provider.connect(to: routerEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await router.peerConnectionCount == 2
+        })
+
+        // The router holds the other provider's record at a routable address.
+        let expiry = await provider.nowUnix() + 60
+        let providerID = TransportTestHarness.key(providerIdentity).peerID
+        await router.storeProviderHint(
+            rootCID: root,
+            peer: providerID,
+            endpoint: PeerEndpoint(publicKey: providerID.publicKey, host: "8.8.8.8", port: providerPort),
+            expiresAt: expiry)
+
+        // The requester provides the root too: its own record is in its table.
+        await requester.announceProvider(rootCID: root, expiresAt: expiry)
+        let requesterKey = TransportTestHarness.key(requesterIdentity).hex
+
+        let found = await requester.discoverProviders(rootCID: root)
+        #expect(found.map(\.publicKey).contains(providerID.publicKey),
+                "a node's own record must not stand in for the network's answer")
+        #expect(!found.map(\.publicKey).contains(requesterKey), "a node never discovers itself")
+
+        await provider.stop()
+        await requester.stop()
+        await router.stop()
+    }
+
     @Test("a failed cached hint triggers fresh discovery without deleting the hint")
     func staleHintFallsBackToFreshQuery() async throws {
         let requesterIdentity = TransportTestHarness.identity("provider-refresh-requester")
