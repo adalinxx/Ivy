@@ -383,6 +383,8 @@ extension Ivy {
             byCID[cid].map { ContentEntry(cid: cid, data: $0) }
         }
         let response = Message.contentResponse(requestID: requestID, entries: entries)
+        let timeout = startServingTimeout(inbound)
+        defer { timeout.cancel() }
         guard await sendWhenWritable(
             response,
             to: peer,
@@ -408,11 +410,7 @@ extension Ivy {
             from: peer,
             session: session
         ) else { return }
-        let timeout = delayedTask(after: config.requestTimeout) { [weak self] in
-            await self?.cancelServingVolume(inbound)
-        }
         servingContentTasks[inbound] = Task { [weak self] in
-            defer { timeout.cancel() }
             await self?.serveVolumeRequest(
                 inbound: inbound,
                 requestID: requestID,
@@ -423,7 +421,15 @@ extension Ivy {
         }
     }
 
-    private func cancelServingVolume(_ request: InboundContentRequest) {
+    /// Bounds a request that holds its capacity: `requestTimeout` runs from
+    /// here, never while the request waits for a slot or a byte reservation.
+    private func startServingTimeout(_ request: InboundContentRequest) -> IvyTimer {
+        delayedTask(after: config.requestTimeout) { [weak self] in
+            await self?.cancelServing(request)
+        }
+    }
+
+    private func cancelServing(_ request: InboundContentRequest) {
         servingContentTasks[request]?.cancel()
     }
 
@@ -511,6 +517,8 @@ extension Ivy {
             )
             return
         }
+        let timeout = startServingTimeout(inbound)
+        defer { timeout.cancel() }
         // A Volume's size is unknown until it is read, so the read holds a
         // worst-case reservation. Once encoded, only the archive stays in
         // memory while it is sent, so the reservation shrinks to its size.

@@ -31,9 +31,10 @@ extension Ivy {
     /// when content it requested from that peer verifies. Without such
     /// credit every peer ranks equally and waiting is first come, first served.
     ///
-    /// A Volume request's `requestTimeout` covers its time waiting, as the
-    /// requester's does. Local reads (`localVolume`, local content) take any
-    /// free slot without queueing: the node's own needs come first.
+    /// `requestTimeout` does not run while a request waits: it starts once
+    /// the request holds its capacity. Local reads (`localVolume`, local
+    /// content) take any free slot without queueing: the node's own needs
+    /// come first.
     func beginServingContent(_ request: InboundContentRequest) -> Bool {
         guard !servingContentRequests.contains(request),
               servingTickets[request] == nil else { return false }

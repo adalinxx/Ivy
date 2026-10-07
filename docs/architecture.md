@@ -116,8 +116,9 @@ independently, and replacement sessions, gaps, duplicates, conflicting stream
 metadata, and malformed archives discard only that provider's attempt. Ivy
 returns no `AttributedVolumeResponse` until one archive is complete and contains
 the requested root. Identifiers and bytes remain opaque: Ivy neither validates
-content addressing nor interprets or traverses a DAG. Ivy cancels serving at
-`requestTimeout`; blocked writers release their reservation, while a storage
+content addressing nor interprets or traverses a DAG. Ivy cancels serving
+`requestTimeout` after a request is granted its capacity, never while it waits
+for it; blocked writers release their reservation, while a storage
 callback that ignores cancellation remains counted until it actually exits.
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
