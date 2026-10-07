@@ -122,7 +122,10 @@ extension Ivy {
     public func discoverProviders(rootCID: String) async -> [PeerEndpoint] {
         let generation = runGeneration
         guard config.mode.usesOverlayServices, MessageLimits.accepts(rootCID) else { return [] }
-        let cached = cachedProviderEndpoints(rootCID: rootCID)
+        // This node's own record is no answer: a provider looking up a root it
+        // provides is looking for the others, so its record neither returns
+        // nor stands in for the network's answer.
+        let cached = cachedProviderEndpoints(rootCID: rootCID).filter { $0.publicKey != localKey.hex }
         return cached.isEmpty
             ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(
                 rootCID: rootCID,
