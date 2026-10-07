@@ -603,19 +603,18 @@ extension Ivy {
         return VolumeArchive.encode(entries: entries, rootCID: rootCID)
     }
 
+    /// With nothing reserved a read always fits, so a budget below one
+    /// worst-case Volume serves one read at a time rather than none.
     private func servingVolumeFits(_ bytes: Int) -> Bool {
-        bytes <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes
+        reservedServingVolumeBytes == 0
+            || bytes <= config.maxInFlightVolumeBytes - reservedServingVolumeBytes
     }
 
     /// Reserves a worst-case Volume for one read. A burst waits for capacity
-    /// rather than being refused: reads are short, and the serving-request
-    /// limits already bound how many requests can wait. False when the
-    /// request is cancelled or a worst-case Volume can never fit.
+    /// rather than being refused. False only when the request is cancelled.
     private func acquireServingVolumeRead() async -> Bool {
         let worstCase = MessageLimits.maxVolumeArchiveBytes
-        guard worstCase <= config.maxInFlightVolumeBytes, !Task.isCancelled else {
-            return false
-        }
+        guard !Task.isCancelled else { return false }
         if tryReserveServingVolumeRead() { return true }
         let id = UUID()
         let acquired = await withTaskCancellationHandler {

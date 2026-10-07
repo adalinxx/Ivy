@@ -56,8 +56,6 @@ enum TransportTestHarness {
         protocolMaxFrameSize: UInt32 = IvyConfig.defaultProtocolMaxFrameSize,
         maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         maxConcurrentContentRequests: Int = 64,
-        maxConcurrentContentRequestsPerPeer: Int? = nil,
-        maxQueuedContentRequestsPerPeer: Int = 64,
         maxOutstandingVolumeRequestsPerPeer: Int = 16
     ) -> IvyConfig {
         IvyConfig(
@@ -73,8 +71,6 @@ enum TransportTestHarness {
             maxConnections: maxConnections,
             maxConnectionsPerNetgroup: min(16, maxConnections),
             maxConcurrentContentRequests: maxConcurrentContentRequests,
-            maxConcurrentContentRequestsPerPeer: maxConcurrentContentRequestsPerPeer,
-            maxQueuedContentRequestsPerPeer: maxQueuedContentRequestsPerPeer,
             maxOutstandingVolumeRequestsPerPeer: maxOutstandingVolumeRequestsPerPeer,
             maxContentCandidates: maxContentCandidates,
             maxInFlightVolumeBytes: maxInFlightVolumeBytes,

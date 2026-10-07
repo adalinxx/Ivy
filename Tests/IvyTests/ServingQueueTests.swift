@@ -47,8 +47,6 @@ private struct ServingFixture {
         clients count: Int,
         source: any IvyContentSource,
         maxConcurrentContentRequests: Int = 64,
-        maxConcurrentContentRequestsPerPeer: Int? = nil,
-        maxQueuedContentRequestsPerPeer: Int = 64,
         maxInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes
     ) async throws -> ServingFixture {
         let serverIdentity = TransportTestHarness.identity("\(name)-server")
@@ -58,9 +56,7 @@ private struct ServingFixture {
             port: serverPort,
             requestTimeout: .seconds(10),
             maxInFlightVolumeBytes: maxInFlightVolumeBytes,
-            maxConcurrentContentRequests: maxConcurrentContentRequests,
-            maxConcurrentContentRequestsPerPeer: maxConcurrentContentRequestsPerPeer,
-            maxQueuedContentRequestsPerPeer: maxQueuedContentRequestsPerPeer
+            maxConcurrentContentRequests: maxConcurrentContentRequests
         ))
         await server.setContentSource(source)
         try await server.start()
@@ -127,20 +123,39 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
-    @Test("a peer over its slot limit waits instead of being refused")
-    func perPeerOverflowWaits() async throws {
+    @Test("one peer alone can occupy every slot, and its next request waits")
+    func onePeerTakesEverySlot() async throws {
         let source = OrderedGateSource()
         let fixture = try await ServingFixture.make(
-            "queue-per-peer-waits", clients: 1, source: source,
-            maxConcurrentContentRequestsPerPeer: 1
+            "queue-one-peer-all-slots", clients: 1, source: source,
+            maxConcurrentContentRequests: 4
         )
-        let first = fixture.fetch(0, "first")
-        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["first"] })
-        let second = fixture.fetch(0, "second")
+        let active = (0..<4).map { fixture.fetch(0, "active-\($0)") }
+        #expect(try await TransportTestHarness.eventually {
+            await fixture.server.servingContentRequests.count == 4
+        })
+        #expect(await fixture.server.servingTicketCountForTesting == 0)
+        let fifth = fixture.fetch(0, "fifth")
         try await fixture.waiting(1)
         await source.open()
-        #expect(served(await first.value, "first"))
-        #expect(served(await second.value, "second"))
+        for (index, fetch) in active.enumerated() { #expect(served(await fetch.value, "active-\(index)")) }
+        #expect(served(await fifth.value, "fifth"))
+        #expect(await fixture.server.servingTicketCountForTesting == 0)
+        await fixture.stop()
+    }
+
+    @Test("with every slot busy, a peer's 200 requests all wait and all are served: none is refused")
+    func overflowWaitsNeverRefused() async throws {
+        let source = OrderedGateSource()
+        let fixture = try await ServingFixture.make(
+            "queue-never-refuses", clients: 1, source: source,
+            maxConcurrentContentRequests: 2
+        )
+        let fetches = (0..<200).map { fixture.fetch(0, "root-\($0)") }
+        #expect(try await TransportTestHarness.eventually { await source.startedRoots().count == 2 })
+        try await fixture.waiting(198)
+        await source.open()
+        for (index, fetch) in fetches.enumerated() { #expect(served(await fetch.value, "root-\(index)")) }
         #expect(await fixture.server.servingTicketCountForTesting == 0)
         await fixture.stop()
     }
@@ -201,85 +216,7 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
-    @Test("a free slot serves a newcomer even while another peer waits at its own limit")
-    func freeSlotIsNotIdledByIneligibleWaiters() async throws {
-        let source = OrderedGateSource()
-        let fixture = try await ServingFixture.make(
-            "queue-no-idle-slots", clients: 2, source: source,
-            maxConcurrentContentRequests: 4,
-            maxConcurrentContentRequestsPerPeer: 1
-        )
-        let active = fixture.fetch(0, "a-active")
-        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["a-active"] })
-        let queued = fixture.fetch(0, "a-queued")
-        try await fixture.waiting(1)
-        // Three slots are free; peer 1 must not wait behind peer 0's queue.
-        let other = fixture.fetch(1, "b")
-        #expect(try await TransportTestHarness.eventually {
-            await source.startedRoots() == ["a-active", "b"]
-        })
-        try await fixture.waiting(1)
-        await source.open()
-        #expect(served(await active.value, "a-active"))
-        #expect(served(await queued.value, "a-queued"))
-        #expect(served(await other.value, "b"))
-        await fixture.stop()
-    }
-
-    @Test("a peer whose queue is full is refused at once")
-    func perPeerQueueFullRefuses() async throws {
-        let source = OrderedGateSource()
-        let fixture = try await ServingFixture.make(
-            "queue-per-peer-full", clients: 1, source: source,
-            maxConcurrentContentRequestsPerPeer: 1,
-            maxQueuedContentRequestsPerPeer: 1
-        )
-        let active = fixture.fetch(0, "active")
-        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["active"] })
-        let queued = fixture.fetch(0, "queued")
-        try await fixture.waiting(1)
-        let started = ContinuousClock.now
-        #expect(await fixture.fetch(0, "overflow").value == .empty)
-        #expect(ContinuousClock.now - started < .seconds(5))
-        await source.open()
-        #expect(served(await active.value, "active"))
-        #expect(served(await queued.value, "queued"))
-        await fixture.stop()
-    }
-
-    @Test("a newcomer's places are its own: others filling theirs and retrying cannot take them")
-    func newcomerPlacesAreItsOwn() async throws {
-        let source = OrderedGateSource()
-        let fixture = try await ServingFixture.make(
-            "queue-own-allotment", clients: 4, source: source,
-            maxConcurrentContentRequests: 1,
-            maxQueuedContentRequestsPerPeer: 2
-        )
-        await fixture.server.tally.recordUsefulReceived(peer: fixture.clientIDs[1], bytes: 1_048_576)
-        let holder = fixture.fetch(0, "holder")
-        #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
-        // A peer may have its slot limit plus its queue limit outstanding:
-        // 1 + 2 here. A credited peer and an attacker take their full allotments.
-        let credited = (0..<3).map { fixture.fetch(1, "credited-\($0)") }
-        let attacker = (0..<3).map { fixture.fetch(3, "attacker-\($0)") }
-        try await fixture.waiting(6)
-        // The newcomer still gets its full allotment.
-        let newcomer = (0..<3).map { fixture.fetch(2, "newcomer-\($0)") }
-        try await fixture.waiting(9)
-        // The attacker re-requests on every refusal; each is refused against
-        // its own allotment and nothing of the newcomer's is displaced.
-        for round in 0..<6 {
-            #expect(await fixture.fetch(3, "attacker-retry-\(round)").value == .empty)
-            try await fixture.waiting(9)
-        }
-        await source.open()
-        for (index, fetch) in newcomer.enumerated() { #expect(served(await fetch.value, "newcomer-\(index)")) }
-        for fetch in credited + attacker { #expect(!(await fetch.value).entries.isEmpty) }
-        _ = await holder.value
-        await fixture.stop()
-    }
-
-    @Test("a waiting request is withdrawn when its requester disconnects")
+    @Test("a peer's waiting requests are withdrawn when it disconnects")
     func waiterWithdrawnOnDisconnect() async throws {
         let source = OrderedGateSource()
         let fixture = try await ServingFixture.make(
@@ -288,13 +225,13 @@ struct ServingQueueTests {
         )
         let holder = fixture.fetch(0, "holder")
         #expect(try await TransportTestHarness.eventually { await source.startedRoots() == ["holder"] })
-        let leaver = fixture.fetch(1, "leaver")
-        try await fixture.waiting(1)
+        let leaver = (0..<20).map { fixture.fetch(1, "leaver-\($0)") }
+        try await fixture.waiting(20)
         await fixture.clients[1].stop()
         try await fixture.waiting(0)
         await source.open()
         #expect(served(await holder.value, "holder"))
-        _ = await leaver.value
+        for fetch in leaver { _ = await fetch.value }
         #expect(await source.startedRoots() == ["holder"])
         #expect(try await TransportTestHarness.eventually {
             await fixture.server.servingTicketCountForTesting == 0
@@ -432,88 +369,13 @@ struct ServingQueueTests {
         await fixture.stop()
     }
 
-    @Test("a peer held at its slot limit cannot rewind virtual time and let others cut ahead")
-    func cappedPeerCannotRewindVirtualTime() async throws {
-        // Driven directly, without the network: total slots 2, one per peer,
-        // every peer at weight 1.
-        let ivy = Ivy(config: TransportTestHarness.config(
-            TransportTestHarness.identity("queue-no-rewind"),
-            port: TransportTestHarness.nextPort(),
-            maxConcurrentContentRequests: 2,
-            maxConcurrentContentRequestsPerPeer: 1
-        ))
-        func peer(_ name: String) -> PeerID {
-            TransportTestHarness.key(TransportTestHarness.identity("queue-no-rewind-\(name)")).peerID
-        }
-        let (capped, other, newcomer, sybil) = (peer("capped"), peer("other"), peer("newcomer"), peer("sybil"))
-        var nextID: UInt64 = 0
-        func request(_ peer: PeerID) -> InboundContentRequest {
-            nextID += 1
-            return InboundContentRequest(peer: peer, connectionID: nil, requestID: nextID)
-        }
-        // The capped peer holds its one slot and keeps a request waiting.
-        let held = request(capped)
-        let waiting = request(capped)
-        #expect(await ivy.beginServingContent(held))
-        #expect(await ivy.beginServingContent(waiting))
-        // Other traffic advances virtual time while the capped peer is skipped.
-        for _ in 0..<50 {
-            let quick = request(other)
-            #expect(await ivy.beginServingContent(quick))
-            await ivy.endServingContent(quick)
-        }
-        var busy = request(other)
-        _ = await ivy.beginServingContent(busy)
-        let newcomerRequest = request(newcomer)
-        #expect(await ivy.beginServingContent(newcomerRequest))
-        // The capped peer frees its slot and its waiting request is served.
-        await ivy.endServingContent(held)
-        #expect(await ivy.servingContentRequests.contains(waiting))
-        // A fresh identity re-requesting after every grant must not cut ahead.
-        var sybilRequest = request(sybil)
-        _ = await ivy.beginServingContent(sybilRequest)
-        var sybilGrantsFirst = 0
-        while !(await ivy.servingContentRequests.contains(newcomerRequest)), sybilGrantsFirst < 200 {
-            if await ivy.servingContentRequests.contains(busy) {
-                await ivy.endServingContent(busy)
-                busy = request(other)
-            } else if await ivy.servingContentRequests.contains(sybilRequest) {
-                sybilGrantsFirst += 1
-                let next = request(sybil)
-                _ = await ivy.beginServingContent(next)
-                await ivy.endServingContent(sybilRequest)
-                sybilRequest = next
-            } else {
-                break
-            }
-        }
-        #expect(await ivy.servingContentRequests.contains(newcomerRequest))
-        #expect(sybilGrantsFirst <= 1)
-        await ivy.stop()
-    }
-
-    @Test("serving limits are validated and the per-peer default is derived")
+    @Test("the serving slot total must be positive")
     func configurationValidation() throws {
         let key = TransportTestHarness.identity("queue-config")
-        func config(
-            concurrent: Int = 64,
-            perPeer: Int? = nil,
-            queuedPerPeer: Int = 64
-        ) -> IvyConfig {
-            IvyConfig(
-                signingKey: key,
-                listenPort: 0,
-                maxConcurrentContentRequests: concurrent,
-                maxConcurrentContentRequestsPerPeer: perPeer,
-                maxQueuedContentRequestsPerPeer: queuedPerPeer
-            )
+        func config(concurrent: Int) -> IvyConfig {
+            IvyConfig(signingKey: key, listenPort: 0, maxConcurrentContentRequests: concurrent)
         }
-        #expect(config().maxConcurrentContentRequestsPerPeer == 8)
-        #expect(config(concurrent: 12).maxConcurrentContentRequestsPerPeer == 3)
-        #expect(config(concurrent: 2).maxConcurrentContentRequestsPerPeer == 1)
-        #expect(throws: (any Error).self) { try config(concurrent: 4, perPeer: 5).validate() }
-        #expect(throws: (any Error).self) { try config(perPeer: 0).validate() }
-        #expect(throws: (any Error).self) { try config(queuedPerPeer: -1).validate() }
-        try config(concurrent: 4, perPeer: 4, queuedPerPeer: 0).validate()
+        #expect(throws: (any Error).self) { try config(concurrent: 0).validate() }
+        try config(concurrent: 1).validate()
     }
 }

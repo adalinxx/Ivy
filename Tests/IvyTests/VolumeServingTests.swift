@@ -268,17 +268,15 @@ struct VolumeServingTests {
         await pair.client.stop()
     }
 
-    @Test("a budget smaller than one worst-case Volume refuses at once, never waits")
-    func impossibleBudgetRefusesPromptly() async throws {
+    @Test("a budget smaller than one worst-case Volume still serves, one read at a time")
+    func smallBudgetServesAlone() async throws {
         let pair = try await ConnectedPair.make(
-            "serving-impossible-budget",
+            "serving-small-budget",
             serverSource: MapVolumeSource(volumes: ["root": smallVolume("root")]),
             serverInFlightVolumeBytes: 1024 * 1024,
             requestTimeout: .seconds(10)
         )
-        let started = ContinuousClock.now
-        #expect(await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer) == .empty)
-        #expect(ContinuousClock.now - started < .seconds(5))
+        #expect(!(await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer)).entries.isEmpty)
         #expect(await pair.server.servingVolumeReadWaiterCountForTesting == 0)
         #expect(await pair.server.reservedServingVolumeBytesForTesting == 0)
         await pair.stop()
