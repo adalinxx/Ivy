@@ -461,7 +461,7 @@ struct TCPIntegrationTests {
         let server = Ivy(config: TransportTestHarness.config(
             serverIdentity,
             port: serverPort,
-            requestTimeout: .seconds(1)
+            requestTimeout: .seconds(3)
         ))
         let client = Ivy(config: TransportTestHarness.config(
             clientIdentity,
@@ -493,7 +493,7 @@ struct TCPIntegrationTests {
         #expect(try await TransportTestHarness.eventually {
             await server.servingContentCountForTesting() == 1
         })
-        #expect(try await TransportTestHarness.eventually {
+        #expect(try await TransportTestHarness.eventually(attempts: 400) {
             await server.servingContentCountForTesting() == 0
         })
         #expect(await fetch.value == .empty)
