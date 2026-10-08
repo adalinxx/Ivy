@@ -73,6 +73,8 @@ public struct AttributedContentResponse: Sendable, Equatable {
 public enum VolumeFetchFailure: Sendable, Equatable {
     case callerBoundaryExceeded
     case localCapacityUnavailable
+    /// No peer was asked: none was named, or the request could not be sent.
+    case notSent
 }
 
 public struct AttributedVolumeResponse: Sendable, Equatable {
@@ -118,6 +120,9 @@ public struct AttributedVolumeBundleResponse: Sendable, Equatable {
     /// the peer holds none. False when it ended any other way (no answer in
     /// time, a stream violation, a lost session, a refusal) or nobody was asked.
     public let ended: Bool
+    /// Why an answer that did not end is not the peer's doing: this node cut
+    /// it short (`localCapacityUnavailable`, `callerBoundaryExceeded`) or
+    /// asked nobody (`notSent`). Nil when the peer ended it, or failed to.
     public let failure: VolumeFetchFailure?
 
     public static let empty = AttributedVolumeBundleResponse(volumes: [])
@@ -125,6 +130,7 @@ public struct AttributedVolumeBundleResponse: Sendable, Equatable {
         volumes: [],
         failure: .localCapacityUnavailable
     )
+    static let notSent = AttributedVolumeBundleResponse(volumes: [], failure: .notSent)
 
     public init(
         volumes: [AttributedVolumeResponse],
@@ -1069,15 +1075,15 @@ extension Ivy {
         rootCID: String,
         from peers: [AuthenticatedPeer]
     ) async -> AttributedVolumeBundleResponse {
-        guard MessageLimits.accepts(rootCID) else { return .empty }
+        guard MessageLimits.accepts(rootCID) else { return .notSent }
         let generation = runGeneration
         var sessions: [PeerID: AuthenticatedPeer] = [:]
         for peer in peers { sessions[peer.id] = peer }
-        var last = AttributedVolumeBundleResponse.empty
+        var last = AttributedVolumeBundleResponse.notSent
         while !sessions.isEmpty {
             guard isCurrentRun(generation), !Task.isCancelled,
                   let id = await acquireOutstandingVolumeSlot(among: Array(sessions.keys)),
-                  let peer = sessions.removeValue(forKey: id) else { return .empty }
+                  let peer = sessions.removeValue(forKey: id) else { return last }
             let response = await requestVolume(
                 rootCID: rootCID,
                 from: id,
@@ -1089,7 +1095,8 @@ extension Ivy {
             )
             releaseOutstandingVolumeSlot(id)
             if !response.volumes.isEmpty { return response }
-            last = response
+            // A peer that was asked is not forgotten for one that was not.
+            if response.failure != .notSent { last = response }
         }
         return last
     }
@@ -1259,7 +1266,7 @@ extension Ivy {
                     }
                 }
                 guard !enqueued.isEmpty else {
-                    continuation.resume(returning: .empty)
+                    continuation.resume(returning: bundle ? .notSent : .empty)
                     return
                 }
                 pendingVolumeRequests[requestID] = PendingVolumeRequest(
@@ -1497,7 +1504,9 @@ extension Ivy {
             volumes: pending.volumes,
             noBundle: pending.noBundle,
             ended: pending.ended,
-            failure: pending.volumes.isEmpty ? pending.failure : nil
+            // A bundle that did not end says why even with Volumes in hand.
+            failure: pending.volumes.isEmpty || (pending.bundle && !pending.ended)
+                ? pending.failure : nil
         ))
     }
 

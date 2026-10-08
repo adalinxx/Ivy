@@ -91,6 +91,7 @@ private struct ConnectedPair {
         _ name: String,
         serverSource: (any IvyContentSource)?,
         serverInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
+        clientInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         serverConcurrentContentRequests: Int = 64,
         serverRequestTimeout: Duration? = nil,
         requestTimeout: Duration = .seconds(5)
@@ -108,7 +109,8 @@ private struct ConnectedPair {
         let client = Ivy(config: TransportTestHarness.config(
             clientIdentity,
             port: TransportTestHarness.nextPort(),
-            requestTimeout: requestTimeout
+            requestTimeout: requestTimeout,
+            maxInFlightVolumeBytes: clientInFlightVolumeBytes
         ))
         let serverRecorder = TransportTestRecorder()
         let clientRecorder = TransportTestRecorder()
@@ -502,7 +504,7 @@ struct VolumeBundleTests {
     func asksOnlyNamedPeers() async throws {
         let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
         let pair = try await ConnectedPair.make("bundle-unnamed", serverSource: source)
-        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: []) == .empty)
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: []) == .notSent)
         // A session the peer has since replaced is not asked either.
         let stale = AuthenticatedPeer(
             key: pair.serverPeer.key,
@@ -511,8 +513,47 @@ struct VolumeBundleTests {
             metadata: pair.serverPeer.metadata,
             sessionID: Data(repeating: 0xEE, count: 32)
         )
-        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [stale]) == .empty)
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [stale]) == .notSent)
         #expect(await source.readsStarted() == 0)
+        await pair.stop()
+    }
+
+    @Test("a bundle cut short by the requester's own capacity says so, with the Volumes it took")
+    func ownCapacityIsNotThePeersFailure() async throws {
+        // Room for the root's Volume and not for the next one with it.
+        let sizes = try ["root", "member-a"].map {
+            try #require(VolumeArchive.encode(entries: smallVolume($0), rootCID: $0)).data.count
+        }
+        let pair = try await ConnectedPair.make(
+            "bundle-own-capacity",
+            serverSource: MapVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots]),
+            clientInFlightVolumeBytes: sizes[0] + sizes[1] - 1
+        )
+        let response = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(response == AttributedVolumeBundleResponse(
+            volumes: [expectedResponse("root", servedBy: pair.serverPeer.id)],
+            failure: .localCapacityUnavailable
+        ))
+        await pair.stop()
+    }
+
+    @Test("a request this node could not send is told apart from one a peer did not end")
+    func unsentIsNotUnended() async throws {
+        let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
+        let pair = try await ConnectedPair.make(
+            "bundle-unsent", serverSource: source, requestTimeout: .milliseconds(300)
+        )
+        await pair.client.setContentRequestEnqueueHookForTesting { _ in false }
+        let unsent = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(unsent == AttributedVolumeBundleResponse(volumes: [], failure: .notSent))
+        #expect(await source.readsStarted() == 0)
+
+        // Sent, and the peer never answers: no failure of this node's to report.
+        await pair.client.setContentRequestEnqueueHookForTesting(nil)
+        let unended = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(unended == .empty)
+        #expect(await source.readsStarted() == 1)
+        await source.open()
         await pair.stop()
     }
 }
