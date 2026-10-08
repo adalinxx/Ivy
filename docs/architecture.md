@@ -32,6 +32,27 @@ Wire/session protocol v9 rejects v8 during authentication. V9 introduces
 multi-frame complete-Volume replies, which cannot safely share the older
 one-frame Volume contract.
 
+### Adding to the wire without a new version
+
+The session version changes only when an existing record or message changes.
+Everything else is an addition, and an addition needs no version:
+
+- An addition is a new message tag. An existing message never changes its
+  encoding or its meaning.
+- Ivy sends a new message only to a session its caller names. Whether a peer
+  speaks it is the application's to learn (its own hello) and to tell Ivy by
+  naming the peer; Ivy's hello carries no capabilities.
+- A message whose tag this version does not know is ignored: the session
+  stays up and nothing is recorded against the peer. A known message that
+  does not decode still ends the session as a signed protocol violation.
+
+An ignored message costs what any message costs before it is understood: its
+signature and sequence are checked and its bytes counted as received. It is
+bounded as every message is, by the negotiated frame size and the inbound
+byte budget, and it is cheaper than a known message nobody wanted. Peers that
+predate this rule (through 14.0.0) end the session on an unknown tag, which is
+why the second point is a rule and not a courtesy.
+
 Treat every authenticated endpoint connection as an independent availability
 zone, not a verdict about the peer. Application timeouts, unavailable content,
 and caller-reported deficiency leave the session open. Only transport safety
@@ -122,6 +143,24 @@ its serving slot, and once a Volume request holds both its slot and its byte
 reservation (its authorization callback runs before that, untimed); from then
 Ivy cancels serving at the deadline. Blocked writers release their reservation, while a storage
 callback that ignores cancellation remains counted until it actually exits.
+
+A bundle request (added after v9 under the rule above, so sent only to the
+sessions `fetchVolumeBundle` is given) names a root and asks for every Volume
+the source bundles under it. The source names the bundle's Volume roots, the root's own first;
+what a bundle means is the application's. Ivy authorizes, reads, reserves,
+times and streams each Volume exactly as a requested one, in turn, then sends
+`volumeBundleEnd`. Between two Volumes the request gives up its serving slot
+and queues for the next, so under contention a bundle is served no faster
+than the same Volumes requested one at a time. A Volume that cannot
+be sent is left out; an end with no Volume before it says the peer holds no
+bundle for the root, which is distinct from `contentUnavailable`. The
+requester keeps every Volume completed before the answer ended, however it
+ended, each counted against its in-flight Volume budget until the fetch
+returns: a bundle is never required to be complete, and the caller fetches
+what it still lacks as single Volumes. Because a bundle is never needed, a
+peer whose last Volume or bundle request timed out is not asked for a bundle
+until it has served a Volume again or has reconnected (a session's end
+forgets its timeouts).
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
 the wire request. `requestTimeout` bounds that whole fetch for its callers;

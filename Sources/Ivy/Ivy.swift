@@ -1966,6 +1966,10 @@ public actor Ivy {
         tally.recordReceived(peer: session.peerKey.peerID, bytes: record.payload.count)
 
         guard let message = Message.deserialize(record.payload, maxDataPayload: config.protocolMaxFrameSize) else {
+            // A message a later version added is ignored, so a peer may be
+            // sent one before this version knows it. A known message that
+            // does not decode is a violation.
+            guard !Message.hasUnknownTag(record.payload) else { return }
             rejectAuthenticatedSession(session, attributedTo: Self.attributedPeer(
                 session.peerKey,
                 direct: session.connection.isDirect,
@@ -2604,7 +2608,7 @@ public actor Ivy {
             case .ping, .pong, .peerMessage:
                 break
             case .contentRequest, .contentResponse, .contentUnavailable,
-                 .volumeRequest, .volumeChunk:
+                 .volumeRequest, .volumeChunk, .volumeBundleRequest, .volumeBundleEnd:
                 guard config.privateContentExchangeEnabled else { return }
             default:
                 return
@@ -2672,6 +2676,22 @@ public actor Ivy {
                 rootCID: rootCID,
                 from: peer,
                 session: session
+            )
+
+        case .volumeBundleRequest(let requestID, let rootCID):
+            scheduleVolumeRequest(
+                requestID: requestID,
+                rootCID: rootCID,
+                bundle: true,
+                from: peer,
+                session: session
+            )
+
+        case .volumeBundleEnd(let requestID):
+            handleVolumeBundleEnd(
+                requestID: requestID,
+                from: peer,
+                sessionID: session?.sessionID.bytes
             )
 
         case let .volumeChunk(
@@ -3044,6 +3064,12 @@ public actor Ivy {
 
     var servingVolumeReadWaiterCountForTesting: Int {
         servingVolumeReadWaiters.count
+    }
+
+    /// Sends `payload` as a signed session record without encoding a message.
+    func sendRawPayloadForTesting(_ payload: Data, to peer: AuthenticatedPeer) -> SendMessageResult {
+        guard let session = endpointSession(for: peer.key) else { return .notConnected }
+        return enqueuePayload(payload, on: session)
     }
 
     var providerQueryCountForTesting: Int {

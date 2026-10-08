@@ -58,6 +58,9 @@ struct MessageTests {
                 totalBytes: 2,
                 payload: Data([0xaa, 0xbb])
              ), "1c0000000000000003000172000000010001000000000000000200000002aabb"),
+            (.volumeBundleRequest(requestID: 3, rootCID: "r"),
+             "1d0000000000000003000172"),
+            (.volumeBundleEnd(requestID: 3), "1e0000000000000003"),
             (.findProviders(rootCID: "r", requestID: 4), "280001720000000000000004"),
             (.providers(rootCID: "r", requestID: 4, records: []),
              "2900017200000000000000000004"),
@@ -105,6 +108,8 @@ struct MessageTests {
             .contentResponse(requestID: 3, entries: entries),
             .contentUnavailable(requestID: 3),
             .volumeRequest(requestID: 3, rootCID: "root"),
+            .volumeBundleRequest(requestID: 3, rootCID: "root"),
+            .volumeBundleEnd(requestID: 3),
             .volumeChunk(
                 requestID: 3,
                 rootCID: "root",

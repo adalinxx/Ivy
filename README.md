@@ -48,6 +48,7 @@ Ivy supplies three small primitives that applications compose:
 - `sendMessage` carries directed sync requests and responses.
 - `fetchContent` retrieves one exact content selection from available providers.
 - `fetchVolume` retrieves one complete bounded Volume from one provider.
+- `fetchVolumeBundle` retrieves, with one request, the Volumes a named peer bundles under a root.
 
 The caller defines gossip IDs, deduplication, forwarding, sync order, and CID
 validation. Ivy authenticates the sender, bounds each operation, and keeps these

@@ -6,6 +6,11 @@ import Tally
 /// Serves a fixed set of Volumes, each keyed by its root.
 private struct MapVolumeSource: IvyContentSource {
     let volumes: [String: [ContentEntry]]
+    var bundles: [String: [String]] = [:]
+
+    func volumeBundle(rootCID: String) -> [String] {
+        bundles[rootCID] ?? []
+    }
 
     func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
         []
@@ -19,12 +24,18 @@ private struct MapVolumeSource: IvyContentSource {
 /// Holds every read until `open()`; reads after that return at once.
 private actor GatedVolumeSource: IvyContentSource {
     private let volumes: [String: [ContentEntry]]
+    private let bundles: [String: [String]]
     private var isOpen = false
     private var startedReads = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(volumes: [String: [ContentEntry]]) {
+    init(volumes: [String: [ContentEntry]], bundles: [String: [String]] = [:]) {
         self.volumes = volumes
+        self.bundles = bundles
+    }
+
+    func volumeBundle(rootCID: String) -> [String] {
+        bundles[rootCID] ?? []
     }
 
     func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
@@ -33,11 +44,14 @@ private actor GatedVolumeSource: IvyContentSource {
 
     func volume(rootCID: String, maxDataBytes: Int) async -> [ContentEntry] {
         startedReads += 1
+        readOrder.append(rootCID)
         if !isOpen { await withCheckedContinuation { waiters.append($0) } }
         return volumes[rootCID] ?? []
     }
 
     func readsStarted() -> Int { startedReads }
+    private var readOrder: [String] = []
+    func reads() -> [String] { readOrder }
 
     func open() {
         isOpen = true
@@ -71,6 +85,7 @@ private struct ConnectedPair {
     let client: Ivy
     let serverPeer: AuthenticatedPeer
     let clientPeer: AuthenticatedPeer
+    let serverEndpoint: PeerEndpoint
 
     static func make(
         _ name: String,
@@ -111,7 +126,8 @@ private struct ConnectedPair {
             server: server,
             client: client,
             serverPeer: try #require(clientRecorder.authenticatedPeers.first),
-            clientPeer: try #require(serverRecorder.authenticatedPeers.first)
+            clientPeer: try #require(serverRecorder.authenticatedPeers.first),
+            serverEndpoint: TransportTestHarness.endpoint(serverIdentity, port: serverPort)
         )
     }
 
@@ -374,5 +390,193 @@ struct VolumeServingTests {
         await client.stop()
         await relay.stop()
         await provider.stop()
+    }
+}
+
+@Suite("Volume bundles", .serialized)
+struct VolumeBundleTests {
+    private static let roots = ["root", "member-a", "member-b"]
+    private static let volumes = Dictionary(uniqueKeysWithValues: roots.map { ($0, smallVolume($0)) })
+
+    @Test("one request returns the bundle's Volumes in order, leaving out one the server cannot send")
+    func bundleRoundTrip() async throws {
+        let pair = try await ConnectedPair.make(
+            "bundle-round-trip",
+            serverSource: MapVolumeSource(
+                volumes: Self.volumes,
+                bundles: ["root": ["root", "member-a", "absent", "member-b"]]
+            )
+        )
+        let response = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(response == AttributedVolumeBundleResponse(
+            volumes: Self.roots.map { expectedResponse($0, servedBy: pair.serverPeer.id) }
+        ))
+        #expect(try await TransportTestHarness.eventually {
+            let reserved = await pair.server.reservedServingVolumeBytesForTesting
+            let tickets = await pair.server.servingTicketCountForTesting
+            return reserved == 0 && tickets == 0
+        })
+        await pair.stop()
+    }
+
+    @Test("a peer whose source bundles nothing says so at once, and still serves the Volume")
+    func noBundleIsAnsweredNotTimedOut() async throws {
+        // The source holds the Volume and implements no bundle hook.
+        let pair = try await ConnectedPair.make(
+            "bundle-none",
+            serverSource: MapVolumeSource(volumes: Self.volumes),
+            requestTimeout: .seconds(30)
+        )
+        let clock = ContinuousClock()
+        let started = clock.now
+        let bundle = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(bundle == AttributedVolumeBundleResponse(volumes: [], noBundle: true))
+        // A Volume the peer does not hold is refused, not answered "no bundle".
+        let absent = await pair.client.fetchVolume(rootCID: "absent", from: pair.serverPeer)
+        #expect(absent == .empty)
+        #expect(clock.now - started < .seconds(10))
+        let single = await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer)
+        #expect(single == expectedResponse("root", servedBy: pair.serverPeer.id))
+        await pair.stop()
+    }
+
+    @Test("a requester that disconnects mid-bundle releases the serving slot and its bytes")
+    func disconnectReleasesServing() async throws {
+        let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
+        let pair = try await ConnectedPair.make("bundle-disconnect", serverSource: source)
+        let fetch = Task { await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) }
+        #expect(try await TransportTestHarness.eventually { await source.readsStarted() == 1 })
+        #expect(await pair.server.reservedServingVolumeBytesForTesting == MessageLimits.maxVolumeArchiveBytes)
+
+        await pair.client.stop()
+        #expect(try await TransportTestHarness.eventually {
+            await !pair.server.connectedPeers.contains(pair.clientPeer.id)
+        })
+        await source.open()
+        #expect(try await TransportTestHarness.eventually {
+            let reserved = await pair.server.reservedServingVolumeBytesForTesting
+            let tickets = await pair.server.servingTicketCountForTesting
+            return reserved == 0 && tickets == 0
+        })
+        // The Volumes after the interrupted one were never read.
+        #expect(await source.readsStarted() == 1)
+        #expect(await fetch.value.volumes.isEmpty)
+        await pair.server.stop()
+    }
+
+    @Test("another peer's waiting request is served between a bundle's Volumes")
+    func bundleYieldsItsSlotBetweenVolumes() async throws {
+        var volumes = Self.volumes
+        volumes["other"] = smallVolume("other")
+        let source = GatedVolumeSource(volumes: volumes, bundles: ["root": Self.roots])
+        let pair = try await ConnectedPair.make(
+            "bundle-yields", serverSource: source, serverConcurrentContentRequests: 1
+        )
+        let second = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("bundle-yields-second"),
+            port: TransportTestHarness.nextPort(),
+            requestTimeout: .seconds(5)
+        ))
+        try await second.start()
+        try await second.connect(to: pair.serverEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await second.connectedPeers.contains(pair.serverPeer.id)
+        })
+        let bundle = Task { await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) }
+        #expect(try await TransportTestHarness.eventually { await source.readsStarted() == 1 })
+        let other = Task { await second.fetchVolume(rootCID: "other") }
+        #expect(try await TransportTestHarness.eventually {
+            await pair.server.waitingServingTicketCountForTesting == 1
+        })
+        await source.open()
+        #expect(await other.value == expectedResponse("other", servedBy: pair.serverPeer.id))
+        await second.stop()
+        #expect(await bundle.value.volumes.map(\.rootCID) == Self.roots)
+        #expect(await source.reads() == ["root", "other", "member-a", "member-b"])
+        await pair.stop()
+    }
+
+    @Test("a peer that let a bundle request time out is not asked for another until it serves a Volume")
+    func silentPeerIsNotAskedAgain() async throws {
+        let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
+        let pair = try await ConnectedPair.make(
+            "bundle-silent",
+            serverSource: source,
+            serverRequestTimeout: .seconds(30),
+            requestTimeout: .milliseconds(400)
+        )
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) == .empty)
+        #expect(await source.readsStarted() == 1)
+        // Not asked: no read starts, and the answer does not wait for a timeout.
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) == .empty)
+        #expect(await source.readsStarted() == 1)
+
+        await source.open()
+        #expect(try await TransportTestHarness.eventually {
+            await pair.server.reservedServingVolumeBytesForTesting == 0
+        })
+        let single = await pair.client.fetchVolume(rootCID: "member-a", from: pair.serverPeer)
+        #expect(single == expectedResponse("member-a", servedBy: pair.serverPeer.id))
+        let again = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
+        #expect(again.volumes.map(\.rootCID) == Self.roots)
+        await pair.stop()
+    }
+
+    @Test("no peer named, no request: a bundle is never asked of a peer on Ivy's initiative")
+    func asksOnlyNamedPeers() async throws {
+        let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
+        let pair = try await ConnectedPair.make("bundle-unnamed", serverSource: source)
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: []) == .empty)
+        // A session the peer has since replaced is not asked either.
+        let stale = AuthenticatedPeer(
+            key: pair.serverPeer.key,
+            role: pair.serverPeer.role,
+            route: pair.serverPeer.route,
+            metadata: pair.serverPeer.metadata,
+            sessionID: Data(repeating: 0xEE, count: 32)
+        )
+        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [stale]) == .empty)
+        #expect(await source.readsStarted() == 0)
+        await pair.stop()
+    }
+}
+
+@Suite("Messages a later version added", .serialized)
+struct UnknownMessageTests {
+    @Test("a message with an unknown tag is ignored and the session stays usable")
+    func unknownTagIsIgnored() async throws {
+        let pair = try await ConnectedPair.make(
+            "unknown-tag",
+            serverSource: MapVolumeSource(volumes: ["root": smallVolume("root")])
+        )
+        // 0xC8 is no message of this version.
+        #expect(Message.deserialize(Data([0xC8, 1, 2, 3])) == nil)
+        guard case .enqueued = await pair.client.sendRawPayloadForTesting(
+            Data([0xC8, 1, 2, 3]), to: pair.serverPeer
+        ) else {
+            Issue.record("the unknown message was not sent")
+            return
+        }
+        // Records are processed in order: this answer follows the ignored one.
+        let response = await pair.client.fetchVolume(rootCID: "root", from: pair.serverPeer)
+        #expect(response == expectedResponse("root", servedBy: pair.serverPeer.id))
+        #expect(await pair.server.connectedPeers.contains(pair.clientPeer.id))
+        await pair.stop()
+    }
+
+    @Test("a known message that does not decode still ends the session")
+    func malformedKnownTagEndsTheSession() async throws {
+        let pair = try await ConnectedPair.make("malformed-known-tag", serverSource: nil)
+        // A ping (tag 0) cut short of its nonce.
+        guard case .enqueued = await pair.client.sendRawPayloadForTesting(
+            Data([0x00, 1, 2, 3]), to: pair.serverPeer
+        ) else {
+            Issue.record("the malformed message was not sent")
+            return
+        }
+        #expect(try await TransportTestHarness.eventually {
+            await !pair.server.connectedPeers.contains(pair.clientPeer.id)
+        })
+        await pair.stop()
     }
 }

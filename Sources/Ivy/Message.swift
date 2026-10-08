@@ -34,6 +34,13 @@ enum Message: Sendable {
         totalBytes: UInt64,
         payload: Data
     )
+    /// Asks for every Volume the peer bundles under `rootCID`. The answer is
+    /// each Volume's `volumeChunk`s in turn, the root's own first, then
+    /// `volumeBundleEnd`.
+    case volumeBundleRequest(requestID: UInt64, rootCID: String)
+    /// Ends a bundle. With no Volume before it: the peer holds no bundle for
+    /// the root.
+    case volumeBundleEnd(requestID: UInt64)
 
     case findProviders(rootCID: String, requestID: UInt64)
     case providers(rootCID: String, requestID: UInt64, records: [ProviderRecord])
@@ -60,6 +67,8 @@ enum Message: Sendable {
         case contentRequest = 26
         case volumeRequest = 27
         case volumeChunk = 28
+        case volumeBundleRequest = 29
+        case volumeBundleEnd = 30
         case findProviders = 40
         case providers = 41
         case announceProvider = 42
@@ -202,6 +211,15 @@ enum Message: Sendable {
                 payload,
                 maxDataPayload: maxDataPayload
             ) else { return false }
+        case .volumeBundleRequest(let requestID, let rootCID):
+            guard requestID != 0, MessageLimits.accepts(rootCID) else { return false }
+            bytes.append(Tag.volumeBundleRequest.rawValue)
+            bytes.appendUInt64(requestID)
+            guard bytes.appendLengthPrefixedString(rootCID) else { return false }
+        case .volumeBundleEnd(let requestID):
+            guard requestID != 0 else { return false }
+            bytes.append(Tag.volumeBundleEnd.rawValue)
+            bytes.appendUInt64(requestID)
         case .findProviders(let rootCID, let requestID):
             guard MessageLimits.accepts(rootCID), requestID != 0 else { return false }
             bytes.append(Tag.findProviders.rawValue)
@@ -293,6 +311,12 @@ enum Message: Sendable {
         return true
     }
 
+    /// Whether `data` opens with a tag this version does not know: a message a
+    /// later version added, as opposed to a known message that is malformed.
+    static func hasUnknownTag(_ data: Data) -> Bool {
+        data.first.map { Tag(rawValue: $0) == nil } ?? false
+    }
+
     static func deserialize(
         _ data: Data,
         maxDataPayload: UInt32 = IvyConfig.defaultProtocolMaxFrameSize
@@ -357,6 +381,13 @@ enum Message: Sendable {
                 totalBytes: totalBytes,
                 payload: payload
             )
+        case .volumeBundleRequest:
+            guard let requestID = reader.readUInt64(), requestID != 0,
+                  let rootCID = reader.readString() else { return nil }
+            return .volumeBundleRequest(requestID: requestID, rootCID: rootCID)
+        case .volumeBundleEnd:
+            guard let requestID = reader.readUInt64(), requestID != 0 else { return nil }
+            return .volumeBundleEnd(requestID: requestID)
         case .findProviders:
             guard let rootCID = reader.readString(),
                   let requestID = reader.readUInt64(), requestID != 0 else { return nil }
