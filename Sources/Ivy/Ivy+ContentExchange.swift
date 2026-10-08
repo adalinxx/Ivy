@@ -25,6 +25,11 @@ public protocol IvyContentSource: Sendable {
         from peer: AuthenticatedPeer,
         rootCID: String
     ) async -> Bool
+
+    /// The roots of the Volumes this source bundles under `rootCID`, its own
+    /// first, or `[]` when it holds no bundle for it. Each is then read with
+    /// `volume` and authorized as a Volume request for it.
+    func volumeBundle(rootCID: String) async -> [String]
 }
 
 public extension IvyContentSource {
@@ -37,6 +42,10 @@ public extension IvyContentSource {
     }
 
     func volume(rootCID: String, maxDataBytes: Int) async -> [ContentEntry] {
+        []
+    }
+
+    func volumeBundle(rootCID: String) async -> [String] {
         []
     }
 
@@ -94,6 +103,42 @@ public struct AttributedVolumeResponse: Sendable, Equatable {
         self.entries = entries
         self.servedBy = servedBy
         self.failure = failure
+    }
+}
+
+/// The Volumes a peer bundles under one root, as served: unvalidated, and
+/// possibly fewer than the peer holds.
+public struct AttributedVolumeBundleResponse: Sendable, Equatable {
+    /// In the order served: the root's own Volume first.
+    public let volumes: [AttributedVolumeResponse]
+    /// The last peer asked answered that it holds no bundle for the root,
+    /// rather than failing or not answering.
+    public let noBundle: Bool
+    public let failure: VolumeFetchFailure?
+
+    public static let empty = AttributedVolumeBundleResponse(volumes: [])
+    static let localCapacityUnavailable = AttributedVolumeBundleResponse(
+        volumes: [],
+        failure: .localCapacityUnavailable
+    )
+
+    public init(
+        volumes: [AttributedVolumeResponse],
+        noBundle: Bool = false,
+        failure: VolumeFetchFailure? = nil
+    ) {
+        self.volumes = volumes
+        self.noBundle = noBundle
+        self.failure = failure
+    }
+
+    var single: AttributedVolumeResponse {
+        volumes.first ?? AttributedVolumeResponse(
+            rootCID: "",
+            entries: [:],
+            servedBy: nil,
+            failure: failure
+        )
     }
 }
 
@@ -206,9 +251,15 @@ struct PendingVolumeRequest {
     let generation: UInt64
     let maximumArchiveBytes: Int
     let maximumEntries: Int
-    let continuation: CheckedContinuation<AttributedVolumeResponse, Never>
+    /// A bundle request: Volumes accumulate until `volumeBundleEnd`.
+    var bundle = false
+    let continuation: CheckedContinuation<AttributedVolumeBundleResponse, Never>
     var candidateSessions: [PeerID: Data]
     var assemblies: [PeerID: VolumeAssembly] = [:]
+    var volumes: [AttributedVolumeResponse] = []
+    /// What the received `volumes` hold of the in-flight Volume budget.
+    var receivedBytes = 0
+    var noBundle = false
     var failure: VolumeFetchFailure? = nil
     var timeoutTask: IvyTimer? = nil
 
@@ -218,6 +269,7 @@ struct PendingVolumeRequest {
 }
 
 struct VolumeAssembly {
+    let rootCID: String
     let chunkCount: UInt16
     let totalEntries: UInt16
     let totalBytes: Int
@@ -401,6 +453,7 @@ extension Ivy {
     func scheduleVolumeRequest(
         requestID: UInt64,
         rootCID: String,
+        bundle: Bool = false,
         from peer: PeerID,
         session: AuthenticatedSession? = nil
     ) {
@@ -415,6 +468,7 @@ extension Ivy {
                 inbound: inbound,
                 requestID: requestID,
                 rootCID: rootCID,
+                bundle: bundle,
                 from: peer,
                 session: session
             )
@@ -481,6 +535,7 @@ extension Ivy {
         inbound: InboundContentRequest,
         requestID: UInt64,
         rootCID: String,
+        bundle: Bool = false,
         from peer: PeerID,
         session: AuthenticatedSession?
     ) async {
@@ -493,6 +548,75 @@ extension Ivy {
             )
             return
         }
+        guard bundle else {
+            if await sendVolume(
+                inbound: inbound,
+                requestID: requestID,
+                rootCID: rootCID,
+                to: peer,
+                session: session
+            ) == .notSent {
+                sendContentReply(
+                    .contentUnavailable(requestID: requestID),
+                    to: peer,
+                    session: session
+                )
+            }
+            return
+        }
+        // Each Volume of the bundle is read, reserved and sent as a requested
+        // Volume is, and between two the request gives up its serving slot
+        // and queues for the next, so a bundle takes no more of a contended
+        // server than the same Volumes requested one at a time. One that
+        // cannot be sent is left out; without the root's own there is no
+        // bundle.
+        let roots = await contentSource?.volumeBundle(rootCID: rootCID) ?? []
+        if roots.first == rootCID {
+            for volumeRoot in roots {
+                if volumeRoot != rootCID {
+                    guard await retakeServingSlot(inbound) else { return }
+                }
+                let outcome = await sendVolume(
+                    inbound: inbound,
+                    requestID: requestID,
+                    rootCID: volumeRoot,
+                    to: peer,
+                    session: session
+                )
+                if outcome == .interrupted { return }
+                if outcome == .notSent, volumeRoot == rootCID { break }
+            }
+        }
+        guard await sendWhenWritable(
+            .volumeBundleEnd(requestID: requestID),
+            to: peer,
+            session: session
+        ) else {
+            sendContentReply(
+                .contentUnavailable(requestID: requestID),
+                to: peer,
+                session: session
+            )
+            return
+        }
+    }
+
+    private enum VolumeSendOutcome {
+        case sent
+        /// Nothing of the Volume went out.
+        case notSent
+        /// The request was cancelled or its session ended.
+        case interrupted
+    }
+
+    /// Sends one Volume's chunks under a request that holds a serving slot.
+    private func sendVolume(
+        inbound: InboundContentRequest,
+        requestID: UInt64,
+        rootCID: String,
+        to peer: PeerID,
+        session: AuthenticatedSession?
+    ) async -> VolumeSendOutcome {
         let source = contentSource
         if let source {
             guard let requester = authenticatedPeer(for: peer, session: session),
@@ -500,22 +624,12 @@ extension Ivy {
                     from: requester,
                     rootCID: rootCID
                   ) else {
-                sendContentReply(
-                    .contentUnavailable(requestID: requestID),
-                    to: peer,
-                    session: session
-                )
-                return
+                return .notSent
             }
         }
-        guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
+        guard !Task.isCancelled, session.map(isCurrent) ?? true else { return .interrupted }
         guard let source, await acquireServingVolumeRead() else {
-            sendContentReply(
-                .contentUnavailable(requestID: requestID),
-                to: peer,
-                session: session
-            )
-            return
+            return .notSent
         }
         let timeout = startServingTimeout(inbound)
         defer { timeout.cancel() }
@@ -539,25 +653,15 @@ extension Ivy {
                     ?? (endpointConnection(for: peer)?.isDirect == false)
               ),
               payloadBytes > 0 else {
-            sendContentReply(
-                .contentUnavailable(requestID: requestID),
-                to: peer,
-                session: session
-            )
-            return
+            return .notSent
         }
         let chunkCount = (archive.data.count + payloadBytes - 1) / payloadBytes
         guard chunkCount > 0,
               chunkCount <= Int(MessageLimits.maxVolumeChunkCount) else {
-            sendContentReply(
-                .contentUnavailable(requestID: requestID),
-                to: peer,
-                session: session
-            )
-            return
+            return .notSent
         }
         for index in 0..<chunkCount {
-            guard !Task.isCancelled, session.map(isCurrent) ?? true else { return }
+            guard !Task.isCancelled, session.map(isCurrent) ?? true else { return .interrupted }
             let start = index * payloadBytes
             let end = min(start + payloadBytes, archive.data.count)
             let response = Message.volumeChunk(
@@ -579,9 +683,10 @@ extension Ivy {
                     to: peer,
                     session: session
                 )
-                return
+                return .interrupted
             }
         }
+        return .sent
     }
 
     /// Reads and encodes a Volume. Its entries go out of scope on return, so
@@ -892,7 +997,7 @@ extension Ivy {
                 generation: generation,
                 maximumArchiveBytes: maximumArchiveBytes,
                 maximumEntries: maximumEntries
-            )
+            ).single
             if !response.entries.isEmpty { return response }
             last = response
             guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
@@ -941,7 +1046,43 @@ extension Ivy {
                 Int(MessageLimits.maxVolumeEntryCount)
             ),
             exactPeer: peer
-        )
+        ).single
+    }
+
+    /// Fetches the Volumes a peer bundles under `rootCID` with one request:
+    /// every Volume the peer sent before its answer ended, the root's own
+    /// first. Only the sessions named are asked, one at a time (least loaded
+    /// first, as Volume requests are), until one sends a Volume: a bundle
+    /// request is a message a peer must be known to speak, which is the
+    /// caller's to know. A bundle is never needed, so a peer whose last
+    /// request timed out is not asked for one until it has served a Volume.
+    public func fetchVolumeBundle(
+        rootCID: String,
+        from peers: [AuthenticatedPeer]
+    ) async -> AttributedVolumeBundleResponse {
+        guard MessageLimits.accepts(rootCID) else { return .empty }
+        let generation = runGeneration
+        var sessions: [PeerID: AuthenticatedPeer] = [:]
+        for peer in peers where volumeTimeoutStreaks[peer.id] == nil { sessions[peer.id] = peer }
+        var last = AttributedVolumeBundleResponse.empty
+        while !sessions.isEmpty {
+            guard isCurrentRun(generation), !Task.isCancelled,
+                  let id = await acquireOutstandingVolumeSlot(among: Array(sessions.keys)),
+                  let peer = sessions.removeValue(forKey: id) else { return .empty }
+            let response = await requestVolume(
+                rootCID: rootCID,
+                from: id,
+                generation: generation,
+                maximumArchiveBytes: MessageLimits.maxVolumeArchiveBytes,
+                maximumEntries: Int(MessageLimits.maxVolumeEntryCount),
+                bundle: true,
+                exactPeer: peer
+            )
+            releaseOutstandingVolumeSlot(id)
+            if !response.volumes.isEmpty { return response }
+            last = response
+        }
+        return last
     }
 
     private func localVolume(rootCID: String) async -> AttributedVolumeResponse? {
@@ -981,10 +1122,10 @@ extension Ivy {
         maximumArchiveBytes: Int,
         maximumEntries: Int,
         exactPeer: AuthenticatedPeer? = nil
-    ) async -> AttributedVolumeResponse {
+    ) async -> AttributedVolumeBundleResponse {
         var remaining: [PeerID] = []
         for peer in candidates where !remaining.contains(peer) { remaining.append(peer) }
-        var last = AttributedVolumeResponse.empty
+        var last = AttributedVolumeBundleResponse.empty
         while !remaining.isEmpty {
             guard isCurrentRun(generation), !Task.isCancelled,
                   let peer = await acquireOutstandingVolumeSlot(among: remaining) else { return .empty }
@@ -995,10 +1136,11 @@ extension Ivy {
                 generation: generation,
                 maximumArchiveBytes: maximumArchiveBytes,
                 maximumEntries: maximumEntries,
+                bundle: false,
                 exactPeer: exactPeer
             )
             releaseOutstandingVolumeSlot(peer)
-            if !response.entries.isEmpty { return response }
+            if !response.volumes.isEmpty { return response }
             // Keep a failure (local capacity) over a later plain miss.
             if response.failure != nil || last.failure == nil { last = response }
         }
@@ -1062,15 +1204,16 @@ extension Ivy {
         for waiter in waiters { waiter.continuation.resume(returning: false) }
     }
 
-    /// One Volume request to one peer.
+    /// One Volume request, or one bundle request, to one peer.
     private func requestVolume(
         rootCID: String,
         from peer: PeerID,
         generation: UInt64,
         maximumArchiveBytes: Int,
         maximumEntries: Int,
+        bundle: Bool,
         exactPeer: AuthenticatedPeer?
-    ) async -> AttributedVolumeResponse {
+    ) async -> AttributedVolumeBundleResponse {
         let candidates = [peer]
         guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
         let requestID = makeWireOperationID(
@@ -1087,10 +1230,9 @@ extension Ivy {
                     continuation.resume(returning: .localCapacityUnavailable)
                     return
                 }
-                let message = Message.volumeRequest(
-                    requestID: requestID,
-                    rootCID: rootCID
-                )
+                let message = bundle
+                    ? Message.volumeBundleRequest(requestID: requestID, rootCID: rootCID)
+                    : Message.volumeRequest(requestID: requestID, rootCID: rootCID)
                 var enqueued: [PeerID: Data] = [:]
                 if let exactPeer {
                     if candidates == [exactPeer.id],
@@ -1116,6 +1258,7 @@ extension Ivy {
                     generation: generation,
                     maximumArchiveBytes: maximumArchiveBytes,
                     maximumEntries: maximumEntries,
+                    bundle: bundle,
                     continuation: continuation,
                     candidateSessions: enqueued
                 )
@@ -1147,7 +1290,8 @@ extension Ivy {
               pending.matches(peer: peer, sessionID: sessionID) else {
             return
         }
-        guard rootCID == pending.rootCID,
+        // A bundle's first Volume is the root's own; a lone Volume is the root's.
+        guard rootCID == pending.rootCID || !pending.volumes.isEmpty,
               count > 0,
               count <= MessageLimits.maxVolumeChunkCount,
               index < count,
@@ -1168,7 +1312,8 @@ extension Ivy {
         var assembly: VolumeAssembly
         if let existing = pending.assemblies[peer] {
             assembly = existing
-            guard assembly.chunkCount == count,
+            guard assembly.rootCID == rootCID,
+                  assembly.chunkCount == count,
                   assembly.totalEntries == totalEntries,
                   assembly.totalBytes == byteCount,
                   assembly.nextIndex == index else {
@@ -1202,6 +1347,7 @@ extension Ivy {
                 return
             }
             assembly = VolumeAssembly(
+                rootCID: rootCID,
                 chunkCount: count,
                 totalEntries: totalEntries,
                 totalBytes: byteCount
@@ -1248,10 +1394,34 @@ extension Ivy {
             rejectVolumeCandidate(requestID: requestID, peer: peer)
             return
         }
-        pending.assemblies[peer] = assembly
+        // The received Volume keeps its bytes of the in-flight budget until
+        // the request resolves.
+        pending.assemblies[peer] = nil
+        pending.receivedBytes += assembly.totalBytes
+        pending.volumes.append(AttributedVolumeResponse(
+            rootCID: rootCID,
+            entries: Dictionary(uniqueKeysWithValues: entries.map { ($0.cid, $0.data) }),
+            servedBy: peer
+        ))
         pendingVolumeRequests[requestID] = pending
         rememberProvider(rootCID: rootCID, peer: peer)
-        resolveVolumeRequest(requestID: requestID, entries: entries, servedBy: peer)
+        if !pending.bundle { resolveVolumeRequest(requestID: requestID) }
+    }
+
+    func handleVolumeBundleEnd(
+        requestID: UInt64,
+        from peer: PeerID,
+        sessionID: Data?
+    ) {
+        guard var pending = pendingVolumeRequests[requestID],
+              pending.matches(peer: peer, sessionID: sessionID) else { return }
+        guard pending.bundle, pending.assemblies[peer] == nil else {
+            rejectVolumeCandidate(requestID: requestID, peer: peer)
+            return
+        }
+        pending.noBundle = pending.volumes.isEmpty
+        pendingVolumeRequests[requestID] = pending
+        markVolumeCandidateDone(requestID: requestID, peer: peer)
     }
 
     func markVolumeCandidateDone(
@@ -1288,31 +1458,31 @@ extension Ivy {
     /// timeout, so the next fetch tries them after peers that answer.
     private func timeOutVolumeRequest(requestID: UInt64) {
         if let pending = pendingVolumeRequests[requestID] {
-            for peer in pending.candidateSessions.keys where pending.assemblies[peer] == nil {
+            for peer in pending.candidateSessions.keys
+                where pending.assemblies[peer] == nil && pending.volumes.isEmpty {
                 volumeTimeoutStreaks[peer, default: 0] += 1
             }
         }
         resolveVolumeRequest(requestID: requestID)
     }
 
-    func resolveVolumeRequest(
-        requestID: UInt64,
-        entries: [ContentEntry] = [],
-        servedBy: PeerID? = nil
-    ) {
+    func resolveVolumeRequest(requestID: UInt64) {
         guard let pending = pendingVolumeRequests.removeValue(forKey: requestID) else {
             return
         }
-        if !entries.isEmpty, let servedBy { volumeTimeoutStreaks[servedBy] = nil }
+        if let servedBy = pending.volumes.first?.servedBy { volumeTimeoutStreaks[servedBy] = nil }
         for assembly in pending.assemblies.values {
             releaseVolumeAssembly(assembly)
         }
+        precondition(pending.receivedBytes <= inFlightVolumeBytes)
+        precondition(pending.receivedBytes <= reservedVolumeBytes)
+        inFlightVolumeBytes -= pending.receivedBytes
+        reservedVolumeBytes -= pending.receivedBytes
         pending.timeoutTask?.cancel()
-        pending.continuation.resume(returning: AttributedVolumeResponse(
-            rootCID: entries.isEmpty ? "" : pending.rootCID,
-            entries: Dictionary(uniqueKeysWithValues: entries.map { ($0.cid, $0.data) }),
-            servedBy: servedBy,
-            failure: entries.isEmpty ? pending.failure : nil
+        pending.continuation.resume(returning: AttributedVolumeBundleResponse(
+            volumes: pending.volumes,
+            noBundle: pending.noBundle,
+            failure: pending.volumes.isEmpty ? pending.failure : nil
         ))
     }
 

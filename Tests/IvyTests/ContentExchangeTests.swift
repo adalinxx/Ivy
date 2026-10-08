@@ -40,7 +40,7 @@ private extension Ivy {
                 continuation: continuation,
                 candidateSessions: candidateSessions
             )
-        }
+        }.single
     }
 
     func networkFetchWaiterCount(for key: ContentRequestKey) -> Int {

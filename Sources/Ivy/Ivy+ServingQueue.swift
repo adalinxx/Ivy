@@ -99,6 +99,16 @@ extension Ivy {
         }
     }
 
+    /// Gives up the slot `request` holds and queues for one again, behind
+    /// whoever is waiting, as a new request of its peer would. False if it
+    /// was cancelled while waiting.
+    func retakeServingSlot(_ request: InboundContentRequest) async -> Bool {
+        guard servingContentRequests.remove(request) != nil else { return false }
+        dispatchServingSlots()
+        guard beginServingContent(request) else { return false }
+        return await awaitServingSlot(request)
+    }
+
     func endServingContent(_ request: InboundContentRequest) {
         servingContentTasks.removeValue(forKey: request)
         if let ticket = servingTickets.removeValue(forKey: request) {
