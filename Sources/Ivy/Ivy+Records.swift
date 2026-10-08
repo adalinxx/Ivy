@@ -19,8 +19,6 @@ struct PendingProviderQuery {
 }
 
 extension Ivy {
-    static let providerObservationTTL: UInt64 = 20 * 60
-
     func handleFindProviders(rootCID: String, requestID: UInt64, from peer: PeerID) {
         guard config.mode.usesOverlayServices else { return }
         evictExpiredProviders(rootCID: rootCID)
@@ -304,18 +302,6 @@ extension Ivy {
         }
     }
 
-    public func rememberProvider(rootCID: String, peer: PeerID) {
-        guard config.mode.usesOverlayServices,
-              MessageLimits.accepts(rootCID),
-              hasEndpointSession(peer) else { return }
-        storeProviderHint(
-            rootCID: rootCID,
-            peer: peer,
-            endpoint: providerEndpoint(for: peer),
-            expiresAt: nowUnix() + Self.providerObservationTTL,
-            source: peer)
-    }
-
     func storeProviderHint(
         rootCID: String,
         peer: PeerID,
@@ -341,15 +327,15 @@ extension Ivy {
             hints.removeAll { $0.peer == peer && $0.source != peer }
             setProviderHints(hints, rootCID: rootCID)
         }
-        // At its quota a source replaces its own soonest-expiring record; at the
-        // table ceiling the source holding the most records gives one up.
+        // At its quota a source gives up one of its own records; at the table
+        // ceiling the source holding the most records gives one up.
         if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
             if providerRecordCount(of: source) >= config.maxProviderRecordsPerPeer {
-                evictSoonestExpiringProviderRecord(of: source)
+                guard evictProviderRecord(of: source, for: hint) else { return }
             } else if providerRecordTotal >= config.maxProviderRecords,
                       let heaviest = providerSourcesByCount.keys.max()
                         .flatMap({ providerSourcesByCount[$0]?.first }) {
-                evictSoonestExpiringProviderRecord(of: heaviest)
+                guard evictProviderRecord(of: heaviest, for: hint) else { return }
             }
         }
         setProviderHints(
@@ -368,22 +354,32 @@ extension Ivy {
         providerRecordCounts[source] ?? 0
     }
 
-    private func evictSoonestExpiringProviderRecord(of source: PeerID) {
+    /// A referral never evicts an announcement. The source giving up a record
+    /// loses an expired one first, then its soonest-expiring referral, then
+    /// its soonest-expiring announcement, and that last only to an incoming
+    /// announcement: false means an incoming referral is dropped instead.
+    private func evictProviderRecord(of source: PeerID, for incoming: ProviderHint) -> Bool {
+        let now = nowUnix()
+        func rank(_ hint: ProviderHint, _ rootCID: String) -> (Int, UInt64, String) {
+            (hint.expiresAt <= now ? 0 : hint.source != hint.peer ? 1 : 2, hint.expiresAt, rootCID)
+        }
         var soonest: (rootCID: String, hint: ProviderHint)?
         for rootCID in (providerRecordsBySource[source] ?? [:]).keys {
             for hint in providerHints[rootCID] ?? [] where hint.source == source {
                 if let current = soonest,
-                   (current.hint.expiresAt, current.rootCID) <= (hint.expiresAt, rootCID) {
+                   rank(current.hint, current.rootCID) <= rank(hint, rootCID) {
                     continue
                 }
                 soonest = (rootCID, hint)
             }
         }
         guard let soonest,
+              rank(soonest.hint, soonest.rootCID).0 < 2 || incoming.source == incoming.peer,
               var hints = providerHints[soonest.rootCID],
-              let index = hints.firstIndex(of: soonest.hint) else { return }
+              let index = hints.firstIndex(of: soonest.hint) else { return false }
         hints.remove(at: index)
         setProviderHints(hints, rootCID: soonest.rootCID)
+        return true
     }
 
     /// The single writer of `providerHints`; keeps the per-source counts exact.
@@ -485,14 +481,21 @@ extension Ivy {
         setProviderHints(hints, rootCID: rootCID)
     }
 
-    func connectedProviderIDs(for rootCID: String) -> [PeerID] {
+    /// The connected peers a fetch asks for `rootCID`: those with a stored
+    /// record, then those in `fresh`. A lookup's answer is used by the fetch
+    /// that made it; storing it is only a cache.
+    func connectedProviderIDs(
+        for rootCID: String,
+        including fresh: [PeerEndpoint] = []
+    ) -> [PeerID] {
         evictExpiredProviders(rootCID: rootCID)
         var seen: Set<PeerID> = []
-        return (providerHints[rootCID] ?? []).compactMap { hint in
-            guard hasEndpointSession(hint.peer),
-                  !isDeficiencySuppressed(rootCID: rootCID, peer: hint.peer),
-                  seen.insert(hint.peer).inserted else { return nil }
-            return hint.peer
+        let peers = (providerHints[rootCID] ?? []).map(\.peer)
+            + fresh.map { PeerID(publicKey: $0.publicKey) }
+        return peers.filter { peer in
+            hasEndpointSession(peer)
+                && !isDeficiencySuppressed(rootCID: rootCID, peer: peer)
+                && seen.insert(peer).inserted
         }
     }
 

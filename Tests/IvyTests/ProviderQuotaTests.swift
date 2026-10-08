@@ -274,6 +274,81 @@ struct ProviderQuotaTests {
         #expect(await node.storedProviderRecordCount() == 2)
     }
 
+    @Test("a responder's referrals at its quota never evict its own announcement")
+    func referralNeverEvictsAnnouncement() async throws {
+        let node = node("quota-referral-rule-node", quota: 2)
+        let responder = peer("quota-referral-rule-responder")
+        let now = await node.nowUnix()
+        // The responder's own announcement is its soonest-expiring record.
+        await node.handleAnnounceProvider(rootCID: "own", expiresAt: now + 5, from: responder)
+        for index in 0..<4 {
+            let referred = PeerEndpoint(
+                publicKey: deterministicTestPeerKey("quota-referral-rule-\(index)"),
+                host: "8.8.8.\(index + 1)", port: 4001)
+            try await refer(
+                node, root: "referred-\(index)", requestID: UInt64(500 + index),
+                records: [ProviderRecord(endpoint: referred, expiresAt: now + 600)],
+                from: responder)
+        }
+        // Each referral past the quota replaced the previous referral.
+        #expect(await node.hasProviderRecord(rootCID: "own", peer: responder))
+        #expect(await node.providerRecordCount(of: responder) == 2)
+        #expect(await node.storedProviderRecordCount() == 2)
+        #expect(await node.providers(for: "referred-3").count == 1)
+
+        // With only announcements left to give up, the referral is dropped.
+        await node.handleAnnounceProvider(rootCID: "own-2", expiresAt: now + 5, from: responder)
+        #expect(await node.providers(for: "referred-3").isEmpty)
+        let late = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("quota-referral-rule-late"),
+            host: "8.8.4.4", port: 4001)
+        try await refer(
+            node, root: "referred-late", requestID: 510,
+            records: [ProviderRecord(endpoint: late, expiresAt: now + 600)], from: responder)
+        #expect(await node.providers(for: "referred-late").isEmpty)
+        #expect(await node.hasProviderRecord(rootCID: "own", peer: responder))
+        #expect(await node.hasProviderRecord(rootCID: "own-2", peer: responder))
+    }
+
+    @Test("an announcement at quota evicts a referral before another announcement, an expired record before either")
+    func announcementEvictsReferralFirst() async throws {
+        let node = node("quota-announce-rule-node", quota: 2)
+        let responder = peer("quota-announce-rule-responder")
+        let now = await node.nowUnix()
+        await node.handleAnnounceProvider(rootCID: "a", expiresAt: now + 5, from: responder)
+        let referred = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("quota-announce-rule-referred"),
+            host: "8.8.8.8", port: 4001)
+        try await refer(
+            node, root: "referred", requestID: 600,
+            records: [ProviderRecord(endpoint: referred, expiresAt: now + 600)], from: responder)
+
+        // The referral goes, though the announcement "a" expires sooner.
+        await node.handleAnnounceProvider(rootCID: "b", expiresAt: now + 600, from: responder)
+        #expect(await node.providers(for: "referred").isEmpty)
+        #expect(await node.hasProviderRecord(rootCID: "a", peer: responder))
+        #expect(await node.hasProviderRecord(rootCID: "b", peer: responder))
+
+        // With only announcements, the soonest-expiring one goes.
+        await node.handleAnnounceProvider(rootCID: "c", expiresAt: now + 600, from: responder)
+        #expect(await !node.hasProviderRecord(rootCID: "a", peer: responder))
+        #expect(await node.providerRecordCount(of: responder) == 2)
+
+        // An expired announcement goes before a live referral, to a referral too.
+        let expired = self.node("quota-expired-rule-node", quota: 2)
+        await expired.storeProviderHint(
+            rootCID: "expired", peer: responder, endpoint: nil, expiresAt: now - 1)
+        try await refer(
+            expired, root: "referred", requestID: 601,
+            records: [ProviderRecord(endpoint: referred, expiresAt: now + 5)], from: responder)
+        try await refer(
+            expired, root: "referred-2", requestID: 602,
+            records: [ProviderRecord(endpoint: referred, expiresAt: now + 600)], from: responder)
+        #expect(await !expired.hasProviderRecord(rootCID: "expired", peer: responder))
+        #expect(await expired.providers(for: "referred").count == 1)
+        #expect(await expired.providers(for: "referred-2").count == 1)
+    }
+
     private func refer(
         _ node: Ivy,
         root: String,
