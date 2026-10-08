@@ -114,6 +114,10 @@ public struct AttributedVolumeBundleResponse: Sendable, Equatable {
     /// The last peer asked answered that it holds no bundle for the root,
     /// rather than failing or not answering.
     public let noBundle: Bool
+    /// The answer ended with the peer's end marker: the bundle is whole, or
+    /// the peer holds none. False when it ended any other way (no answer in
+    /// time, a stream violation, a lost session, a refusal) or nobody was asked.
+    public let ended: Bool
     public let failure: VolumeFetchFailure?
 
     public static let empty = AttributedVolumeBundleResponse(volumes: [])
@@ -125,10 +129,12 @@ public struct AttributedVolumeBundleResponse: Sendable, Equatable {
     public init(
         volumes: [AttributedVolumeResponse],
         noBundle: Bool = false,
+        ended: Bool = false,
         failure: VolumeFetchFailure? = nil
     ) {
         self.volumes = volumes
         self.noBundle = noBundle
+        self.ended = ended
         self.failure = failure
     }
 
@@ -259,7 +265,10 @@ struct PendingVolumeRequest {
     var volumes: [AttributedVolumeResponse] = []
     /// What the received `volumes` hold of the in-flight Volume budget.
     var receivedBytes = 0
+    /// The roots of `volumes`: a bundle carries no Volume twice.
+    var receivedRoots = Set<String>()
     var noBundle = false
+    var ended = false
     var failure: VolumeFetchFailure? = nil
     var timeoutTask: IvyTimer? = nil
 
@@ -1054,8 +1063,8 @@ extension Ivy {
     /// first. Only the sessions named are asked, one at a time (least loaded
     /// first, as Volume requests are), until one sends a Volume: a bundle
     /// request is a message a peer must be known to speak, which is the
-    /// caller's to know. A bundle is never needed, so a peer whose last
-    /// request timed out is not asked for one until it has served a Volume.
+    /// caller's to know, as is whether to ask again a peer whose answer did
+    /// not end (`ended`).
     public func fetchVolumeBundle(
         rootCID: String,
         from peers: [AuthenticatedPeer]
@@ -1063,7 +1072,7 @@ extension Ivy {
         guard MessageLimits.accepts(rootCID) else { return .empty }
         let generation = runGeneration
         var sessions: [PeerID: AuthenticatedPeer] = [:]
-        for peer in peers where volumeTimeoutStreaks[peer.id] == nil { sessions[peer.id] = peer }
+        for peer in peers { sessions[peer.id] = peer }
         var last = AttributedVolumeBundleResponse.empty
         while !sessions.isEmpty {
             guard isCurrentRun(generation), !Task.isCancelled,
@@ -1294,7 +1303,7 @@ extension Ivy {
         // carries no Volume twice.
         guard pending.volumes.isEmpty
                 ? rootCID == pending.rootCID
-                : !pending.volumes.contains(where: { $0.rootCID == rootCID }),
+                : !pending.receivedRoots.contains(rootCID),
               count > 0,
               count <= MessageLimits.maxVolumeChunkCount,
               index < count,
@@ -1401,6 +1410,7 @@ extension Ivy {
         // the request resolves.
         pending.assemblies[peer] = nil
         pending.receivedBytes += assembly.totalBytes
+        pending.receivedRoots.insert(rootCID)
         pending.volumes.append(AttributedVolumeResponse(
             rootCID: rootCID,
             entries: Dictionary(uniqueKeysWithValues: entries.map { ($0.cid, $0.data) }),
@@ -1423,6 +1433,7 @@ extension Ivy {
             return
         }
         pending.noBundle = pending.volumes.isEmpty
+        pending.ended = true
         pendingVolumeRequests[requestID] = pending
         markVolumeCandidateDone(requestID: requestID, peer: peer)
     }
@@ -1485,6 +1496,7 @@ extension Ivy {
         pending.continuation.resume(returning: AttributedVolumeBundleResponse(
             volumes: pending.volumes,
             noBundle: pending.noBundle,
+            ended: pending.ended,
             failure: pending.volumes.isEmpty ? pending.failure : nil
         ))
     }

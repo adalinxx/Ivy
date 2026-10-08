@@ -409,7 +409,8 @@ struct VolumeBundleTests {
         )
         let response = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
         #expect(response == AttributedVolumeBundleResponse(
-            volumes: Self.roots.map { expectedResponse($0, servedBy: pair.serverPeer.id) }
+            volumes: Self.roots.map { expectedResponse($0, servedBy: pair.serverPeer.id) },
+            ended: true
         ))
         #expect(try await TransportTestHarness.eventually {
             let reserved = await pair.server.reservedServingVolumeBytesForTesting
@@ -430,7 +431,7 @@ struct VolumeBundleTests {
         let clock = ContinuousClock()
         let started = clock.now
         let bundle = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
-        #expect(bundle == AttributedVolumeBundleResponse(volumes: [], noBundle: true))
+        #expect(bundle == AttributedVolumeBundleResponse(volumes: [], noBundle: true, ended: true))
         // A Volume the peer does not hold is refused, not answered "no bundle".
         let absent = await pair.client.fetchVolume(rootCID: "absent", from: pair.serverPeer)
         #expect(absent == .empty)
@@ -460,7 +461,8 @@ struct VolumeBundleTests {
         })
         // The Volumes after the interrupted one were never read.
         #expect(await source.readsStarted() == 1)
-        #expect(await fetch.value.volumes.isEmpty)
+        // Nothing arrived, and the answer did not end.
+        #expect(await fetch.value == .empty)
         await pair.server.stop()
     }
 
@@ -493,32 +495,6 @@ struct VolumeBundleTests {
         await second.stop()
         #expect(await bundle.value.volumes.map(\.rootCID) == Self.roots)
         #expect(await source.reads() == ["root", "other", "member-a", "member-b"])
-        await pair.stop()
-    }
-
-    @Test("a peer that let a bundle request time out is not asked for another until it serves a Volume")
-    func silentPeerIsNotAskedAgain() async throws {
-        let source = GatedVolumeSource(volumes: Self.volumes, bundles: ["root": Self.roots])
-        let pair = try await ConnectedPair.make(
-            "bundle-silent",
-            serverSource: source,
-            serverRequestTimeout: .seconds(30),
-            requestTimeout: .milliseconds(400)
-        )
-        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) == .empty)
-        #expect(await source.readsStarted() == 1)
-        // Not asked: no read starts, and the answer does not wait for a timeout.
-        #expect(await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) == .empty)
-        #expect(await source.readsStarted() == 1)
-
-        await source.open()
-        #expect(try await TransportTestHarness.eventually {
-            await pair.server.reservedServingVolumeBytesForTesting == 0
-        })
-        let single = await pair.client.fetchVolume(rootCID: "member-a", from: pair.serverPeer)
-        #expect(single == expectedResponse("member-a", servedBy: pair.serverPeer.id))
-        let again = await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer])
-        #expect(again.volumes.map(\.rootCID) == Self.roots)
         await pair.stop()
     }
 
