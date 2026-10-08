@@ -35,6 +35,14 @@ private extension Ivy {
     }
 }
 
+private struct QuotaTestVolumeSource: IvyContentSource {
+    func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] { [] }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        [ContentEntry(cid: rootCID, data: Data(rootCID.utf8))]
+    }
+}
+
 @Suite("Provider record quota")
 struct ProviderQuotaTests {
     private func node(
@@ -272,6 +280,73 @@ struct ProviderQuotaTests {
 
         #expect(await node.hasProviderRecord(rootCID: "root", peer: honest))
         #expect(await node.storedProviderRecordCount() == 2)
+    }
+
+    @Test("serving Volumes never evicts what the server announced, and the last server is asked first")
+    func observationsNeverEvictAnnouncements() async throws {
+        let quota = 4
+        let serverIdentity = TransportTestHarness.identity("quota-observed-server")
+        let serverPort = TransportTestHarness.nextPort()
+        let server = Ivy(config: TransportTestHarness.config(serverIdentity, port: serverPort))
+        let client = Ivy(config: IvyConfig(
+            signingKey: TransportTestHarness.identity("quota-observed-client"),
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            maxProviderRecordsPerPeer: quota))
+        await server.setContentSource(QuotaTestVolumeSource())
+        try await server.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(serverIdentity, port: serverPort))
+        let serverID = TransportTestHarness.key(serverIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await server.peerConnectionCount == 1
+        })
+
+        await client.handleAnnounceProvider(
+            rootCID: "rendezvous", expiresAt: await client.nowUnix() + 60, from: serverID)
+        #expect(await client.providers(for: "rendezvous") == [serverID])
+
+        for index in 0..<(quota * 3) {
+            let response = await client.fetchVolume(rootCID: "volume-\(index)")
+            #expect(response.servedBy == serverID)
+        }
+
+        #expect(await client.providers(for: "rendezvous") == [serverID])
+        #expect(await client.providerRecordCount(of: serverID) == quota)
+        #expect(await client.connectedProviderIDs(for: "volume-\(quota * 3 - 1)") == [serverID])
+        #expect(await client.connectedProviderIDs(for: "volume-0").isEmpty)
+
+        await client.stop()
+        await server.stop()
+    }
+
+    @Test("an observation neither replaces an announcement nor takes its place at the quota")
+    func observationYieldsToAnnouncement() async {
+        let node = node("quota-yield-node", quota: 2)
+        let server = peer("quota-yield-server")
+        let other = peer("quota-yield-other")
+        let now = await node.nowUnix()
+        await node.handleAnnounceProvider(rootCID: "other", expiresAt: now + 5, from: other)
+        await node.handleAnnounceProvider(rootCID: "a", expiresAt: now + 600, from: server)
+        await node.handleAnnounceProvider(rootCID: "b", expiresAt: now + 30, from: server)
+
+        // What the peer announced keeps the expiry it announced.
+        await node.storeProviderHint(
+            rootCID: "a", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+        // A quota full of announcements admits no observation.
+        await node.storeProviderHint(
+            rootCID: "c", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+        #expect(await node.providerRecords(rootCID: "a", peer: server)
+            == [ProviderHint(peer: server, endpoint: nil, expiresAt: now + 600, source: server)])
+        #expect(await node.hasProviderRecord(rootCID: "b", peer: server))
+        #expect(await !node.hasProviderRecord(rootCID: "c", peer: server))
+
+        // The peer's own later announcement still replaces its own soonest-expiring one.
+        await node.handleAnnounceProvider(rootCID: "d", expiresAt: now + 90, from: server)
+        #expect(await !node.hasProviderRecord(rootCID: "b", peer: server))
+        #expect(await node.providerRecordCount(of: server) == 2)
+        #expect(await node.hasProviderRecord(rootCID: "other", peer: other))
     }
 
     private func refer(

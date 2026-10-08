@@ -8,6 +8,8 @@ struct ProviderHint: Sendable, Equatable {
     /// The authenticated peer whose quota this record counts against: the
     /// announcer, or the responder that referred it.
     let source: PeerID
+    /// This node saw `peer` serve the root; the peer did not announce it.
+    var observed = false
 }
 
 struct PendingProviderQuery {
@@ -313,7 +315,7 @@ extension Ivy {
             peer: peer,
             endpoint: providerEndpoint(for: peer),
             expiresAt: nowUnix() + Self.providerObservationTTL,
-            source: peer)
+            observed: true)
     }
 
     func storeProviderHint(
@@ -321,18 +323,25 @@ extension Ivy {
         peer: PeerID,
         endpoint: PeerEndpoint?,
         expiresAt: UInt64,
-        source: PeerID? = nil
+        source: PeerID? = nil,
+        observed: Bool = false
     ) {
         let source = source ?? peer
         let hint = ProviderHint(
             peer: peer,
             endpoint: endpoint,
             expiresAt: expiresAt,
-            source: source)
+            source: source,
+            observed: observed)
         evictExpiredProviders(rootCID: rootCID)
         // A referral never overrides what a provider announced for itself.
         if source != peer,
            providerHints[rootCID]?.contains(where: { $0.peer == peer && $0.source == peer }) == true {
+            return
+        }
+        // Nor does seeing a provider serve override what it announced for itself.
+        if observed,
+           providerHints[rootCID]?.contains(where: { $0.peer == peer && $0.source == peer && !$0.observed }) == true {
             return
         }
         // A provider's own record supersedes the routes others referred for it.
@@ -342,14 +351,16 @@ extension Ivy {
             setProviderHints(hints, rootCID: rootCID)
         }
         // At its quota a source replaces its own soonest-expiring record; at the
-        // table ceiling the source holding the most records gives one up.
+        // table ceiling the source holding the most records gives one up. What
+        // this node observed goes before what a peer announced, and an
+        // observation that would cost an announcement is not kept.
         if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
             if providerRecordCount(of: source) >= config.maxProviderRecordsPerPeer {
-                evictSoonestExpiringProviderRecord(of: source)
+                guard evictSoonestExpiringProviderRecord(of: source, for: hint) else { return }
             } else if providerRecordTotal >= config.maxProviderRecords,
                       let heaviest = providerSourcesByCount.keys.max()
                         .flatMap({ providerSourcesByCount[$0]?.first }) {
-                evictSoonestExpiringProviderRecord(of: heaviest)
+                guard evictSoonestExpiringProviderRecord(of: heaviest, for: hint) else { return }
             }
         }
         setProviderHints(
@@ -368,22 +379,26 @@ extension Ivy {
         providerRecordCounts[source] ?? 0
     }
 
-    private func evictSoonestExpiringProviderRecord(of source: PeerID) {
+    /// Makes room for `incoming`; false when only an announcement could give way to an observation.
+    private func evictSoonestExpiringProviderRecord(of source: PeerID, for incoming: ProviderHint) -> Bool {
         var soonest: (rootCID: String, hint: ProviderHint)?
         for rootCID in (providerRecordsBySource[source] ?? [:]).keys {
             for hint in providerHints[rootCID] ?? [] where hint.source == source {
                 if let current = soonest,
-                   (current.hint.expiresAt, current.rootCID) <= (hint.expiresAt, rootCID) {
+                   (current.hint.observed ? 0 : 1, current.hint.expiresAt, current.rootCID)
+                    <= (hint.observed ? 0 : 1, hint.expiresAt, rootCID) {
                     continue
                 }
                 soonest = (rootCID, hint)
             }
         }
         guard let soonest,
+              soonest.hint.observed || !incoming.observed,
               var hints = providerHints[soonest.rootCID],
-              let index = hints.firstIndex(of: soonest.hint) else { return }
+              let index = hints.firstIndex(of: soonest.hint) else { return false }
         hints.remove(at: index)
         setProviderHints(hints, rootCID: soonest.rootCID)
+        return true
     }
 
     /// The single writer of `providerHints`; keeps the per-source counts exact.
