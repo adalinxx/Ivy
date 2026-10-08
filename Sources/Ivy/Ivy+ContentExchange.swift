@@ -1675,18 +1675,6 @@ extension Ivy {
             attemptedSessions.merge(sessions) { _, latest in latest }
         }
 
-        // The peers already connected before the DHT, as `fetchVolume` does.
-        candidates = connectedFallbackCandidates(
-            rootCID: key.rootCID,
-            excluding: attemptedSessions)
-        if !candidates.isEmpty {
-            let sessions = liveConnectionIDs(for: candidates)
-            let response = await fetchContent(key, from: candidates, generation: generation)
-            guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-            if !response.entries.isEmpty { return response }
-            attemptedSessions.merge(sessions) { _, latest in latest }
-        }
-
         let fresh = await queryFreshProviderEndpoints(
             rootCID: key.rootCID,
             generation: generation)
@@ -1698,7 +1686,18 @@ extension Ivy {
                 attemptedSessions[$0] != endpointConnection(for: $0)?.connectionID
             }
             .prefix(config.maxContentCandidates))
-        guard !candidates.isEmpty else { return .empty }
+        if !candidates.isEmpty {
+            let sessions = liveConnectionIDs(for: candidates)
+            let response = await fetchContent(key, from: candidates, generation: generation)
+            guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
+            if !response.entries.isEmpty { return response }
+            attemptedSessions.merge(sessions) { _, latest in latest }
+        }
+
+        candidates = connectedFallbackCandidates(
+            rootCID: key.rootCID,
+            excluding: attemptedSessions)
+        guard !Task.isCancelled, !candidates.isEmpty else { return .empty }
         let response = await fetchContent(key, from: candidates, generation: generation)
         return isCurrentRun(generation) && !Task.isCancelled ? response : .empty
     }

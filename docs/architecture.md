@@ -163,7 +163,11 @@ not is the caller's to decide.
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
 the wire request. `requestTimeout` bounds that whole fetch for its callers;
-timed-out backend or network work remains counted until it exits. Provider hints are bounded and expiring: each is a peer's own announcement or a
+timed-out backend or network work remains counted until it exits. A content
+selection asks known providers, then fresh discovery, then the peers already
+connected, under that deadline; a Volume fetch asks known providers, then the
+peers already connected, then fresh discovery, with no deadline over the whole
+fetch. Provider hints are bounded and expiring: each is a peer's own announcement or a
 referral from a lookup answer, never a note that a peer served the root; a
 source's referrals never evict an announcement. A failed local dial
 does not erase a hint, and a failed address does not suppress a healthy address
