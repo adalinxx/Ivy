@@ -10,6 +10,10 @@ struct ProviderHint: Sendable, Equatable {
     let source: PeerID
     /// This node saw `peer` serve the root; the peer did not announce it.
     var observed = false
+
+    /// What a peer announced for itself outranks what a responder referred,
+    /// which outranks what this node observed.
+    var strength: Int { observed ? 0 : source != peer ? 1 : 2 }
 }
 
 struct PendingProviderQuery {
@@ -344,27 +348,26 @@ extension Ivy {
            providerHints[rootCID]?.contains(where: { $0.peer == peer && $0.source == peer && !$0.observed }) == true {
             return
         }
-        // A provider's own record supersedes the routes others referred for it.
-        if source == peer, var hints = providerHints[rootCID],
-           hints.contains(where: { $0.peer == peer && $0.source != peer }) {
-            hints.removeAll { $0.peer == peer && $0.source != peer }
-            setProviderHints(hints, rootCID: rootCID)
+        // A provider's own record supersedes the routes others referred for
+        // it, once that record is stored.
+        let superseded: (ProviderHint) -> Bool = {
+            source == peer && $0.peer == peer && $0.source != peer
         }
-        // At its quota a source replaces its own soonest-expiring record; at the
-        // table ceiling the source holding the most records gives one up. What
-        // this node observed goes before what a peer announced, and an
-        // observation that would cost an announcement is not kept.
+        // At its quota a source gives up one of its own records; at the table
+        // ceiling the source holding the most records gives one up.
         if source != localID, addsProviderRecord(hint, rootCID: rootCID) {
+            let freed = (providerHints[rootCID] ?? []).filter(superseded).count
             if providerRecordCount(of: source) >= config.maxProviderRecordsPerPeer {
-                guard evictSoonestExpiringProviderRecord(of: source, for: hint) else { return }
-            } else if providerRecordTotal >= config.maxProviderRecords,
+                guard evictProviderRecord(of: source, for: hint) else { return }
+            } else if providerRecordTotal - freed >= config.maxProviderRecords,
                       let heaviest = providerSourcesByCount.keys.max()
-                        .flatMap({ providerSourcesByCount[$0]?.first }) {
-                guard evictSoonestExpiringProviderRecord(of: heaviest, for: hint) else { return }
+                        .flatMap({ providerSourcesByCount[$0]?.min { $0.publicKey < $1.publicKey } }) {
+                guard evictProviderRecord(of: heaviest, for: hint) else { return }
             }
         }
         setProviderHints(
-            boundedProviderHints((providerHints[rootCID] ?? []) + [hint]),
+            boundedProviderHints(
+                (providerHints[rootCID] ?? []).filter { !superseded($0) } + [hint]),
             rootCID: rootCID)
     }
 
@@ -379,21 +382,27 @@ extension Ivy {
         providerRecordCounts[source] ?? 0
     }
 
-    /// Makes room for `incoming`; false when only an announcement could give way to an observation.
-    private func evictSoonestExpiringProviderRecord(of source: PeerID, for incoming: ProviderHint) -> Bool {
+    /// The one eviction order: expired records go first whatever their kind;
+    /// then, among a source's live records, an observation before a referral
+    /// before an announcement, soonest-expiring first. A record never evicts
+    /// one of a stronger kind: false means `incoming` is dropped instead.
+    private func evictProviderRecord(of source: PeerID, for incoming: ProviderHint) -> Bool {
+        let now = nowUnix()
+        func rank(_ hint: ProviderHint, _ rootCID: String) -> (Int, UInt64, String) {
+            (hint.expiresAt <= now ? -1 : hint.strength, hint.expiresAt, rootCID)
+        }
         var soonest: (rootCID: String, hint: ProviderHint)?
         for rootCID in (providerRecordsBySource[source] ?? [:]).keys {
             for hint in providerHints[rootCID] ?? [] where hint.source == source {
                 if let current = soonest,
-                   (current.hint.observed ? 0 : 1, current.hint.expiresAt, current.rootCID)
-                    <= (hint.observed ? 0 : 1, hint.expiresAt, rootCID) {
+                   rank(current.hint, current.rootCID) <= rank(hint, rootCID) {
                     continue
                 }
                 soonest = (rootCID, hint)
             }
         }
         guard let soonest,
-              soonest.hint.observed || !incoming.observed,
+              soonest.hint.expiresAt <= now || soonest.hint.strength <= incoming.strength,
               var hints = providerHints[soonest.rootCID],
               let index = hints.firstIndex(of: soonest.hint) else { return false }
         hints.remove(at: index)
@@ -437,12 +446,11 @@ extension Ivy {
             routes.append(hint)
             routesByPeer[hint.peer] = Array(routes.suffix(config.maxRoutesPerIdentity))
         }
-        // A full root sheds the oldest referred-only provider before any that announced itself.
+        // A full root sheds the oldest provider of the weakest kind: one only
+        // observed, then one only referred, before any that announced itself.
         while peerOrder.count > config.kBucketSize {
-            let index = peerOrder.firstIndex { peer in
-                routesByPeer[peer]?.contains { $0.source == peer } != true
-            } ?? 0
-            peerOrder.remove(at: index)
+            let strengths = peerOrder.map { routesByPeer[$0]?.map(\.strength).max() ?? 0 }
+            peerOrder.remove(at: strengths.firstIndex(of: strengths.min() ?? 0) ?? 0)
         }
         return peerOrder.flatMap { routesByPeer[$0] ?? [] }
     }

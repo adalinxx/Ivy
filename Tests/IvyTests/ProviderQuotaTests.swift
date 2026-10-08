@@ -349,6 +349,90 @@ struct ProviderQuotaTests {
         #expect(await node.hasProviderRecord(rootCID: "other", peer: other))
     }
 
+    @Test("an announcement replaces the observation of the same root and keeps the announced expiry")
+    func announcementReplacesObservation() async {
+        let node = node("quota-upgrade-node", quota: 1)
+        let server = peer("quota-upgrade-server")
+        let now = await node.nowUnix()
+        await node.storeProviderHint(
+            rootCID: "root", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+        await node.handleAnnounceProvider(rootCID: "root", expiresAt: now + 600, from: server)
+        #expect(await node.providerRecords(rootCID: "root", peer: server)
+            == [ProviderHint(peer: server, endpoint: nil, expiresAt: now + 600, source: server)])
+    }
+
+    @Test("a dropped observation leaves the route another peer referred")
+    func droppedObservationKeepsReferral() async throws {
+        let node = node("quota-kept-referral-node", quota: 1)
+        let server = peer("quota-kept-referral-server")
+        let responder = peer("quota-kept-referral-responder")
+        let now = await node.nowUnix()
+        await node.handleAnnounceProvider(rootCID: "announced", expiresAt: now + 600, from: server)
+        let route = PeerEndpoint(publicKey: server.publicKey, host: "8.8.8.8", port: 4001)
+        try await refer(
+            node, root: "root", requestID: 500,
+            records: [ProviderRecord(endpoint: route, expiresAt: now + 600)], from: responder)
+
+        await node.storeProviderHint(
+            rootCID: "root", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+
+        #expect(await node.providerRecords(rootCID: "root", peer: server)
+            == [ProviderHint(peer: server, endpoint: route, expiresAt: now + 600, source: responder)])
+        #expect(await node.hasProviderRecord(rootCID: "announced", peer: server))
+    }
+
+    @Test("an expired announcement gives way before a live observation")
+    func expiredRecordsGoFirst() async {
+        let node = node("quota-expired-node", quota: 2)
+        let server = peer("quota-expired-server")
+        let now = await node.nowUnix()
+        await node.storeProviderHint(rootCID: "expired", peer: server, endpoint: nil, expiresAt: now - 1)
+        await node.storeProviderHint(
+            rootCID: "seen", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+
+        await node.storeProviderHint(
+            rootCID: "new", peer: server, endpoint: nil, expiresAt: now + 60, observed: true)
+
+        #expect(await !node.hasProviderRecord(rootCID: "expired", peer: server))
+        #expect(await node.hasProviderRecord(rootCID: "seen", peer: server))
+        #expect(await node.hasProviderRecord(rootCID: "new", peer: server))
+    }
+
+    @Test("in a full root an observation sheds no announcer")
+    func fullRootKeepsAnnouncersOverObservation() async {
+        let node = node("quota-root-node", quota: 100, kBucketSize: 2)
+        let announcers = [peer("quota-root-a"), peer("quota-root-b")]
+        let now = await node.nowUnix()
+        for announcer in announcers {
+            await node.handleAnnounceProvider(rootCID: "root", expiresAt: now + 600, from: announcer)
+        }
+        await node.storeProviderHint(
+            rootCID: "root", peer: peer("quota-root-seen"), endpoint: nil,
+            expiresAt: now + 60, observed: true)
+        #expect(await node.providers(for: "root") == announcers)
+    }
+
+    @Test("a responder's referrals cannot evict its own announcement")
+    func referralsYieldToRespondersAnnouncement() async throws {
+        let node = node("quota-own-node", quota: 2)
+        let responder = peer("quota-own-responder")
+        let now = await node.nowUnix()
+        await node.handleAnnounceProvider(rootCID: "own", expiresAt: now + 5, from: responder)
+        for index in 0..<3 {
+            let record = ProviderRecord(
+                endpoint: PeerEndpoint(
+                    publicKey: deterministicTestPeerKey("quota-own-fake-\(index)"),
+                    host: "8.8.8.\(index + 1)",
+                    port: 4001),
+                expiresAt: now + 600)
+            try await refer(
+                node, root: "referred-\(index)", requestID: UInt64(600 + index),
+                records: [record], from: responder)
+        }
+        #expect(await node.hasProviderRecord(rootCID: "own", peer: responder))
+        #expect(await node.providerRecordCount(of: responder) == 2)
+    }
+
     private func refer(
         _ node: Ivy,
         root: String,
