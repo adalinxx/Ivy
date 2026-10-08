@@ -157,10 +157,9 @@ bundle for the root, which is distinct from `contentUnavailable`. The
 requester keeps every Volume completed before the answer ended, however it
 ended, each counted against its in-flight Volume budget until the fetch
 returns: a bundle is never required to be complete, and the caller fetches
-what it still lacks as single Volumes. Because a bundle is never needed, a
-peer whose last Volume or bundle request timed out is not asked for a bundle
-until it has served a Volume again or has reconnected (a session's end
-forgets its timeouts).
+what it still lacks as single Volumes. The result says whether the answer
+ended with the peer's end marker; whether to ask again a peer whose answer did
+not is the caller's to decide.
 
 Equal requests coalesce across cached providers, fresh discovery, fallback, and
 the wire request. `requestTimeout` bounds that whole fetch for its callers;
