@@ -85,6 +85,7 @@ private struct ConnectedPair {
     let client: Ivy
     let serverPeer: AuthenticatedPeer
     let clientPeer: AuthenticatedPeer
+    let serverEndpoint: PeerEndpoint
 
     static func make(
         _ name: String,
@@ -125,7 +126,8 @@ private struct ConnectedPair {
             server: server,
             client: client,
             serverPeer: try #require(clientRecorder.authenticatedPeers.first),
-            clientPeer: try #require(serverRecorder.authenticatedPeers.first)
+            clientPeer: try #require(serverRecorder.authenticatedPeers.first),
+            serverEndpoint: TransportTestHarness.endpoint(serverIdentity, port: serverPort)
         )
     }
 
@@ -462,7 +464,7 @@ struct VolumeBundleTests {
         await pair.server.stop()
     }
 
-    @Test("a bundle queues for its slot again between Volumes, behind a request that was waiting")
+    @Test("another peer's waiting request is served between a bundle's Volumes")
     func bundleYieldsItsSlotBetweenVolumes() async throws {
         var volumes = Self.volumes
         volumes["other"] = smallVolume("other")
@@ -470,14 +472,25 @@ struct VolumeBundleTests {
         let pair = try await ConnectedPair.make(
             "bundle-yields", serverSource: source, serverConcurrentContentRequests: 1
         )
+        let second = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("bundle-yields-second"),
+            port: TransportTestHarness.nextPort(),
+            requestTimeout: .seconds(5)
+        ))
+        try await second.start()
+        try await second.connect(to: pair.serverEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await second.connectedPeers.contains(pair.serverPeer.id)
+        })
         let bundle = Task { await pair.client.fetchVolumeBundle(rootCID: "root", from: [pair.serverPeer]) }
         #expect(try await TransportTestHarness.eventually { await source.readsStarted() == 1 })
-        let other = Task { await pair.client.fetchVolume(rootCID: "other", from: pair.serverPeer) }
+        let other = Task { await second.fetchVolume(rootCID: "other") }
         #expect(try await TransportTestHarness.eventually {
             await pair.server.waitingServingTicketCountForTesting == 1
         })
         await source.open()
         #expect(await other.value == expectedResponse("other", servedBy: pair.serverPeer.id))
+        await second.stop()
         #expect(await bundle.value.volumes.map(\.rootCID) == Self.roots)
         #expect(await source.reads() == ["root", "other", "member-a", "member-b"])
         await pair.stop()

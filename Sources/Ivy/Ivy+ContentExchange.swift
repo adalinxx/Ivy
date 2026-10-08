@@ -1290,8 +1290,11 @@ extension Ivy {
               pending.matches(peer: peer, sessionID: sessionID) else {
             return
         }
-        // A bundle's first Volume is the root's own; a lone Volume is the root's.
-        guard rootCID == pending.rootCID || !pending.volumes.isEmpty,
+        // A lone Volume, and a bundle's first, is the root's own; a bundle
+        // carries no Volume twice.
+        guard pending.volumes.isEmpty
+                ? rootCID == pending.rootCID
+                : !pending.volumes.contains(where: { $0.rootCID == rootCID }),
               count > 0,
               count <= MessageLimits.maxVolumeChunkCount,
               index < count,
@@ -1372,14 +1375,16 @@ extension Ivy {
         assembly.archive.append(payload)
         assembly.nextIndex += 1
         inFlightVolumeBytes += payload.count
+        // Stored before anything can reject it: a rejection releases what
+        // the stored assembly holds, which must include these bytes.
+        pending.assemblies[peer] = assembly
+        pendingVolumeRequests[requestID] = pending
 
         if assembly.nextIndex < assembly.chunkCount {
             guard assembly.archive.count < assembly.totalBytes else {
                 rejectVolumeCandidate(requestID: requestID, peer: peer)
                 return
             }
-            pending.assemblies[peer] = assembly
-            pendingVolumeRequests[requestID] = pending
             return
         }
 
@@ -1389,8 +1394,6 @@ extension Ivy {
                 rootCID: rootCID,
                 expectedEntries: totalEntries
               ) else {
-            pending.assemblies[peer] = assembly
-            pendingVolumeRequests[requestID] = pending
             rejectVolumeCandidate(requestID: requestID, peer: peer)
             return
         }

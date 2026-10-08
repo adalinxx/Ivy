@@ -1982,4 +1982,97 @@ struct ContentExchangeTests {
             routeID: Data(repeating: marker, count: 32),
             carrier: try PeerKey(deterministicTestPeerKey("stale-content-carrier")))
     }
+
+    /// A requester with one seeded peer that every request is "sent" to.
+    private func requester(_ name: String) async throws -> (ivy: Ivy, peer: AuthenticatedPeer) {
+        let ivy = node("\(name)-requester")
+        let identity = deterministicTestPeerKey("\(name)-peer")
+        try await ivy.seedConnectedEndpointForTesting(
+            PeerEndpoint(publicKey: identity, host: "127.0.0.1", port: 4101), marker: 2
+        )
+        await ivy.setContentRequestEnqueueHookForTesting { _ in true }
+        return (ivy, AuthenticatedPeer(
+            key: try PeerKey(identity), role: .endpoint, route: .direct,
+            metadata: PeerMetadata(), sessionID: Data(repeating: 2, count: 32)
+        ))
+    }
+
+    /// Delivers `root`'s Volume from `peer`: whole, or only its first
+    /// `prefix` bytes as chunk 0 of `count`.
+    private func deliver(
+        _ root: String,
+        to ivy: Ivy,
+        from peer: AuthenticatedPeer,
+        count: UInt16 = 1,
+        prefix: Int? = nil
+    ) async throws {
+        let requestID = try #require(await ivy.pendingVolumeState().requestID)
+        let archive = try #require(VolumeArchive.encode(
+            entries: [ContentEntry(cid: root, data: Data(root.utf8))], rootCID: root
+        ))
+        await ivy.handleVolumeChunk(
+            requestID: requestID, rootCID: root, index: 0, count: count,
+            totalEntries: 1, totalBytes: UInt64(archive.data.count),
+            payload: Data(archive.data.prefix(prefix ?? archive.data.count)),
+            from: peer.id, sessionID: peer.sessionID
+        )
+    }
+
+    private func holdsNoVolumeBytes(_ ivy: Ivy) async -> Bool {
+        let reserved = await ivy.volumeReservations().receiving
+        let inFlight = await ivy.inFlightVolumeByteCount()
+        return reserved == 0 && inFlight == 0
+    }
+
+    @Test("a first chunk that claims more chunks but carries every byte is rejected and its bytes released")
+    func overfullFirstChunkReleasesItsBytes() async throws {
+        let (ivy, peer) = try await requester("overfull-chunk")
+        let rejected = Task { await ivy.fetchVolume(rootCID: "root", from: peer) }
+        #expect(try await TransportTestHarness.eventually { await ivy.pendingVolumeState().requestID != nil })
+        try await deliver("root", to: ivy, from: peer, count: 2)
+        #expect(await rejected.value == .empty)
+        #expect(await holdsNoVolumeBytes(ivy))
+
+        let served = Task { await ivy.fetchVolume(rootCID: "root", from: peer) }
+        #expect(try await TransportTestHarness.eventually { await ivy.pendingVolumeState().requestID != nil })
+        try await deliver("root", to: ivy, from: peer)
+        #expect(await served.value.entries == ["root": Data("root".utf8)])
+        #expect(await holdsNoVolumeBytes(ivy))
+    }
+
+    @Test("a bundle stream that breaks its order is a violation that keeps the Volumes already complete")
+    func bundleStreamViolations() async throws {
+        let (ivy, peer) = try await requester("bundle-violations")
+        func bundle(_ answer: (UInt64) async throws -> Void) async throws -> [String] {
+            let fetch = Task { await ivy.fetchVolumeBundle(rootCID: "root", from: [peer]) }
+            #expect(try await TransportTestHarness.eventually { await ivy.pendingVolumeState().requestID != nil })
+            let requestID = try #require(await ivy.pendingVolumeState().requestID)
+            try await answer(requestID)
+            let roots = await fetch.value.volumes.map(\.rootCID)
+            #expect(await holdsNoVolumeBytes(ivy))
+            return roots
+        }
+        // The first Volume is not the requested root's.
+        #expect(try await bundle { _ in
+            try await deliver("other", to: ivy, from: peer)
+        } == [])
+        // The end arrives while a Volume is half assembled.
+        #expect(try await bundle { requestID in
+            try await deliver("root", to: ivy, from: peer)
+            try await deliver("member", to: ivy, from: peer, count: 2, prefix: 4)
+            await ivy.handleVolumeBundleEnd(requestID: requestID, from: peer.id, sessionID: peer.sessionID)
+        } == ["root"])
+        // A Volume the bundle already carried.
+        #expect(try await bundle { _ in
+            try await deliver("root", to: ivy, from: peer)
+            try await deliver("member", to: ivy, from: peer)
+            try await deliver("member", to: ivy, from: peer)
+        } == ["root", "member"])
+        // A second end is ignored.
+        #expect(try await bundle { requestID in
+            try await deliver("root", to: ivy, from: peer)
+            await ivy.handleVolumeBundleEnd(requestID: requestID, from: peer.id, sessionID: peer.sessionID)
+            await ivy.handleVolumeBundleEnd(requestID: requestID, from: peer.id, sessionID: peer.sessionID)
+        } == ["root"])
+    }
 }
