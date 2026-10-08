@@ -238,6 +238,64 @@ struct ClientVolumeSchedulingTests {
         await silent.stop()
     }
 
+    @Test("a peer that starts a Volume and stalls is tried after peers that answer")
+    func stalledPeerGoesLast() async throws {
+        let stalledIdentity = TransportTestHarness.identity("client-stalled-server")
+        let holderIdentity = TransportTestHarness.identity("client-stalled-holder")
+        let clientIdentity = TransportTestHarness.identity("client-stalled-client")
+        let (stalledPort, holderPort) = (TransportTestHarness.nextPort(), TransportTestHarness.nextPort())
+        let stalled = Ivy(config: TransportTestHarness.config(stalledIdentity, port: stalledPort))
+        let holder = Ivy(config: TransportTestHarness.config(holderIdentity, port: holderPort))
+        let client = Ivy(config: TransportTestHarness.config(
+            clientIdentity, port: TransportTestHarness.nextPort(), requestTimeout: .seconds(5)
+        ))
+        await holder.setContentSource(RecordingSource(volumes: ["root": volume("root")]))
+        let stalledRecorder = TransportTestRecorder()
+        let clientRecorder = TransportTestRecorder()
+        await stalled.setTestDelegate(stalledRecorder)
+        await client.setTestDelegate(clientRecorder)
+        try await stalled.start()
+        try await holder.start()
+        try await client.start()
+        try await client.connect(to: TransportTestHarness.endpoint(stalledIdentity, port: stalledPort))
+        #expect(try await TransportTestHarness.eventually {
+            stalledRecorder.authenticatedPeers.count == 1 && clientRecorder.authenticatedPeers.count == 1
+        })
+        let stalledID = TransportTestHarness.key(stalledIdentity).peerID
+        await stalled.setEndpointWritabilityForTesting(try #require(stalledRecorder.authenticatedPeers.first).id, writable: false)
+
+        // The only peer sends the first of two chunks and nothing more: the
+        // fetch times out with the Volume begun, and that counts.
+        let fetch = Task { await client.fetchVolume(rootCID: "root") }
+        #expect(try await TransportTestHarness.eventually { await client.pendingVolumeRequests.count == 1 })
+        let requestID = try #require(await client.pendingVolumeRequests.keys.first)
+        await client.handleVolumeChunk(
+            requestID: requestID, rootCID: "root", index: 0, count: 2, totalEntries: 1, totalBytes: 2,
+            payload: Data([1]), from: stalledID,
+            sessionID: await client.pendingVolumeRequests[requestID]?.candidateSessions[stalledID]
+        )
+        #expect(await client.pendingVolumeRequests[requestID]?.assemblies[stalledID] != nil)
+        #expect(await fetch.value.entries.isEmpty)
+        #expect(await client.volumeTimeoutStreaks[stalledID] == 1)
+        #expect(await client.inFlightVolumeBytes == 0)
+        #expect(await client.reservedVolumeBytes == 0)
+
+        // With a peer that answers connected, it is asked first: the stalled
+        // peer is not asked, so it counts no further timeout. (Without the
+        // streak, a random tie would pick it about half the time; eight
+        // fetches make that near certain to show.)
+        try await client.connect(to: TransportTestHarness.endpoint(holderIdentity, port: holderPort))
+        #expect(try await TransportTestHarness.eventually { clientRecorder.authenticatedPeers.count == 2 })
+        for _ in 0..<8 {
+            let response = await client.fetchVolume(rootCID: "root")
+            #expect(response.servedBy == TransportTestHarness.key(holderIdentity).peerID)
+        }
+        #expect(await client.volumeTimeoutStreaks[stalledID] == 1)
+        await client.stop()
+        await holder.stop()
+        await stalled.stop()
+    }
+
     @Test("cancelling a fetch waiting for a slot withdraws it and leaks nothing")
     func cancelWhileWaitingForSlot() async throws {
         let source = RecordingSource(volumes: ["a": volume("a"), "b": volume("b")], gated: true)
