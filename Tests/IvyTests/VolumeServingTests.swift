@@ -92,6 +92,7 @@ private struct ConnectedPair {
         serverSource: (any IvyContentSource)?,
         serverInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
         clientInFlightVolumeBytes: Int = IvyConfig.defaultMaxInFlightVolumeBytes,
+        clientProviderRecordsPerPeer: Int = IvyConfig.defaultMaxProviderRecordsPerPeer,
         serverConcurrentContentRequests: Int = 64,
         serverRequestTimeout: Duration? = nil,
         requestTimeout: Duration = .seconds(5)
@@ -110,6 +111,7 @@ private struct ConnectedPair {
             clientIdentity,
             port: TransportTestHarness.nextPort(),
             requestTimeout: requestTimeout,
+            maxProviderRecordsPerPeer: clientProviderRecordsPerPeer,
             maxInFlightVolumeBytes: clientInFlightVolumeBytes
         ))
         let serverRecorder = TransportTestRecorder()
@@ -336,6 +338,37 @@ struct VolumeServingTests {
         let response = await pair.client.fetchVolume(rootCID: "root")
         #expect(response == expectedResponse("root", servedBy: pair.serverPeer.id))
         #expect(await pair.client.providerQueryCountForTesting == 0)
+        await pair.stop()
+    }
+
+    @Test("serving Volumes is not a provider record: nothing is stored, preferred, or relayed")
+    func servingIsNotAProviderRecord() async throws {
+        let roots = (0..<6).map { "served-\($0)" }
+        let pair = try await ConnectedPair.make(
+            "serving-not-a-record",
+            serverSource: MapVolumeSource(volumes: Dictionary(
+                uniqueKeysWithValues: roots.map { ($0, smallVolume($0)) })),
+            clientProviderRecordsPerPeer: 2
+        )
+        let server = pair.serverPeer.id
+        let expiry = await pair.client.nowUnix() + 1_200
+        await pair.client.handleAnnounceProvider(
+            rootCID: "rendezvous", expiresAt: expiry, from: server)
+
+        // More Volumes served than the server's quota of records.
+        for root in roots {
+            #expect(await pair.client.fetchVolume(rootCID: root)
+                == expectedResponse(root, servedBy: server))
+        }
+
+        #expect(await pair.client.providers(for: "rendezvous") == [server])
+        #expect(await pair.client.providerRecordCount(of: server) == 1)
+        for root in roots {
+            // Not a provider, not asked first on a retry, not in a find-providers answer.
+            #expect(await pair.client.providers(for: root).isEmpty)
+            #expect(await pair.client.connectedProviderIDs(for: root).isEmpty)
+            #expect(await pair.client.providerHints[root] == nil)
+        }
         await pair.stop()
     }
 

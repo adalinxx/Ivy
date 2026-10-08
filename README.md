@@ -99,7 +99,8 @@ only after the whole archive is present. This does not make Ivy a DAG layer:
 the caller still validates every identifier and byte before storage.
 
 Provider records are expiring routing hints, not proof of possession, validity,
-pinning, or authority.
+pinning, or authority. A record is what a peer announced for itself or what a
+lookup answer referred; a peer that served content is not recorded as a provider.
 
 ## Application messages
 

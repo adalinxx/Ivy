@@ -872,7 +872,6 @@ extension Ivy {
             return
         }
 
-        rememberProvider(rootCID: key.rootCID, peer: peer)
         resolveContentRequest(requestID: requestID, entries: result, servedBy: peer)
     }
 
@@ -973,7 +972,9 @@ extension Ivy {
             return .empty
         }
 
-        // Known providers, then the peers already connected, then the DHT.
+        // Known providers (peers that announced the root or were referred for
+        // it; having served it is not a record), then the peers already
+        // connected, then the DHT.
         // A connected peer without the Volume answers contentUnavailable at
         // once, so asking them costs one round trip before any DHT lookup
         // (Bitswap's order). Each step asks only peers not yet asked, and a
@@ -1424,7 +1425,6 @@ extension Ivy {
             servedBy: peer
         ))
         pendingVolumeRequests[requestID] = pending
-        rememberProvider(rootCID: rootCID, peer: peer)
         if !pending.bundle { resolveVolumeRequest(requestID: requestID) }
     }
 
