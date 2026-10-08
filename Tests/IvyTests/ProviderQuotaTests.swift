@@ -333,6 +333,20 @@ struct ProviderQuotaTests {
         await node.handleAnnounceProvider(rootCID: "c", expiresAt: now + 600, from: responder)
         #expect(await !node.hasProviderRecord(rootCID: "a", peer: responder))
         #expect(await node.providerRecordCount(of: responder) == 2)
+
+        // An expired announcement goes before a live referral, to a referral too.
+        let expired = self.node("quota-expired-rule-node", quota: 2)
+        await expired.storeProviderHint(
+            rootCID: "expired", peer: responder, endpoint: nil, expiresAt: now - 1)
+        try await refer(
+            expired, root: "referred", requestID: 601,
+            records: [ProviderRecord(endpoint: referred, expiresAt: now + 5)], from: responder)
+        try await refer(
+            expired, root: "referred-2", requestID: 602,
+            records: [ProviderRecord(endpoint: referred, expiresAt: now + 600)], from: responder)
+        #expect(await !expired.hasProviderRecord(rootCID: "expired", peer: responder))
+        #expect(await expired.providers(for: "referred").count == 1)
+        #expect(await expired.providers(for: "referred-2").count == 1)
     }
 
     private func refer(

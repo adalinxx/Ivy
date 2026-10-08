@@ -13,7 +13,7 @@ private struct MapVolumeSource: IvyContentSource {
     }
 
     func content(rootCID: String, cids: [String], maxDataBytes: Int) -> [ContentEntry] {
-        []
+        (volumes[rootCID] ?? []).filter { cids.contains($0.cid) }
     }
 
     func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
@@ -355,11 +355,14 @@ struct VolumeServingTests {
         await pair.client.handleAnnounceProvider(
             rootCID: "rendezvous", expiresAt: expiry, from: server)
 
-        // More Volumes served than the server's quota of records.
+        // More Volumes served than the server's quota of records, and a
+        // content selection served as well.
         for root in roots {
             #expect(await pair.client.fetchVolume(rootCID: root)
                 == expectedResponse(root, servedBy: server))
         }
+        #expect(await pair.client.fetchContent(rootCID: "served-0", cids: ["served-0-child"])
+            .servedBy == server)
 
         #expect(await pair.client.providers(for: "rendezvous") == [server])
         #expect(await pair.client.providerRecordCount(of: server) == 1)
@@ -422,6 +425,73 @@ struct VolumeServingTests {
         ))
         #expect(response.servedBy == providerID)
         #expect(await client.providerQueryCountForTesting == 1)
+        await client.stop()
+        await relay.stop()
+        await provider.stop()
+    }
+
+    @Test(
+        "a lookup's answer is asked even when its referral is not stored",
+        arguments: [false, true])
+    func unstoredReferralIsStillAsked(atTableCeiling: Bool) async throws {
+        let name = "fetch-unstored-\(atTableCeiling)"
+        let providerIdentity = TransportTestHarness.identity("\(name)-provider")
+        let relayIdentity = TransportTestHarness.identity("\(name)-relay")
+        let providerPort = TransportTestHarness.nextPort()
+        let relayPort = TransportTestHarness.nextPort()
+        let advertisedHost = "9.9.9.9"
+        let provider = Ivy(config: TransportTestHarness.config(
+            providerIdentity,
+            port: providerPort,
+            advertisedHost: advertisedHost
+        ))
+        let relay = Ivy(config: TransportTestHarness.config(relayIdentity, port: relayPort))
+        // Ceiling = maxConnections * quota.
+        let client = Ivy(config: TransportTestHarness.config(
+            TransportTestHarness.identity("\(name)-client"),
+            port: TransportTestHarness.nextPort(),
+            maxConnections: 2,
+            maxProviderRecordsPerPeer: atTableCeiling ? 2 : 1
+        ))
+        await client.setDialEndpointRewriteForTesting { endpoint in
+            endpoint.host == advertisedHost
+                ? PeerEndpoint(publicKey: endpoint.publicKey, host: "127.0.0.1", port: endpoint.port)
+                : endpoint
+        }
+        await provider.setContentSource(MapVolumeSource(volumes: ["root": smallVolume("root")]))
+        try await provider.start()
+        try await relay.start()
+        try await client.start()
+        try await provider.connect(to: TransportTestHarness.endpoint(relayIdentity, port: relayPort))
+        try await client.connect(to: TransportTestHarness.endpoint(relayIdentity, port: relayPort))
+        let providerID = TransportTestHarness.key(providerIdentity).peerID
+        let relayID = TransportTestHarness.key(relayIdentity).peerID
+        #expect(try await TransportTestHarness.eventually {
+            await relay.peerConnectionCount == 2
+        })
+        let expiry = UInt64(Date().timeIntervalSince1970) + 600
+        await provider.announceProvider(rootCID: "root", expiresAt: expiry)
+        #expect(try await TransportTestHarness.eventually {
+            await relay.providers(for: "root").contains(providerID)
+        })
+
+        // Only live announcements can make room for the relay's referral, so
+        // the client drops it: the relay is at its quota, or the table is at
+        // its ceiling and the source holding the most records announced them.
+        await client.handleAnnounceProvider(rootCID: "relay-own", expiresAt: expiry, from: relayID)
+        if atTableCeiling {
+            let heavy = PeerID(publicKey: deterministicTestPeerKey("\(name)-heavy"))
+            let other = PeerID(publicKey: deterministicTestPeerKey("\(name)-other"))
+            await client.handleAnnounceProvider(rootCID: "heavy-1", expiresAt: expiry, from: heavy)
+            await client.handleAnnounceProvider(rootCID: "heavy-2", expiresAt: expiry, from: heavy)
+            await client.handleAnnounceProvider(rootCID: "other", expiresAt: expiry, from: other)
+        }
+
+        let response = await client.fetchVolume(rootCID: "root")
+        #expect(response == expectedResponse("root", servedBy: providerID))
+        #expect(await client.providers(for: "root").isEmpty)
+        #expect(await client.fetchContent(rootCID: "root", cids: ["root-child"])
+            .servedBy == providerID)
         await client.stop()
         await relay.stop()
         await provider.stop()

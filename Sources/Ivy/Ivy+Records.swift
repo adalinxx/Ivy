@@ -481,14 +481,21 @@ extension Ivy {
         setProviderHints(hints, rootCID: rootCID)
     }
 
-    func connectedProviderIDs(for rootCID: String) -> [PeerID] {
+    /// The connected peers a fetch asks for `rootCID`: those with a stored
+    /// record, then those in `fresh`. A lookup's answer is used by the fetch
+    /// that made it; storing it is only a cache.
+    func connectedProviderIDs(
+        for rootCID: String,
+        including fresh: [PeerEndpoint] = []
+    ) -> [PeerID] {
         evictExpiredProviders(rootCID: rootCID)
         var seen: Set<PeerID> = []
-        return (providerHints[rootCID] ?? []).compactMap { hint in
-            guard hasEndpointSession(hint.peer),
-                  !isDeficiencySuppressed(rootCID: rootCID, peer: hint.peer),
-                  seen.insert(hint.peer).inserted else { return nil }
-            return hint.peer
+        let peers = (providerHints[rootCID] ?? []).map(\.peer)
+            + fresh.map { PeerID(publicKey: $0.publicKey) }
+        return peers.filter { peer in
+            hasEndpointSession(peer)
+                && !isDeficiencySuppressed(rootCID: rootCID, peer: peer)
+                && seen.insert(peer).inserted
         }
     }
 

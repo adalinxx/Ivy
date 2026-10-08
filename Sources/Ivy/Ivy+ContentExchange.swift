@@ -1000,7 +1000,7 @@ extension Ivy {
                 )
                 await connectToProviderEndpoints(fresh + cached, generation: generation)
                 guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-                peers = connectedProviderIDs(for: rootCID)
+                peers = connectedProviderIDs(for: rootCID, including: fresh)
             }
             let batch = Array(
                 peers.filter { !asked.contains($0) }.prefix(config.maxContentCandidates)
@@ -1675,17 +1675,10 @@ extension Ivy {
             attemptedSessions.merge(sessions) { _, latest in latest }
         }
 
-        let fresh = await queryFreshProviderEndpoints(
+        // The peers already connected before the DHT, as `fetchVolume` does.
+        candidates = connectedFallbackCandidates(
             rootCID: key.rootCID,
-            generation: generation)
-        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-        await connectToProviderEndpoints(fresh + cached, generation: generation)
-        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
-        candidates = Array(connectedProviderIDs(for: key.rootCID)
-            .filter {
-                attemptedSessions[$0] != endpointConnection(for: $0)?.connectionID
-            }
-            .prefix(config.maxContentCandidates))
+            excluding: attemptedSessions)
         if !candidates.isEmpty {
             let sessions = liveConnectionIDs(for: candidates)
             let response = await fetchContent(key, from: candidates, generation: generation)
@@ -1694,10 +1687,18 @@ extension Ivy {
             attemptedSessions.merge(sessions) { _, latest in latest }
         }
 
-        candidates = connectedFallbackCandidates(
+        let fresh = await queryFreshProviderEndpoints(
             rootCID: key.rootCID,
-            excluding: attemptedSessions)
-        guard !Task.isCancelled, !candidates.isEmpty else { return .empty }
+            generation: generation)
+        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
+        await connectToProviderEndpoints(fresh + cached, generation: generation)
+        guard isCurrentRun(generation), !Task.isCancelled else { return .empty }
+        candidates = Array(connectedProviderIDs(for: key.rootCID, including: fresh)
+            .filter {
+                attemptedSessions[$0] != endpointConnection(for: $0)?.connectionID
+            }
+            .prefix(config.maxContentCandidates))
+        guard !candidates.isEmpty else { return .empty }
         let response = await fetchContent(key, from: candidates, generation: generation)
         return isCurrentRun(generation) && !Task.isCancelled ? response : .empty
     }
