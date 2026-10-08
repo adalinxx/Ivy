@@ -1475,12 +1475,11 @@ extension Ivy {
         reservedVolumeBytes -= assembly.totalBytes
     }
 
-    /// The request's deadline passed: peers asked that sent nothing count a
-    /// timeout, so the next fetch tries them after peers that answer.
+    /// The request's deadline passed: peers asked that completed no Volume
+    /// count a timeout, so the next fetch tries them after peers that answer.
     private func timeOutVolumeRequest(requestID: UInt64) {
         if let pending = pendingVolumeRequests[requestID] {
-            for peer in pending.candidateSessions.keys
-                where pending.assemblies[peer] == nil && pending.volumes.isEmpty {
+            for peer in pending.candidateSessions.keys where pending.volumes.isEmpty {
                 volumeTimeoutStreaks[peer, default: 0] += 1
             }
         }

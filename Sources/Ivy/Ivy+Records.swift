@@ -124,11 +124,15 @@ extension Ivy {
         // provides is looking for the others, so its record neither returns
         // nor stands in for the network's answer.
         let cached = cachedProviderEndpoints(rootCID: rootCID).filter { $0.publicKey != localKey.hex }
-        return cached.isEmpty
-            ? uniqueProviderEndpoints(await queryFreshProviderEndpoints(
-                rootCID: rootCID,
-                generation: generation))
-            : cached
+        // Nor is a record naming a peer already connected: it tells the
+        // caller of no one new, so only a record naming a peer this node has
+        // no session with answers without asking the network.
+        guard !cached.contains(where: { !hasEndpointSession(PeerID(publicKey: $0.publicKey)) }) else {
+            return cached
+        }
+        return uniqueProviderEndpoints(cached + (await queryFreshProviderEndpoints(
+            rootCID: rootCID,
+            generation: generation)))
     }
 
     func cachedProviderEndpoints(rootCID: String) -> [PeerEndpoint] {

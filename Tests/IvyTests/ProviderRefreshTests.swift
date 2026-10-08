@@ -223,6 +223,55 @@ struct ProviderRefreshTests {
         await router.stop()
     }
 
+    @Test("a record naming a connected peer does not stand in for the network's answer")
+    func connectedRecordDoesNotAnswerDiscovery() async throws {
+        let requesterIdentity = TransportTestHarness.identity("connected-record-requester")
+        let routerIdentity = TransportTestHarness.identity("connected-record-router")
+        let (requesterPort, routerPort) = (TransportTestHarness.nextPort(), TransportTestHarness.nextPort())
+        let root = "connected-record-root"
+        let requester = Ivy(config: TransportTestHarness.config(requesterIdentity, port: requesterPort))
+        let router = Ivy(config: TransportTestHarness.config(routerIdentity, port: routerPort))
+        try await router.start()
+        try await requester.start()
+        let routerEndpoint = TransportTestHarness.endpoint(routerIdentity, port: routerPort)
+        try await requester.connect(to: routerEndpoint)
+        #expect(try await TransportTestHarness.eventually {
+            await router.peerConnectionCount == 1
+        })
+
+        // The router holds another provider's record; the requester's only
+        // record names the router, which it is connected to.
+        let expiry = await requester.nowUnix() + 60
+        let routerID = TransportTestHarness.key(routerIdentity).peerID
+        let other = PeerEndpoint(
+            publicKey: deterministicTestPeerKey("connected-record-provider"), host: "8.8.8.8", port: 4001)
+        await router.storeProviderHint(
+            rootCID: root,
+            peer: PeerID(publicKey: other.publicKey),
+            endpoint: other,
+            expiresAt: expiry)
+        await requester.storeProviderHint(
+            rootCID: root, peer: routerID, endpoint: routerEndpoint, expiresAt: expiry)
+
+        let found = await requester.discoverProviders(rootCID: root)
+        #expect(found.contains(other), "a lookup must find providers beyond the ones already connected")
+        #expect(found.contains(routerEndpoint))
+        #expect(await requester.providerQueryCountForTesting == 1)
+
+        // A record naming a peer not connected answers without a round trip.
+        let cachedOnly = "connected-record-cached-root"
+        await requester.storeProviderHint(
+            rootCID: cachedOnly,
+            peer: PeerID(publicKey: other.publicKey),
+            endpoint: other,
+            expiresAt: expiry)
+        #expect(await requester.discoverProviders(rootCID: cachedOnly) == [other])
+        #expect(await requester.providerQueryCountForTesting == 1)
+
+        await requester.stop()
+        await router.stop()
+    }
+
     @Test("a failed cached hint triggers fresh discovery without deleting the hint")
     func staleHintFallsBackToFreshQuery() async throws {
         let requesterIdentity = TransportTestHarness.identity("provider-refresh-requester")
